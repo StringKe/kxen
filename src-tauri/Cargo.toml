@@ -14,7 +14,7 @@ tauri = { version = "2.11", features = [] }
 tauri-plugin-websocket = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
-similar = "2"
+similar = "3"
 serde_json = "1"
 tokio = { version = "1.53", features = [
   "rt-multi-thread",
