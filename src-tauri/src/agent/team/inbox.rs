@@ -31,6 +31,13 @@ fn lock_for(path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Team Session 生命周期终点：该目录不会再接收 inbox 写入后回收路径锁。
+pub(super) fn drop_session_locks(session_dir: &Path) {
+    if let Some(locks) = INBOX_LOCKS.get() {
+        locks.lock().expect("inbox locks").retain(|path, _| !path.starts_with(session_dir));
+    }
+}
+
 /// 单条文本上限：inbox 是落盘 mailbox，无 cap 时失控/恶意写入可让单条无限膨胀
 ///（drain 后整条进 LLM 历史，超限文本还会爆上下文）。截断保留前缀并标注原始长度。
 /// append 侧不做文件总量 cap：inbox 读后即焚（drain 即清空），总量已被消费节奏自然限制。
@@ -152,5 +159,25 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), 100, "重复投递检测");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_lock_entries_are_reclaimable() {
+        let base = std::env::temp_dir().join(format!("kxen-inbox-lifecycle-{}", std::process::id()));
+        let first = base.join("first");
+        let second = base.join("second");
+        std::fs::create_dir_all(first.join("inboxes")).unwrap();
+        std::fs::create_dir_all(second.join("inboxes")).unwrap();
+        append_inbox(&first, "lead", "worker", "one").unwrap();
+        append_inbox(&second, "lead", "worker", "two").unwrap();
+
+        drop_session_locks(&first);
+        let locks = INBOX_LOCKS.get().unwrap().lock().unwrap();
+        assert!(!locks.keys().any(|path| path.starts_with(&first)));
+        assert!(locks.keys().any(|path| path.starts_with(&second)));
+        drop(locks);
+
+        drop_session_locks(&second);
+        std::fs::remove_dir_all(base).ok();
     }
 }

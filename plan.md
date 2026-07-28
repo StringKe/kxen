@@ -94,17 +94,18 @@
 - [x] 接入 Tauri updater 和 process plugin。
 - [x] 生成 updater signing key，私钥写入 1Password 共享 vault，仓库只保存公钥。
 - [x] updater endpoint 改为 GitHub Releases `latest.json`。
-- [x] GitHub workflow 上传 DMG、updater artifact、签名和 manifest，并发布正式 latest Release。
+- [x] GitHub workflow 先创建 draft，上传 DMG、updater artifact、签名和 manifest，最终 DMG notarize、staple 和 Gatekeeper PASS 后才发布 latest Release。
 - [x] GitHub workflow 构建 macOS ARM64 DMG 和 updater artifact。
 - [x] 执行 Developer ID Application 本地签名验证。
-- [ ] 执行 Apple notarization 和 staple。
+- [x] 执行 Apple notarization 和 staple。
 - [ ] 发布 `v0.1.0` development preview。
 - [ ] 官网增加下载入口并更新当前可用性。
 
 外部前置条件:
 
-- [ ] 1Password 共享 vault 存在 `Kxen Apple Release` item。
-- [ ] item 包含 Developer ID Application `.p12`、certificate password、Apple Team ID、App Store Connect Issuer ID、Key ID 和 `.p8` private key。
+- [x] 本机 Keychain 中的 Developer ID Application identity 与 App Store Connect API key 已通过真实 notarization 验证。
+- [x] GitHub `release` environment 已配置 workflow 要求的 8 个 Apple 和 updater secrets。
+- [x] 1Password 团队共享 vault 的 `Kxen Updater Signing` item 包含 updater private key、password 和 public key。
 
 ## 6. 完成验证
 
@@ -124,7 +125,7 @@
 - [x] Browser 桌面、移动、Mermaid 和搜索流程
 - [ ] Browser 下载流程
 - [x] `codesign` 和 DMG checksum
-- [ ] `spctl`、`stapler`、DMG 安装和 updater 签名
+- [x] `spctl`、`stapler`、DMG 挂载和 updater 签名
 - [x] GitHub required checks
 - [ ] GitHub Releases HTTPS 和 updater endpoint
 

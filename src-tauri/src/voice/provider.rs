@@ -165,6 +165,11 @@ impl RecordSession {
         write_wav(&path, &samples, self.sample_rate).map_err(|e| format!("写 WAV 失败: {e}"))?;
         Ok((path_str, samples.len() as f32 / self.sample_rate as f32))
     }
+
+    /// Session 被删除或同 Session 重启 PTT 时停止录音且丢弃未提交样本。
+    pub fn cancel(self) {
+        super::objc::stop_mic_engine(&self.engine);
+    }
 }
 
 /// 云转写临时 WAV 路径：pid + 原子序号 + 纳秒时间戳。

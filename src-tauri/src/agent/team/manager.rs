@@ -76,6 +76,7 @@ impl TeamManager {
         }
         self.detach_session(session_id);
         let _ = std::fs::remove_dir_all(self.root.join(session_id));
+        super::inbox::drop_session_locks(&self.root.join(session_id));
     }
 
     pub(super) fn state_for(self: &Arc<Self>, session_id: &str) -> Arc<TeamState> {

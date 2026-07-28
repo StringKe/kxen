@@ -73,6 +73,7 @@ fn cleanup_references(state: &Arc<AppState>, id: &str) {
     kxen_app::core::goal::Goal::remove_for_session(&kxen_app::core::paths::goals_dir(), id);
     state.team.drop_session(id);
     state.agents.drop_session(id);
+    kxen_app::voice::drop_session(id);
     state.drop_extras(id);
     state.picked_files.drop_session(id);
     kxen_app::tools::snapshot::drop_session(&state.session_snapshots, id);

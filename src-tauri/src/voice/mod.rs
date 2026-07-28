@@ -59,6 +59,17 @@ enum Active {
     Dummy(u32),
 }
 
+impl Active {
+    fn cancel(self) {
+        match self {
+            Self::Apple { session, .. } => session.0.cancel(),
+            Self::Record { session, .. } => session.0.cancel(),
+            #[cfg(test)]
+            Self::Dummy(_) => {}
+        }
+    }
+}
+
 static ACTIVE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Active>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -89,7 +100,10 @@ fn start_one(
     session_id: &str,
 ) -> Result<String, String> {
     // 同 session 重复 start = 替换：旧槽先移出（旧泵 ptr_eq 不过随即退出）
-    let _ = crate::core::shared::lock(&ACTIVE).remove(session_id);
+    let previous = { crate::core::shared::lock(&ACTIVE).remove(session_id) };
+    if let Some(previous) = previous {
+        previous.cancel();
+    }
     match engine {
         "apple" => {
             let session = apple::start_mic(locale)?;
@@ -189,6 +203,14 @@ pub async fn stop(
     }
 }
 
+/// Session 生命周期终点：停止并移除仍占用麦克风的 PTT 槽。
+pub fn drop_session(session_id: &str) {
+    let active = { crate::core::shared::lock(&ACTIVE).remove(session_id) };
+    if let Some(active) = active {
+        active.cancel();
+    }
+}
+
 /// 云终稿引擎选择：fallback 链优先，其次 openai/xai/自定义 audio 里第一个有 key 的。
 fn first_ready_cloud(config: &crate::core::config::Config, store: &crate::auth::credential::AuthStore) -> Option<String> {
     let mut candidates: Vec<String> = config.voice.fallback.clone();
@@ -234,6 +256,15 @@ mod tests {
         let text = stop(&crate::core::config::Config::default(), &store, "slot-unknown").await.expect("stop unknown");
         assert_eq!(text, None);
         crate::core::shared::lock(&ACTIVE).clear();
+    }
+
+    #[test]
+    fn drop_session_reclaims_active_slot() {
+        let store = crate::auth::credential::AuthStore::new();
+        start(&dummy_config(), &store, "zh-CN", crate::core::event::EventBus::default(), "voice-delete").unwrap();
+        assert!(dummy_slot("voice-delete").is_some());
+        drop_session("voice-delete");
+        assert!(dummy_slot("voice-delete").is_none());
     }
 
     #[test]

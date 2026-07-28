@@ -171,4 +171,11 @@ impl MicSession {
         };
         (last, wav)
     }
+
+    /// Session 被删除或同 Session 重启 PTT 时立即释放麦克风，不等待终稿。
+    pub fn cancel(self) {
+        objc::stop_mic_engine(&self.engine);
+        objc::end_audio(&self.request);
+        objc::cancel_task(&self.task);
+    }
 }

@@ -5,6 +5,7 @@
 //!
 //! 端口启动时随机分配，前端经 ws_port command 获取。
 
+mod active_context;
 pub mod llm_task;
 mod ops;
 mod ops_agents;

@@ -91,15 +91,14 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
         "workspace.switch" => {
             let path = params.get("path").and_then(Value::as_str).ok_or("missing path")?;
             let state = app.state::<Arc<AppState>>();
-            let dir = activate_workspace(std::path::Path::new(path), &state)?;
+            let dir = activate_workspace(std::path::Path::new(path), None, &state)?;
             Ok(json!(dir.to_string_lossy()))
         }
         "session.activate" => {
             let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
             let state = app.state::<Arc<AppState>>();
             let meta = kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), id).map_err(|e| e.to_string())?;
-            let dir = activate_workspace(std::path::Path::new(&meta.directory), &state)?;
-            *state.foreground_session.write().map_err(|_| "foreground lock poisoned".to_string())? = id.to_string();
+            let dir = activate_workspace(std::path::Path::new(&meta.directory), Some(id), &state)?;
             Ok(json!({ "id": id, "directory": dir.to_string_lossy() }))
         }
         "session.create" => {
@@ -141,11 +140,6 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
         }
         "session.update_meta" => super::session_ops::session_update_meta(&params),
         "session.set_model" => super::session_ops::session_set_model(&params),
-        "session.foreground" => {
-            let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-            *app.state::<Arc<AppState>>().foreground_session.write().expect("foreground") = id.to_string();
-            Ok(Value::Null)
-        }
         "session.fork" => {
             let session_id = params.get("session_id").and_then(Value::as_str).ok_or("missing session_id")?;
             let message_id = params.get("message_id").and_then(Value::as_str).ok_or("missing message_id")?;
@@ -293,11 +287,16 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
     }
 }
 
-fn activate_workspace(path: &std::path::Path, state: &Arc<AppState>) -> Result<std::path::PathBuf, String> {
+fn activate_workspace(
+    path: &std::path::Path,
+    foreground_session: Option<&str>,
+    state: &Arc<AppState>,
+) -> Result<std::path::PathBuf, String> {
     let runtime = state.workspace_runtimes.runtime(path)?;
     let dir = runtime.root().to_path_buf();
-    *state.active_workspace.write().map_err(|_| "workspace lock poisoned".to_string())? = dir.clone();
     kxen_app::core::workspace::touch(&kxen_app::core::paths::data_dir(), &dir.to_string_lossy()).map_err(|e| e.to_string())?;
+    // workspace.switch 传 None 会同时清空 foreground，避免旧 Session 继续抑制系统通知。
+    super::active_context::commit(&state.active_workspace, &state.foreground_session, &dir, foreground_session)?;
 
     let trusted_runtime = runtime.clone();
     kxen_app::core::trust::gate_async(
