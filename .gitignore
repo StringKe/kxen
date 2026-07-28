@@ -6,7 +6,6 @@ target/
 node_modules/
 dist/
 coverage/
-release-assets/
 .kxen/
 .vitest-attachments/
 src/components/composer/__screenshots__/

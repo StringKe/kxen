@@ -1,7 +1,7 @@
 # kxen 全面加固与发布计划
 
 - 状态: CONFIRMED
-- 分支: `fix/project-hardening`
+- 分支: `main`
 - 基线 commit: `b65ba0ee545a9618ba29463895242eb447f7dc26`
 - 目标: 修复代码审查报告中的全部有效 P0 和 P1，建立可验证的质量门禁与 macOS Apple Silicon 发布链路
 
@@ -87,14 +87,14 @@
 - [x] 新增 MIT LICENSE。
 - [x] 新增 `SECURITY.md`、`CONTRIBUTING.md` 和 `CHANGELOG.md`。
 - [x] 新增 Dependabot。
-- [ ] CI 合并后配置 main ruleset，要求 checks 并禁止 force push。
+- [x] CI 合并后配置 main ruleset，要求 checks 并禁止 force push。
 
 ## 5. macOS 发布
 
 - [x] 接入 Tauri updater 和 process plugin。
 - [x] 生成 updater signing key，私钥写入 1Password 共享 vault，仓库只保存公钥。
-- [ ] 创建 Cloudflare R2 bucket `kxen-releases`。
-- [ ] 创建 `https://releases.kxen.ai` 和 `https://releases.kxen.ai/latest.json`。
+- [x] updater endpoint 改为 GitHub Releases `latest.json`。
+- [x] GitHub workflow 上传 DMG、updater artifact、签名和 manifest，并发布正式 latest Release。
 - [x] GitHub workflow 构建 macOS ARM64 DMG 和 updater artifact。
 - [x] 执行 Developer ID Application 本地签名验证。
 - [ ] 执行 Apple notarization 和 staple。
@@ -125,8 +125,8 @@
 - [ ] Browser 下载流程
 - [x] `codesign` 和 DMG checksum
 - [ ] `spctl`、`stapler`、DMG 安装和 updater 签名
-- [ ] GitHub required checks
-- [ ] Cloudflare R2 HTTPS 和 updater endpoint
+- [x] GitHub required checks
+- [ ] GitHub Releases HTTPS 和 updater endpoint
 
 ## 7. 已完成历史基线
 

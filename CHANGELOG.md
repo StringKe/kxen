@@ -18,6 +18,7 @@
 - Session 激活改为原子 RPC。
 - WebSocket stream sequence 改为连接级状态。
 - Markdown highlighter 改为代码块首次渲染时加载。
+- macOS 发布和自动更新资产改为直接使用 GitHub Releases。
 
 ### Fixed
 

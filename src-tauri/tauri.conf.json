@@ -41,7 +41,7 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IERBQzQzQkYxRkJFMUI4MTgKUldRWXVPSDc4VHZFMm9YS3dHelJYdWZZYThVUmwvdlV3ZGhVV2p0cnpSQ0pVYTRyTjAxUmhUSkYK",
-      "endpoints": ["https://releases.kxen.ai/latest.json"]
+      "endpoints": ["https://github.com/StringKe/kxen/releases/latest/download/latest.json"]
     }
   }
 }

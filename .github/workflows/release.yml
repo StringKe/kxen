@@ -34,8 +34,6 @@ jobs:
       APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: 86e4d320a5d69fb54f9721fb219a4902
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,18 +46,20 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: |
-            pnpm-lock.yaml
-            website/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir website install --frozen-lockfile
       - name: Validate release credentials
         shell: bash
         run: |
           set -euo pipefail
+          KXEN_VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          if [[ "$RELEASE_TAG" != "v$KXEN_VERSION" ]]; then
+            printf 'release tag %s does not match v%s\n' "$RELEASE_TAG" "$KXEN_VERSION"
+            exit 1
+          fi
           required=(
             APPLE_CERTIFICATE
             APPLE_CERTIFICATE_PASSWORD
@@ -69,7 +69,6 @@ jobs:
             APPLE_API_PRIVATE_KEY
             TAURI_SIGNING_PRIVATE_KEY
             TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-            CLOUDFLARE_API_TOKEN
           )
           for name in "${required[@]}"; do
             if [[ -z "${!name}" ]]; then
@@ -115,120 +114,15 @@ jobs:
           KXEN_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KXEN_API_KEY_PATH"
           printf 'APPLE_API_KEY_PATH=%s\n' "$KXEN_API_KEY_PATH" >> "$GITHUB_ENV"
-      - name: Build signed and notarized bundle
-        run: pnpm tauri:build --target aarch64-apple-darwin
-      - name: Stage release assets
-        id: stage
-        run: node scripts/stage-release.mjs
-      - name: Verify Apple signatures and notarization
-        shell: bash
-        run: |
-          set -euo pipefail
-          KXEN_APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Kxen.app"
-          KXEN_DMG_PATH="${{ steps.stage.outputs.dmg_path }}"
-          codesign --verify --deep --strict --verbose=2 "$KXEN_APP_PATH"
-          spctl --assess --type execute --verbose=2 "$KXEN_APP_PATH"
-          xcrun stapler validate "$KXEN_APP_PATH"
-          codesign --verify --strict --verbose=2 "$KXEN_DMG_PATH"
-          spctl --assess --type open --context context:primary-signature --verbose=2 \
-            "$KXEN_DMG_PATH"
-          xcrun stapler validate "$KXEN_DMG_PATH"
-      - name: Publish R2 release
-        shell: bash
-        run: |
-          set -euo pipefail
-          pnpm --dir website exec wrangler r2 object put \
-            "kxen-releases/$RELEASE_TAG/${{ steps.stage.outputs.dmg_name }}" \
-            --file "${{ steps.stage.outputs.dmg_path }}" \
-            --content-type application/x-apple-diskimage \
-            --cache-control "public, max-age=31536000, immutable" \
-            --remote
-          pnpm --dir website exec wrangler r2 object put \
-            "kxen-releases/$RELEASE_TAG/${{ steps.stage.outputs.updater_name }}" \
-            --file "${{ steps.stage.outputs.updater_path }}" \
-            --content-type application/gzip \
-            --cache-control "public, max-age=31536000, immutable" \
-            --remote
-          pnpm --dir website exec wrangler r2 object put \
-            "kxen-releases/$RELEASE_TAG/${{ steps.stage.outputs.updater_name }}.sig" \
-            --file "${{ steps.stage.outputs.signature_path }}" \
-            --content-type text/plain \
-            --cache-control "public, max-age=31536000, immutable" \
-            --remote
-          pnpm --dir website exec wrangler r2 object put \
-            "kxen-releases/latest.json" \
-            --file "${{ steps.stage.outputs.manifest_path }}" \
-            --content-type application/json \
-            --cache-control "no-cache, no-store, must-revalidate" \
-            --remote
-      - name: Verify published updater
-        shell: bash
-        run: |
-          set -euo pipefail
-          KXEN_MANIFEST_PATH="$RUNNER_TEMP/kxen-latest.json"
-          KXEN_UPDATER_URL="https://releases.kxen.ai/$RELEASE_TAG/${{ steps.stage.outputs.updater_name }}"
-          KXEN_SIGNATURE_URL="$KXEN_UPDATER_URL.sig"
-          KXEN_DMG_URL="https://releases.kxen.ai/$RELEASE_TAG/${{ steps.stage.outputs.dmg_name }}"
-          curl --fail --silent --show-error \
-            --retry 8 \
-            --retry-all-errors \
-            --output "$KXEN_MANIFEST_PATH" \
-            "https://releases.kxen.ai/latest.json"
-          jq -e \
-            --arg version "${{ steps.stage.outputs.version }}" \
-            --arg updater_url "$KXEN_UPDATER_URL" \
-            '.version == $version
-              and .platforms["darwin-aarch64"].url == $updater_url
-              and .platforms["darwin-aarch64"].signature != ""' \
-            "$KXEN_MANIFEST_PATH"
-          KXEN_EXPECTED_SIGNATURE="$(
-            jq -r '.platforms["darwin-aarch64"].signature' "$KXEN_MANIFEST_PATH"
-          )"
-          KXEN_PUBLISHED_SIGNATURE="$(
-            curl --fail --silent --show-error \
-              --retry 8 \
-              --retry-all-errors \
-              "$KXEN_SIGNATURE_URL"
-          )"
-          if [[ "$KXEN_PUBLISHED_SIGNATURE" != "$KXEN_EXPECTED_SIGNATURE" ]]; then
-            printf 'published updater signature does not match latest.json\n'
-            exit 1
-          fi
-          curl --fail --silent --show-error \
-            --retry 8 \
-            --retry-all-errors \
-            --head \
-            "$KXEN_UPDATER_URL"
-          curl --fail --silent --show-error \
-            --retry 8 \
-            --retry-all-errors \
-            --head \
-            "$KXEN_DMG_URL"
-      - name: Publish GitHub prerelease
+      - name: Build and publish GitHub release
+        uses: tauri-apps/tauri-action@v1
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          KXEN_RELEASE_ASSETS=(
-            "${{ steps.stage.outputs.dmg_path }}"
-            "${{ steps.stage.outputs.updater_path }}"
-            "${{ steps.stage.outputs.signature_path }}"
-            "${{ steps.stage.outputs.manifest_path }}"
-          )
-          KXEN_RELEASE_TITLE="Kxen ${{ steps.stage.outputs.version }} development preview"
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${KXEN_RELEASE_ASSETS[@]}" --clobber
-            gh release edit "$RELEASE_TAG" \
-              --verify-tag \
-              --prerelease \
-              --title "$KXEN_RELEASE_TITLE" \
-              --notes-file "${{ steps.stage.outputs.notes_path }}"
-          else
-            gh release create "$RELEASE_TAG" \
-              "${KXEN_RELEASE_ASSETS[@]}" \
-              --verify-tag \
-              --prerelease \
-              --title "$KXEN_RELEASE_TITLE" \
-              --notes-file "${{ steps.stage.outputs.notes_path }}"
-          fi
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Kxen v__VERSION__ development preview
+          releaseBody: macOS 14+ Apple Silicon signed and notarized build.
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          args: --target aarch64-apple-darwin
