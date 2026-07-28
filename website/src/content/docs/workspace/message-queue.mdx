@@ -27,6 +27,8 @@ stateDiagram-v2
 
 `queue` 是默认行为。新消息进入当前 Session 的等待队列，当前 run 完成后按顺序继续处理。它适合补充后续任务，不会打断正在执行的工具调用。
 
+队列状态持久化为 `queued` 和 `in_flight`。每条 delivery 拥有稳定 ID，后端先 claim 并落盘，再用同一 ID 幂等追加 Session 用户消息，持久化成功后才 acknowledge。应用在 claim 后异常退出时会重放 `in_flight`；如果崩溃发生在 JSONL append 和 acknowledge 之间，重放会识别同一 message ID，不重复追加也不静默丢失。后续模型执行是否完成不改变用户消息已经持久化的事实。
+
 ## Interrupt 模式
 
 `interrupt` 会先取消当前 run，再处理新消息。它适合立即纠正方向，但当前回合尚未完成的结果不会继续执行。

@@ -156,7 +156,7 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
         "session.pending_clear" => {
             let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
             let state = app.state::<Arc<AppState>>();
-            let n = state.pending_messages.clear(id);
+            let n = state.pending_messages.clear(id)?;
             Ok(json!({ "cleared": n }))
         }
         "session.export" => {
@@ -178,7 +178,7 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
                     .unwrap_or_default();
                 let policy = if cfg.send_when_running.is_empty() { "queue" } else { cfg.send_when_running.as_str() };
                 if policy != "interrupt" {
-                    let n = state.pending_messages.enqueue(&p.session_id, p.text, p.context, p.images);
+                    let n = state.pending_messages.enqueue(&p.session_id, p.text, p.context, p.images)?;
                     state.bus.publish(kxen_app::core::event::Event::notify(format!("运行中，消息已排队（第 {n} 条）"), Some(p.session_id)));
                     return Ok(json!({ "queued": true }));
                 }
@@ -189,14 +189,14 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
             // 分配 run 流 id（JSON-RPC 3.0：增量走 stream chunk 下发）
             let stream_id = super::protocol::stream_id("run");
             kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), p.session_id.clone());
-            tokio::spawn(run_llm(stream_id.clone(), p.session_id, p.text, p.context, p.images, app.clone()));
+            tokio::spawn(run_llm(stream_id.clone(), p.session_id, p.text, p.context, p.images, None, app.clone()));
             Ok(json!({ "stream_id": stream_id }))
         }
         "session.abort" => {
             let id = params.get("session_id").and_then(Value::as_str).ok_or("missing session_id")?;
             let state = app.state::<Arc<AppState>>();
             // abort = 停当前 + 清队列（否则 abort 完队列立刻续跑，等于没停）
-            state.pending_messages.clear(id);
+            state.pending_messages.clear(id)?;
             let token = kxen_app::core::shared::lock(&state.active_runs).get(id).cloned();
             Ok(json!(token.map(|t| t.cancel()).is_some()))
         }

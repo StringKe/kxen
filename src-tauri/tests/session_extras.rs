@@ -67,6 +67,7 @@ fn subagent_shares_parent_session_extras() {
         registry: Arc::new(kxen_app::tools::task::TaskRegistry::new()),
         tracker: kxen_app::tools::fs_tool::FileTracker::default(),
         workdir: Arc::from(Path::new("/tmp")),
+        path_grants: Arc::new(Default::default()),
         model: kxen_app::llm::ModelRef::new("p", "m"),
         store: kxen_app::auth::credential::AuthStore::default(),
         max_turns: 1,

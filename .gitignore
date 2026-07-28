@@ -10,6 +10,7 @@ coverage/
 .vitest-attachments/
 src/components/composer/__screenshots__/
 src/components/__screenshots__/
+src/components/settings/__screenshots__/
 .DS_Store
 src-tauri/gen/
 src/lib/__screenshots__/

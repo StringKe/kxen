@@ -28,6 +28,8 @@ const METHODS: &[&str] = &[
     "voice.set_provider_key",
     "voice.set_engine",
     "config.set_send_policy",
+    "config.set_experimental",
+    "config.set_limits",
     "voice.start",
     "voice.stop",
 ];
@@ -57,6 +59,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             Ok(json!({
                 "describe": mrm.describe().await,
                 "history": mrm.history().await,
+                "health": mrm.health().await,
             }))
         }
         "agent.test_dispatch" => test_dispatch(app, params).await,
@@ -129,12 +132,22 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             for h in &history {
                 *by_model.entry(format!("{}/{}", h.provider, h.model)).or_default() += 1;
             }
+            let daily: Vec<_> = kxen_app::core::usage_trend::recent(14)
+                .into_iter()
+                .map(
+                    |(date, usage)| json!({ "date": date, "input": usage.input, "output": usage.output, "by_provider": usage.by_provider }),
+                )
+                .collect();
+            let today = kxen_app::core::usage_trend::today();
             Ok(json!({
                 "total_input": total_input,
                 "total_output": total_output,
                 "sessions": tokens.len(),
                 "dispatches": history.len(),
                 "by_model": by_model,
+                "today_input": today.input,
+                "today_output": today.output,
+                "daily": daily,
             }))
         }
         "schedule.add" => {
@@ -154,44 +167,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let enabled = params.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
             Ok(json!(kxen_app::core::schedule::set_enabled(id, enabled)))
         }
-        "diagnostics.export" => {
-            let state = app.state::<Arc<AppState>>();
-            let store = state.auth_store.lock().map_err(|e| e.to_string())?.clone();
-            let report = crate::doctor::doctor_report(&store);
-            let config_text = std::fs::read_to_string(kxen_app::core::paths::config_dir().join("config.toml")).unwrap_or_default();
-            let health = crate::doctor::system_health(&state).await?;
-            let mut md =
-                format!("# kxen diagnostics\n\n- version: {}\n- at: {:?}\n\n", env!("CARGO_PKG_VERSION"), std::time::SystemTime::now());
-            md.push_str("## providers\n\n");
-            for e in &report.entries {
-                md.push_str(&format!("- {} [{}]: {} ({})\n", e.display, e.provider, e.status, e.detail));
-            }
-            md.push_str("\n## mcp servers\n\n");
-            if health.mcp.is_empty() {
-                md.push_str("- (none configured)\n");
-            }
-            for s in &health.mcp {
-                md.push_str(&format!("- {} [{}]: {} tools, {} resources\n", s.name, s.status, s.tools, s.resources));
-            }
-            md.push_str(&format!("\n## lsp (root: {})\n\n", health.lsp_root));
-            if health.lsp.is_empty() {
-                md.push_str("- (no language server started yet)\n");
-            }
-            for l in &health.lsp {
-                md.push_str(&format!("- {}: {}\n", l.language, l.status));
-            }
-            md.push_str(&format!("\n## event bus\n\n- capacity: {}\n- receivers: {}\n", health.bus_capacity, health.bus_receivers));
-            md.push_str(&format!(
-                "\n## mrm ({} dispatches)\n\n```\n{}\n```\n\n## config.toml\n\n```toml\n{config_text}\n```\n",
-                health.mrm_dispatches, health.mrm_describe
-            ));
-            let path = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp")).join("Downloads").join(format!(
-                "kxen-diagnostics-{}.md",
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
-            ));
-            std::fs::write(&path, md).map_err(|e| e.to_string())?;
-            Ok(json!({ "path": path.to_string_lossy() }))
-        }
+        "diagnostics.export" => super::ops_diagnostics::export(app).await,
         "notifications.list" => {
             let state = app.state::<Arc<AppState>>();
             let buf = state.notifications.lock().map_err(|e| e.to_string())?;
@@ -260,6 +236,8 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             write_toml(&path, &doc)?;
             Ok(json!({ "send_when_running": policy }))
         }
+        "config.set_experimental" => super::settings::set_experimental(params, &app.state::<Arc<AppState>>()).await,
+        "config.set_limits" => super::settings::set_limits(params, &app.state::<Arc<AppState>>()),
         "voice.start" => {
             let config = load_config()?;
             let locale = params.get("locale").and_then(Value::as_str).unwrap_or(&config.voice.locale);
@@ -319,6 +297,7 @@ async fn test_dispatch(app: &AppHandle, params: &Value) -> Result<Value, String>
     let deps = kxen_app::agent::subagent::SubagentDeps {
         registry: state.registry.clone(),
         workdir: Arc::from(runtime.root()),
+        path_grants: Arc::new(Default::default()),
         store,
         mrm,
         hooks: Some(runtime.hooks()),

@@ -21,6 +21,19 @@ pub struct Config {
     pub search: SearchConfig,
     /// 内置编码规则注入开关（缺省开启）
     pub coding_rules: CodingRulesConfig,
+    /// 涉及外发内容或扩大宿主机能力面的实验功能，全部缺省关闭。
+    pub experimental: ExperimentalConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// 定期把近期会话发送给当前 Provider 并写入个人知识库。
+    pub automatic_knowledge_distillation: bool,
+    /// Chrome automation 无法完整拦截页面后续导航和全部子资源，需用户显式启用。
+    pub browser_automation: bool,
+    /// HTTP/SSE MCP 会把工具参数发送到远端 server，需用户显式启用。
+    pub remote_mcp: bool,
 }
 
 /// 内置编码规则（prompt.rs CODING_RULES）：app 自带的通用编码纪律，对所有会话生效。
@@ -133,12 +146,14 @@ impl Default for StatuslineConfig {
 #[serde(default)]
 pub struct Limits {
     pub global_concurrent: u32,
+    /// 全部模型调用的每日 token 硬上限；None = 不限制。
+    pub daily_token_budget: Option<u64>,
     pub providers: HashMap<String, ProviderLimit>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { global_concurrent: 8, providers: HashMap::new() }
+        Self { global_concurrent: 8, daily_token_budget: None, providers: HashMap::new() }
     }
 }
 
@@ -147,6 +162,14 @@ impl Default for Limits {
 pub struct ProviderLimit {
     pub concurrent: Option<u32>,
     pub rpm: Option<u32>,
+    /// 用户提供的真实计价口径；订阅或未知价格留空，不做虚假金额估算。
+    pub input_usd_per_million: Option<f64>,
+    pub output_usd_per_million: Option<f64>,
+    pub daily_cost_budget_usd: Option<f64>,
+    /// 连续失败熔断；0 = 关闭，None 使用默认值 3。
+    pub circuit_failure_threshold: Option<u32>,
+    /// 熔断冷却秒数；None 使用默认值 60。
+    pub circuit_cooldown_seconds: Option<u64>,
 }
 
 impl Config {
@@ -193,6 +216,9 @@ impl Config {
         if other.limits.global_concurrent != 0 {
             self.limits.global_concurrent = other.limits.global_concurrent;
         }
+        if other.limits.daily_token_budget.is_some() {
+            self.limits.daily_token_budget = other.limits.daily_token_budget;
+        }
         self.limits.providers.extend(other.limits.providers);
         for (event, defs) in other.hooks {
             self.hooks.entry(event).or_default().extend(defs);
@@ -213,6 +239,9 @@ impl Config {
         if other.coding_rules != CodingRulesConfig::default() {
             self.coding_rules = other.coding_rules;
         }
+        if other.experimental != ExperimentalConfig::default() {
+            self.experimental = other.experimental;
+        }
     }
 }
 
@@ -220,6 +249,11 @@ impl Config {
 /// prompt 组装每次现读：设置页开关下一轮即生效，无需重启。
 pub fn coding_rules_enabled() -> bool {
     Config::load(&crate::core::paths::config_dir().join("config.toml"), None).map(|c| c.coding_rules.enabled).unwrap_or(true)
+}
+
+/// 实验能力只读取个人配置，项目配置不能替用户扩大数据外发或宿主机能力面。
+pub fn experimental_config() -> ExperimentalConfig {
+    Config::load(&crate::core::paths::config_dir().join("config.toml"), None).map(|c| c.experimental).unwrap_or_default()
 }
 
 /// voice.set_engine 的局部更新：覆盖 engine/fallback（空数组 = 清空降级链；

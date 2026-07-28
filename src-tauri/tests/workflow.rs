@@ -18,7 +18,7 @@ fn test_deps() -> SubagentDeps {
     roles.insert("execution".into(), RoleBinding { provider: "xai".into(), model: "grok".into(), fallback: None, account: None });
     let config = Config {
         roles,
-        limits: Limits { global_concurrent: 4, providers: HashMap::<String, ProviderLimit>::new() },
+        limits: Limits { global_concurrent: 4, daily_token_budget: None, providers: HashMap::<String, ProviderLimit>::new() },
         hooks: HashMap::new(),
         statusline: Default::default(),
         voice: Default::default(),
@@ -27,10 +27,12 @@ fn test_deps() -> SubagentDeps {
         embedding: Default::default(),
         search: Default::default(),
         coding_rules: Default::default(),
+        experimental: Default::default(),
     };
     SubagentDeps {
         registry: Arc::new(kxen_app::tools::task::TaskRegistry::new()),
         workdir: Arc::from(std::path::Path::new("/tmp")),
+        path_grants: Arc::new(Default::default()),
         store: kxen_app::auth::credential::AuthStore::default(),
         mrm: Arc::new(ModelResourceManager::new(config)),
         hooks: None,

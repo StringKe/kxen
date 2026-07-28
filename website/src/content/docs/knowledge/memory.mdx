@@ -13,11 +13,11 @@ Memory 保存从历史 Session 和长期工作中提炼出的稳定信息。它�
 Memory 可以来自:
 
 - Agent 主动通过 knowledge 工具沉淀。
-- Session 删除前的尽力蒸馏。
-- 后台 consolidation。
+- 用户在删除 Session 时明确选择「删除并沉淀个人知识」。
+- 用户在个人设置中明确开启的后台 consolidation。
 - 用户维护的长期条目。
 
-自动沉淀不能把失败输出写成事实，也不能静默覆盖项目 Rules。
+自动知识沉淀默认关闭，只读取个人配置，并且只写个人 scope。启用后，每 30 分钟把近 24 小时活跃 Session 各自最近 20 条文本和注入上下文发送给 Settings 中显示的默认 Provider。删除 Session 默认直接删除；选择沉淀时，界面会显示本次目标 Provider，Provider 处理失败会保留 Session 并显示错误，不会静默删除。自动沉淀不能把失败输出写成事实，也不能静默覆盖项目 Rules。
 
 ## 检索
 
@@ -39,8 +39,8 @@ Memory 与 Notes 一起参与检索:
 
 项目 Memory 位于 `file:///path/to/workspace/.agents/memory/`。个人 Memory 位于 `file:///Users/you/.agents/memory/`。
 
-项目 Memory 应只保存团队长期需要的事实。个人偏好、个人工具习惯和跨项目经验保存在个人 scope。
+项目 Memory 应只保存团队长期需要的事实。Agent 通过 knowledge 工具写项目 scope 前必须显示 description 和 content 预览并获得 Approval；没有 Approval channel 时失败关闭。个人偏好、个人工具习惯和跨项目经验保存在个人 scope。
 
 ## 与 Session 的区别
 
-Session 是完整执行历史。Memory 是从历史中选出的稳定知识。删除 Session 不保证每条内容都会转成 Memory，因此重要信息应显式沉淀。
+Session 是完整执行历史。Memory 是从历史中选出的稳定知识。直接删除 Session 不会自动生成 Memory；只有明确选择「删除并沉淀个人知识」才执行一次蒸馏，因此重要信息应显式沉淀。

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use super::context::AgentContext;
 use super::goal_tool::execute_goal_tool;
 use super::helpers::{parse_shell, resolve_path};
+use super::knowledge_tool::execute_knowledge_tool;
 use super::task_tool::execute_task_tool;
 
 /// Ask 档审批通道（broker+bus 齐备才为 Some；hooks 与 exec 共用）。
@@ -50,7 +51,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
         "exec" => {
             let params = ExecParams {
                 shell_type: parse_shell(args.get("type").and_then(Value::as_str).unwrap_or("zsh"))?,
-                path: args.get("path").and_then(Value::as_str).unwrap_or(cwd).to_string(),
+                path: resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), ctx)?.to_string_lossy().into_owned(),
                 command: args.get("command").and_then(Value::as_str).ok_or("missing command")?.to_string(),
                 timeout_ms: args.get("timeout_ms").and_then(Value::as_u64),
                 background: args.get("background").and_then(Value::as_bool).unwrap_or(false),
@@ -72,7 +73,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
             }
         }
         "read" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, &ctx.workdir);
+            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
             let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
             read(&path, &ctx.tracker, cwd, offset, limit)
@@ -97,7 +98,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 .map_err(|e| e.to_string())
         }
         "edit" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, &ctx.workdir);
+            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let spec = match args.get("mode").and_then(Value::as_str) {
                 Some("anchors") => EditSpec::Anchors {
                     edits: serde_json::from_value(args.get("edits").cloned().unwrap_or(json!([]))).map_err(|e| e.to_string())?,
@@ -114,7 +115,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), &path))
         }
         "write" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, &ctx.workdir);
+            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
             write(&path, content, &ctx.tracker, cwd)
                 .map(|_| format!("wrote {} bytes", content.len()))
@@ -122,29 +123,17 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), &path))
         }
         "delete" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, &ctx.workdir);
+            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             delete(&path, &ctx.tracker, cwd).map(|_| "moved to Trash".to_string()).map_err(|e| e.to_string())
         }
-        "lsp" => crate::lsp::lsp_tool(ctx.lsp.as_ref(), args, &ctx.workdir, ctx.tracker.files()).await,
-        "knowledge" => match args.get("action").and_then(Value::as_str).ok_or("missing action")? {
-            "add" => {
-                let scope = crate::knowledge::Scope::parse(args.get("scope").and_then(Value::as_str).unwrap_or("personal"))?;
-                let slug = args.get("slug").and_then(Value::as_str);
-                let kind = args.get("type").and_then(Value::as_str).unwrap_or("note");
-                let description = args.get("description").and_then(Value::as_str).ok_or("missing description")?;
-                let content = args.get("content").and_then(Value::as_str).ok_or("missing content")?;
-                let path = crate::knowledge::add(scope, &ctx.workdir, slug, kind, description, content)?;
-                Ok(format!("knowledge saved ({}): {path}", scope.as_str()))
+        "lsp" => {
+            let mut safe_args = args.clone();
+            if let Some(path) = args.get("path").and_then(Value::as_str) {
+                safe_args["path"] = json!(resolve_path(path, ctx)?.to_string_lossy());
             }
-            "list" => Ok(serde_json::to_string_pretty(&crate::knowledge::list(&ctx.workdir)).unwrap_or_default()),
-            "remove" => {
-                let scope = crate::knowledge::Scope::parse(args.get("scope").and_then(Value::as_str).ok_or("missing scope")?)?;
-                let slug = args.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
-                crate::knowledge::remove(scope, &ctx.workdir, slug)?;
-                Ok(format!("knowledge removed ({}/{slug})", scope.as_str()))
-            }
-            other => Err(format!("unknown knowledge action: {other}")),
-        },
+            crate::lsp::lsp_tool(ctx.lsp.as_ref(), &safe_args, &ctx.workdir, ctx.tracker.files()).await
+        }
+        "knowledge" => execute_knowledge_tool(args, ctx).await,
         "schedule" => match args.get("action").and_then(Value::as_str).ok_or("missing action")? {
             "add" => {
                 let cron = args.get("cron").and_then(Value::as_str).ok_or("missing cron")?;
@@ -175,7 +164,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
             execute_goal_tool(args, ctx.session_id.as_deref(), ctx.bus.as_ref(), Some(&judge)).await
         }
         "glob" => {
-            let base = resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), &ctx.workdir);
+            let base = resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), ctx)?;
             let pattern = args.get("pattern").and_then(Value::as_str).ok_or("missing pattern")?;
             crate::tools::search::glob_files(pattern, &base)
                 .map(|r| {
@@ -195,7 +184,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 .map_err(|e| e.to_string())
         }
         "grep" => {
-            let base = resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), &ctx.workdir);
+            let base = resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), ctx)?;
             let pattern = args.get("pattern").and_then(Value::as_str).ok_or("missing pattern")?;
             let filter = args.get("glob").and_then(Value::as_str);
             crate::tools::search::grep_files(pattern, &base, filter)
@@ -261,7 +250,12 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
             let url = args.get("url").and_then(Value::as_str).ok_or("missing url")?;
             crate::tools::webfetch::fetch_text(url).await
         }
-        "browser" => crate::tools::browser::dispatch(args, ctx.extras.as_deref().map(|e| &e.browser), ctx.session_id.as_deref()).await,
+        "browser" => {
+            if !crate::core::config::experimental_config().browser_automation {
+                return Err("browser automation is experimental and disabled; enable it explicitly in Settings > Advanced".into());
+            }
+            crate::tools::browser::dispatch(args, ctx.extras.as_deref().map(|e| &e.browser), ctx.session_id.as_deref()).await
+        }
         "websearch" => {
             let query = args.get("query").and_then(Value::as_str).ok_or("missing query")?;
             Ok(crate::tools::websearch::format_hits(&crate::tools::websearch::search(query, &ctx.store).await?))

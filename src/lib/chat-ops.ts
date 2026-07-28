@@ -156,6 +156,18 @@ export async function goalTransit(id: string, action: GoalAction): Promise<GoalI
   return client.rpc<GoalInfo>(`goal.${action}`, { id });
 }
 
+export async function goalCreate(
+  objective: string,
+  completionCriteria: string,
+  sessionId?: string,
+): Promise<GoalInfo> {
+  return client.rpc<GoalInfo>("goal.create", {
+    objective,
+    completion_criteria: completionCriteria,
+    session_id: sessionId || undefined,
+  });
+}
+
 // ---------------- 后台任务 ----------------
 
 export interface TaskInfo {

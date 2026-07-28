@@ -18,6 +18,8 @@ kxen 支持:
 
 stdio server 由本机命令启动。远端 server 使用 URL，并可以附带固定 header 或 OAuth 配置。
 
+Streamable HTTP 和 SSE 属于 Remote MCP，默认关闭，只有用户在个人 Settings 中显式开启后才会加载。项目配置不能替用户开启。远端调用会把工具参数发送给对应 server；关闭开关后，当前 Workspace 的 MCP runtime 会立即重载并移除远端 server。
+
 ## Scope
 
 用户 MCP 对所有 Workspace 可见。项目 MCP 属于当前 Workspace，同名项目 server 覆盖用户 server。
@@ -40,7 +42,7 @@ Settings 的高级区域显示 MCP server 状态、工具和资源数量。用�
 
 ## 凭证
 
-远端 token、OAuth secret 和固定敏感 header 不应提交到项目仓库。项目配置可以描述连接，但 Secret 保存在本地安全位置。
+远端 token、OAuth secret 和固定敏感 header 不应提交到项目仓库。项目配置可以描述连接，但 Secret 保存在本地安全位置。启用 Remote MCP 前需要确认 server 的运营方、数据保留和访问范围。
 
 ## 故障边界
 

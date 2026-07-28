@@ -32,9 +32,9 @@ pub(super) async fn finalize_run(end: RunEnd<'_>) {
     notify.close({
         let state = Arc::clone(state);
         let sid = session_id.clone();
-        std::sync::Arc::new(move |text: String| {
-            state.pending_messages.enqueue(&sid, text, vec![], vec![]);
-            kxen_app::agent::background::kick_late(&sid);
+        std::sync::Arc::new(move |text: String| match state.pending_messages.enqueue(&sid, text, vec![], vec![]) {
+            Ok(_) => kxen_app::agent::background::kick_late(&sid),
+            Err(error) => tracing::error!(session = sid, %error, "late background notification enqueue failed"),
         })
     });
     // P0-2a 摘除：此后 teammate -> lead 报告走 pending queue 续跑路（relay 查无 router）
@@ -100,14 +100,25 @@ pub(super) async fn finalize_run(end: RunEnd<'_>) {
     kxen_app::core::shared::lock(&state.run_streams).remove(&stream_id);
     append_assistant_and_publish(&sessions_dir, &assistant_msg, &state.bus, &stream_id, &outcome.terminal);
 
-    // 队列下一条：run 进行中收到的消息按序接续（pop 即落盘重写，崩溃窗口丢一条与旧纯内存等价）。
-    // pop 前复查本 run token：已 cancel（abort/interrupt）不续跑——收尾 pop 起新 run 会让 abort 失效；
+    // Queue delivery 在用户消息幂等落盘后已经 ack。这里只 claim 下一条；
+    // claim 前复查本 run token：已 cancel（abort/interrupt）不续跑，收尾起新 run 会让 abort 失效；
     // 残留队列由下一次 send 的 run 收尾或重启 restore 消化
-    let next = if cancel.is_cancelled() { None } else { state.pending_messages.pop(&session_id) };
+    let next = if cancel.is_cancelled() {
+        None
+    } else {
+        match state.pending_messages.claim(&session_id) {
+            Ok(next) => next,
+            Err(error) => {
+                tracing::error!(session = session_id, %error, "pending queue claim failed after run");
+                state.bus.publish(kxen_app::core::event::Event::notify(format!("队列续跑失败：{error}"), Some(session_id.clone())));
+                None
+            }
+        }
+    };
     if let Some(q) = next {
         let stream_id = super::protocol::stream_id("run");
         kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), session_id.clone());
-        super::llm_task::spawn_run(stream_id, session_id, q.text, q.context, q.images, app.clone());
+        super::llm_task::spawn_run(stream_id, session_id, q.text, q.context, q.images, Some(q.id), app.clone());
     }
 }
 

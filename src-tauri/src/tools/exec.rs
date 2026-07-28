@@ -107,38 +107,40 @@ impl<'a> ApprovalCtx<'a> {
     }
 }
 
-/// safety 闸门：Deny 直接拒绝；Ask 有审批通道则挂起等用户决定，无通道/拒绝/中断按拒绝。
+/// 宿主机执行闸门：Deny 直接拒绝，其余命令逐次展示完整 command/cwd 并等待用户批准。
+/// Shell 不是文件工具的 Workspace sandbox；逐次审批是唯一放行入口，无通道时 fail closed。
 /// 评估用的 cwd 必须是真实执行目录（与 spawn 的 current_dir 一致），否则相对路径判定失真。
 pub async fn safety_gate(command: &str, cwd: &str, approval: Option<&ApprovalCtx<'_>>) -> Result<(), ExecError> {
-    match evaluate_shell_command(command, cwd) {
+    let reason = match evaluate_shell_command(command, cwd) {
         Verdict::Deny { rule_id, reason, suggestion } => Err(ExecError::Safety {
             rule: rule_id.to_string(),
             reason: reason.into_owned(),
             suggestion: suggestion.map(|s| format!(" Suggestion: {s}")).unwrap_or_default(),
-        }),
-        Verdict::Ask { reason } => {
-            let Some(appr) = approval else {
-                return Err(ExecError::Safety {
-                    rule: "approval".into(),
-                    reason: format!("{reason}（当前上下文无审批通道，按拒绝处理）"),
-                    suggestion: String::new(),
-                });
-            };
-            match crate::agent::approval::request_approval(appr, command, &reason).await {
-                crate::agent::approval::ApprovalOutcome::Allow => Ok(()),
-                crate::agent::approval::ApprovalOutcome::Timeout => Err(ExecError::Safety {
-                    rule: "approval".into(),
-                    reason: format!("{reason}（用户超时未响应）"),
-                    suggestion: String::new(),
-                }),
-                crate::agent::approval::ApprovalOutcome::Deny => Err(ExecError::Safety {
-                    rule: "approval".into(),
-                    reason: format!("{reason}（用户拒绝或已中断）"),
-                    suggestion: String::new(),
-                }),
-            }
+        })?,
+        Verdict::Ask { reason } => format!("{reason}。Shell 将在宿主机目录 {cwd} 执行，可能访问 Workspace 外数据"),
+        Verdict::Allow | Verdict::Recoverable => {
+            format!("Shell 将在宿主机目录 {cwd} 执行，可能访问 Workspace 外数据；Kxen 不将其声明为 sandbox")
         }
-        _ => Ok(()),
+    };
+    let Some(appr) = approval else {
+        return Err(ExecError::Safety {
+            rule: "approval".into(),
+            reason: format!("{reason}（当前上下文无审批通道，按拒绝处理）"),
+            suggestion: String::new(),
+        });
+    };
+    match crate::agent::approval::request_approval(appr, command, &reason).await {
+        crate::agent::approval::ApprovalOutcome::Allow => Ok(()),
+        crate::agent::approval::ApprovalOutcome::Timeout => {
+            Err(ExecError::Safety {
+                rule: "approval".into(), reason: format!("{reason}（用户超时未响应）"), suggestion: String::new()
+            })
+        }
+        crate::agent::approval::ApprovalOutcome::Deny => {
+            Err(ExecError::Safety {
+                rule: "approval".into(), reason: format!("{reason}（用户拒绝或已中断）"), suggestion: String::new()
+            })
+        }
     }
 }
 
@@ -305,32 +307,5 @@ pub async fn spawn_task(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn explicit_background_with_timeout_is_watched() {
-        let registry = Arc::new(TaskRegistry::new());
-        let params = ExecParams {
-            shell_type: ShellKind::Zsh,
-            path: std::env::temp_dir().to_string_lossy().into_owned(),
-            command: "sleep 30".into(),
-            timeout_ms: Some(300),
-            background: true,
-        };
-        let ExecOutcome::Background { task_id } = exec(params, &registry, "/tmp", None).await.expect("exec") else {
-            panic!("background: true 必须返回 Background");
-        };
-        let task = registry.get(&task_id).expect("spawned task registered");
-        let mut exited = false;
-        for _ in 0..100 {
-            if lock(&task.exit_code).is_some() {
-                exited = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(exited, "显式 background + timeout_ms 必须被看门狗终止");
-        assert_eq!(task.status(), crate::tools::task::TaskStatus::Killed);
-    }
-}
+#[path = "exec_tests.rs"]
+mod tests;

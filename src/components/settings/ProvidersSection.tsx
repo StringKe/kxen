@@ -22,6 +22,7 @@ import { GUIDES } from "../../lib/provider-guides";
 import { flashErr, flashOk } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
 import AddAccountPanel from "./AddAccountPanel";
+import ProviderCompatibility from "./ProviderCompatibility";
 
 interface Row extends AccountInfo {
   verify?: VerifyOutcome;
@@ -178,6 +179,8 @@ export default function ProvidersSection() {
           </button>
         </div>
       </div>
+
+      <ProviderCompatibility providers={providers()} />
 
       <Show when={issues().length > 0}>
         <div class="rounded border border-[var(--warn)]/50 bg-[var(--warn)]/5 px-3 py-2 text-xs space-y-0.5">

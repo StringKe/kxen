@@ -234,6 +234,10 @@ impl McpManager {
         approval: Option<&crate::tools::exec::ApprovalCtx<'_>>,
     ) -> Result<String, String> {
         let (server, tool) = tools::split_prefixed(prefixed).ok_or_else(|| format!("invalid mcp tool name: {prefixed}"))?;
+        let remote = self.servers.lock().expect("mcp").get(server).is_some_and(|entry| matches!(&entry.config, ServerConfig::Remote(_)));
+        if remote && !crate::core::config::experimental_config().remote_mcp {
+            return Err(format!("remote MCP tool {prefixed} is experimental and disabled; enable it explicitly in Settings > Advanced"));
+        }
         match self.policy_for(server, tool) {
             ToolPolicy::Deny => Err(format!("mcp tool {prefixed} denied by toolPolicies")),
             ToolPolicy::Allow => self.call(server, tool, args).await,
@@ -294,51 +298,14 @@ impl McpManager {
 /// roots 取 workdir：roots/list 反向请求答的就是当前 workspace 根。
 pub async fn reload_for_workspace(workdir: &std::path::Path, mcp: &Arc<McpManager>) {
     let trusted = crate::core::trust::is_trusted(workdir);
-    let (configs, policies) = config::load(workdir, trusted);
+    let (mut configs, policies) = config::load(workdir, trusted);
+    if !crate::core::config::experimental_config().remote_mcp {
+        configs.retain(|config| matches!(config, ServerConfig::Stdio(_)));
+    }
     let roots = vec![workdir.to_string_lossy().into_owned()];
     mcp.reload(configs, policies, roots).await;
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cap_output_truncates_without_splitting_utf8() {
-        let short = "abc汉字";
-        assert_eq!(cap_output(short), short);
-        let long: String = "汉".repeat(OUTPUT_CAP + 10);
-        let capped = cap_output(&long);
-        assert!(capped.contains("truncated"), "截断必须带标记");
-        assert!(capped.chars().count() > OUTPUT_CAP, "标记本身在 cap 之外");
-        assert!(!capped.contains('\u{fffd}'), "不得出半个 UTF-8 的替换符");
-    }
-
-    #[test]
-    fn auth_error_roundtrips_into_status() {
-        let m = McpManager::new();
-        let cfg = ServerConfig::Stdio(config::StdioConfig { name: "s".into(), command: "true".into(), args: vec![], env: HashMap::new() });
-        m.servers
-            .lock()
-            .expect("mcp")
-            .insert("s".to_string(), Entry { config: cfg, client: None, needs_auth: true, last_auth_error: None });
-        m.set_auth_error("s", Some("callback timeout".into()));
-        let st = m.status().into_iter().find(|s| s.name == "s").expect("server s");
-        assert_eq!(st.last_auth_error.as_deref(), Some("callback timeout"), "失败原因必须透出到 status");
-        m.set_auth_error("s", None);
-        assert!(m.status()[0].last_auth_error.is_none(), "新一次发起/成功后必须清掉");
-        m.set_auth_error("ghost", Some("x".into())); // 不存在的 server 不得 panic
-    }
-
-    #[tokio::test]
-    async fn reload_is_serialized() {
-        let m = McpManager::new();
-        let guard = m.reload_lock.lock().await;
-        let m2 = m.clone();
-        let pending = tokio::spawn(async move { m2.reload(vec![], PolicySet::default(), vec![]).await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!pending.is_finished(), "持锁期间并发 reload 不得进入执行");
-        drop(guard);
-        pending.await.expect("锁释放后 reload 必须完成");
-    }
-}
+#[path = "tests.rs"]
+mod tests;

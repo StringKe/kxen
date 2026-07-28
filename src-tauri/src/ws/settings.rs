@@ -149,9 +149,111 @@ pub(super) fn set_coding_rules(params: &Value) -> Result<Value, String> {
     Ok(json!({ "enabled": enabled }))
 }
 
+pub(super) async fn set_experimental(params: &Value, state: &Arc<AppState>) -> Result<Value, String> {
+    let key = params.get("key").and_then(Value::as_str).ok_or("missing key")?;
+    if !matches!(key, "automatic_knowledge_distillation" | "browser_automation" | "remote_mcp") {
+        return Err("unknown experimental setting".into());
+    }
+    let enabled = params.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
+    let path = kxen_app::core::paths::config_dir().join("config.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml::Table =
+        if text.trim().is_empty() { toml::Table::new() } else { toml::from_str(&text).map_err(|e| format!("config.toml parse: {e}"))? };
+    let section = doc.entry("experimental").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !section.is_table() {
+        *section = toml::Value::Table(toml::Table::new());
+    }
+    section.as_table_mut().expect("experimental table").insert(key.into(), toml::Value::Boolean(enabled));
+    std::fs::create_dir_all(kxen_app::core::paths::config_dir()).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    if key == "remote_mcp" {
+        state.workspace_runtimes.reload_all().await?;
+    }
+    Ok(json!({ "key": key, "enabled": enabled }))
+}
+
+/// MRM 预算、显式计价和熔断参数写回。所有金额必须由用户提供实际合同口径，
+/// 后端只计算和执行阈值，不维护可能漂移的公开模型价目表。
+pub(super) fn set_limits(params: &Value, state: &Arc<AppState>) -> Result<Value, String> {
+    let path = kxen_app::core::paths::config_dir().join("config.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml::Table =
+        if text.trim().is_empty() { toml::Table::new() } else { toml::from_str(&text).map_err(|e| format!("config.toml parse: {e}"))? };
+    let limits = doc.entry("limits").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if !limits.is_table() {
+        *limits = toml::Value::Table(toml::Table::new());
+    }
+    let limits = limits.as_table_mut().expect("limits table");
+    set_optional_integer(limits, "daily_token_budget", params.get("daily_token_budget"))?;
+
+    if let Some(provider) = params.get("provider").and_then(Value::as_str) {
+        if provider.is_empty() || provider.chars().any(char::is_whitespace) {
+            return Err("provider must be a non-empty id without whitespace".into());
+        }
+        let providers = limits.entry("providers").or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !providers.is_table() {
+            *providers = toml::Value::Table(toml::Table::new());
+        }
+        let provider_limit =
+            providers.as_table_mut().expect("providers table").entry(provider).or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !provider_limit.is_table() {
+            *provider_limit = toml::Value::Table(toml::Table::new());
+        }
+        let table = provider_limit.as_table_mut().expect("provider limit table");
+        for key in ["input_usd_per_million", "output_usd_per_million", "daily_cost_budget_usd"] {
+            set_optional_float(table, key, params.get(key))?;
+        }
+        for key in ["circuit_failure_threshold", "circuit_cooldown_seconds"] {
+            set_optional_integer(table, key, params.get(key))?;
+        }
+    }
+
+    std::fs::create_dir_all(kxen_app::core::paths::config_dir()).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let config = kxen_app::core::config::Config::load(&path, None).map_err(|e| e.to_string())?;
+    *state.mrm.write().expect("mrm lock") = std::sync::Arc::new(kxen_app::llm::mrm::ModelResourceManager::new(config));
+    Ok(json!({ "saved": true }))
+}
+
+fn set_optional_integer(table: &mut toml::Table, key: &str, value: Option<&Value>) -> Result<(), String> {
+    match value {
+        None => {}
+        Some(Value::Null) => {
+            table.remove(key);
+        }
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| format!("{key} must be a non-negative integer or null"))?;
+            let number = i64::try_from(number).map_err(|_| format!("{key} is too large"))?;
+            table.insert(key.into(), toml::Value::Integer(number));
+        }
+    }
+    Ok(())
+}
+
+fn set_optional_float(table: &mut toml::Table, key: &str, value: Option<&Value>) -> Result<(), String> {
+    match value {
+        None => {}
+        Some(Value::Null) => {
+            table.remove(key);
+        }
+        Some(value) => {
+            let number = value.as_f64().ok_or_else(|| format!("{key} must be a non-negative number or null"))?;
+            if !number.is_finite() || number < 0.0 {
+                return Err(format!("{key} must be finite and non-negative"));
+            }
+            table.insert(key.into(), toml::Value::Float(number));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::merge_binding;
+    use super::{merge_binding, set_optional_float, set_optional_integer};
 
     fn old_binding() -> toml::map::Map<String, toml::Value> {
         let mut t = toml::map::Map::new();
@@ -196,5 +298,15 @@ mod tests {
         let b = merge_binding(None, "anthropic", "m", None, None);
         assert!(!b.contains_key("fallback"));
         assert!(!b.contains_key("account"));
+    }
+
+    #[test]
+    fn limit_values_are_validated_and_null_removes() {
+        let mut table = toml::Table::new();
+        set_optional_integer(&mut table, "daily_token_budget", Some(&serde_json::json!(1000))).unwrap();
+        assert_eq!(table["daily_token_budget"].as_integer(), Some(1000));
+        set_optional_integer(&mut table, "daily_token_budget", Some(&serde_json::Value::Null)).unwrap();
+        assert!(!table.contains_key("daily_token_budget"));
+        assert!(set_optional_float(&mut table, "daily_cost_budget_usd", Some(&serde_json::json!(-1.0))).is_err());
     }
 }

@@ -3,7 +3,8 @@
 use crate::llm::ModelRef;
 use crate::tools::fs_tool::FileTracker;
 use crate::tools::task::TaskRegistry;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::events::AgentEvent;
@@ -52,6 +53,9 @@ pub struct AgentContext {
     pub registry: Arc<TaskRegistry>,
     pub tracker: FileTracker,
     pub workdir: Arc<Path>,
+    /// Native-picker grants captured at run start. Credential paths remain
+    /// denied even when present in this set.
+    pub path_grants: Arc<HashSet<PathBuf>>,
     pub model: ModelRef,
     pub store: crate::auth::credential::AuthStore,
     pub max_turns: u32,

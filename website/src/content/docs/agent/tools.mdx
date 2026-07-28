@@ -12,21 +12,37 @@ sidebar:
 
 高频工具直接提供给模型:
 
+- `exec`
 - `read`
 - `edit`
 - `write`
-- `delete`
-- `exec`
 - `task`
+- `goal`
 - `glob`
 - `grep`
-- `lsp`
+- `todo`
+- `webfetch`
+- `websearch`
+- `tool_search`
+- `workflow`
+- `team`
 
-文件工具受 Workspace 和路径边界限制。`delete` 进入 macOS 废纸篓。`exec` 要求显式 Shell dialect，并把长命令转为后台任务。
+`team` 只对主会话 lead 可见，teammate 使用受限的 `send_message` 和 `team_task`。文件工具受 Workspace 和统一路径边界限制。`exec` 要求显式 Shell dialect，并把长命令转为后台任务。
 
 ## 按需工具
 
-低频工具通过 tool search 渐进披露，例如 Goal、Workflow、Team、Knowledge、Schedule、MCP 和 Browser。模型先发现契约，再调用具体工具，避免一次性把全部工具说明塞入上下文。
+低频工具通过 `tool_search` 渐进披露:
+
+- `delete`
+- `lsp`
+- `agent`
+- `worktree`
+- `skill`
+- `knowledge`
+- `schedule`
+- `browser`
+
+`Browser` 只有在个人配置中显式启用实验开关后才进入目录。MCP 工具有独立目录和策略，不属于内置 deferred tools 清单。模型先发现契约，再调用具体工具，避免一次性把全部工具说明塞入上下文。
 
 ## 权限来源
 
@@ -38,7 +54,7 @@ sidebar:
 - Safety 判定。
 - 用户 Approval。
 
-研究和规划角色默认没有写入和命令权限。execution 角色可以获得更完整的工具面，但仍不能覆盖 Safety 的硬拒绝。
+研究和规划角色默认没有写入和命令权限。execution 角色可以获得更完整的工具面，但仍不能覆盖 Safety 的硬拒绝。Shell 在宿主机执行，不是沙盒；每条命令都必须显示完整 command 和 cwd，并获得当次 Approval。
 
 ## 可观察性
 

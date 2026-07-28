@@ -151,6 +151,9 @@ fn build_ctx(
         tracker: crate::tools::fs_tool::FileTracker::default(),
         // member 绑其 team session 的目录，不随 workspace switch 漂移（旧 workspace 的活跃 member 继续干活）
         workdir: state.workdir.clone(),
+        // Teammates do not inherit native-picker grants because their loops can
+        // outlive the foreground run that captured the grant snapshot.
+        path_grants: Arc::new(std::collections::HashSet::new()),
         model: model.clone(),
         // 每轮取实时凭证快照：探测/刷新晚于 deps 构造，冻结副本会让派发报假「无可用模型」
         store: lock(&state.deps.store).clone(),

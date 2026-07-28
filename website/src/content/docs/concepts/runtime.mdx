@@ -47,4 +47,4 @@ Session 是用户工作的持久边界。一次 run 是 Session 中的一次执�
 
 ## 平台边界
 
-当前 Runtime 只支持 macOS 14 及以上版本和 Apple Silicon。Tauri bundle 目标是 DMG，签名身份尚未配置。
+当前 Runtime 只支持 macOS 14 及以上版本和 Apple Silicon。Tauri bundle 目标是 DMG。本地 Developer ID 签名、公证、staple 和 Gatekeeper 已经实测通过；GitHub Actions 使用同一发布链生成 updater artifacts。公开 Release 尚未发布，因此不能把流水线就绪等同于公众已经可下载。

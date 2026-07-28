@@ -12,6 +12,7 @@ pub struct ModelResourceManager {
     semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
     rpm_windows: Mutex<HashMap<String, Vec<Instant>>>,
     history: Mutex<std::collections::VecDeque<DispatchRecord>>,
+    health: crate::llm::mrm_health::Health,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -58,6 +59,7 @@ impl ModelResourceManager {
             semaphores: Mutex::new(HashMap::new()),
             rpm_windows: Mutex::new(HashMap::new()),
             history: Mutex::new(std::collections::VecDeque::new()),
+            health: Default::default(),
         }
     }
 
@@ -208,7 +210,20 @@ impl ModelResourceManager {
 
     /// 候选可用性：provider 并发有余量 + 该账号 RPM 窗未满（账号维度限流只剩 RPM）。
     async fn candidate_open(&self, provider: &str, key: &str) -> bool {
-        self.available(provider).await && !self.rpm_blocked(key).await
+        self.health.admit(provider, &self.config).await.is_ok() && self.available(provider).await && !self.rpm_blocked(key).await
+    }
+
+    /// 主会话显式模型在占槽前也必须经过预算和熔断，不得绕过角色路由的 admission。
+    pub async fn admit(&self, provider: &str) -> Result<(), String> {
+        self.health.admit(provider, &self.config).await
+    }
+
+    pub async fn record_result(&self, provider: &str, success: bool) {
+        self.health.record_result(provider, success, &self.config).await;
+    }
+
+    pub async fn health(&self) -> Vec<crate::llm::mrm_health::HealthReport> {
+        self.health.reports(&self.config).await
     }
 
     /// 并发池按 provider 段归一：同 provider 多账号共享一个池（"" 为全局池，不进此归一以外的拆分）。

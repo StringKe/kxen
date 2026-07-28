@@ -56,65 +56,18 @@ pub async fn build_context(items: &[ContextItem], workdir: &Path, allowed: Optio
     (out, failures)
 }
 
-fn resolve(input: &str, workdir: &Path) -> PathBuf {
-    let p = PathBuf::from(input);
-    if p.is_absolute() { p } else { workdir.join(p) }
-}
-
 /// @ 引用的 workspace 边界守卫：canonicalize 后必须仍在 workdir 内（symlink 跳出拦截），
 /// 例外是 picked 授权清单内的绝对路径（原生对话框选择即授权），
-/// 两者都再叠 safety 的保护路径规则（.git/系统目录/凭证不进模型上下文，授权不豁免）。
+/// 两者都走与工具调用相同的统一路径策略，授权不豁免凭证和应用数据保护。
 fn guard_context_path(full: &Path, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> Result<PathBuf, String> {
-    let canon_work = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-    let canon = canon_lenient(full);
-    if !canon.starts_with(&canon_work) && !allowed.is_some_and(|set| set.contains(&canon)) {
-        return Err(format!("path escapes workspace: {}", full.display()));
-    }
-    if let crate::tools::safety::Verdict::Deny { rule_id, reason, .. } =
-        crate::tools::safety::guard_path(&canon.to_string_lossy(), &canon_work.to_string_lossy())
-    {
-        return Err(format!("{rule_id}: {reason}"));
-    }
-    Ok(canon)
-}
-
-/// 不存在的目标也能做边界判定：canonicalize 失败时向上找存在的祖先拼接，再 lexical 归一 `..`。
-fn canon_lenient(p: &Path) -> PathBuf {
-    let resolved = if let Ok(c) = p.canonicalize() {
-        c
-    } else {
-        let mut missing = Vec::new();
-        let mut cur = p;
-        while !cur.exists() {
-            missing.push(cur);
-            match cur.parent() {
-                Some(parent) => cur = parent,
-                None => break,
-            }
-        }
-        let mut base = cur.canonicalize().unwrap_or_else(|_| cur.to_path_buf());
-        for m in missing.iter().rev() {
-            if let Some(name) = m.file_name() {
-                base.push(name);
-            }
-        }
-        base
-    };
-    let mut out = PathBuf::new();
-    for c in resolved.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    let empty = HashSet::new();
+    crate::tools::path_policy::resolve(&full.to_string_lossy(), workdir, allowed.unwrap_or(&empty))
+        .map(crate::tools::path_policy::ResolvedPath::into_path_buf)
 }
 
 fn file_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> (String, Option<String>) {
-    let full = resolve(path, workdir);
+    let full = PathBuf::from(path);
+    let full = if full.is_absolute() { full } else { workdir.join(full) };
     let rel = full.strip_prefix(workdir).unwrap_or(&full).to_string_lossy().into_owned();
     let full = match guard_context_path(&full, workdir, allowed) {
         Ok(p) => p,
@@ -149,7 +102,8 @@ fn file_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) ->
 }
 
 fn dir_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> (String, Option<String>) {
-    let full = resolve(path, workdir);
+    let full = PathBuf::from(path);
+    let full = if full.is_absolute() { full } else { workdir.join(full) };
     let rel = full.strip_prefix(workdir).unwrap_or(&full).to_string_lossy().into_owned();
     let full = match guard_context_path(&full, workdir, allowed) {
         Ok(p) => p,

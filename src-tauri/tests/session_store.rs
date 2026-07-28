@@ -201,3 +201,19 @@ fn reasoning_part_roundtrip() {
     assert!(matches!(&loaded[0].parts[0], Part::Reasoning { text } if text == "先分析问题结构"));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn idempotent_append_replays_same_delivery_once() {
+    let dir = tmp_dir("idempotent");
+    let session = ses::create(&dir, "/tmp").unwrap();
+    let mut message = ses::new_message(&session.id, Role::User, vec![Part::Text { text: "queued".into() }]);
+    message.id = "queue-delivery-1".into();
+    ses::append_message_idempotent(&dir, &message).unwrap();
+    ses::append_message_idempotent(&dir, &message).unwrap();
+    assert_eq!(ses::load_messages(&dir, &session.id).iter().filter(|item| item.id == message.id).count(), 1);
+
+    let mut collision = message.clone();
+    collision.parts = vec![Part::Text { text: "different".into() }];
+    assert_eq!(ses::append_message_idempotent(&dir, &collision).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    std::fs::remove_dir_all(dir).ok();
+}

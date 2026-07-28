@@ -11,7 +11,7 @@ import UsageSection from "../components/settings/UsageSection";
 import VoiceSection from "../components/settings/VoiceSection";
 import UpdateSection from "../components/settings/UpdateSection";
 import { client } from "../lib/client";
-import { configGet } from "../lib/chat";
+import { configGet, currentModel, doctor } from "../lib/chat";
 import { flashErr, flashOk } from "../lib/flash";
 import { onDragStart } from "../lib/drag";
 import { mode, setMode } from "../lib/theme";
@@ -31,11 +31,49 @@ const SECTIONS = [
 export default function Settings() {
   const [section, setSection] = createSignal<(typeof SECTIONS)[number]>("通用");
   const [sendPolicy, setSendPolicy] = createSignal("queue");
+  const [experimental, setExperimental] = createSignal({
+    automatic_knowledge_distillation: false,
+    browser_automation: false,
+    remote_mcp: false,
+  });
+  const [readiness, setReadiness] = createSignal({
+    workspace: false,
+    provider: false,
+    routing: false,
+  });
+  const [distillModel, setDistillModel] = createSignal("当前默认 Provider");
 
   onMount(async () => {
     // 首屏读取失败保持缺省 queue 不阻塞页面；用户改动时的保存路径才显错
-    const cfg = await configGet().catch(() => null);
+    const [cfg, report, model] = await Promise.all([
+      configGet().catch(() => null),
+      doctor().catch(() => null),
+      currentModel().catch(() => null),
+    ]);
+    if (model?.provider && model?.model) {
+      setDistillModel(`${model.provider}/${model.model}`);
+    }
     if (cfg?.send_when_running) setSendPolicy(cfg.send_when_running);
+    if (cfg?.experimental) {
+      setExperimental({
+        automatic_knowledge_distillation:
+          cfg.experimental.automatic_knowledge_distillation === true,
+        browser_automation: cfg.experimental.browser_automation === true,
+        remote_mcp: cfg.experimental.remote_mcp === true,
+      });
+    }
+    const availableProviders = new Set(
+      report?.entries
+        ?.filter((entry) => ["ok", "imported"].includes(entry.status))
+        .map((entry) => entry.provider) ?? [],
+    );
+    setReadiness({
+      workspace: Boolean(report?.system?.lsp_root),
+      provider: availableProviders.size > 0,
+      routing: Object.values(cfg?.roles ?? {}).some((binding) =>
+        availableProviders.has(binding.provider),
+      ),
+    });
   });
 
   const setPolicy = async (p: string) => {
@@ -43,6 +81,16 @@ export default function Settings() {
     setSendPolicy(p);
     await client.rpc("config.set_send_policy", { policy: p }).catch((e: unknown) => {
       setSendPolicy(prev); // 乐观更新失败回滚，不留假状态
+      flashErr(`保存失败：${e instanceof Error ? e.message : String(e)}`);
+    });
+  };
+
+  type ExperimentalKey = keyof ReturnType<typeof experimental>;
+  const setExperimentalFlag = async (key: ExperimentalKey, enabled: boolean) => {
+    const prev = experimental();
+    setExperimental({ ...prev, [key]: enabled });
+    await client.rpc("config.set_experimental", { key, enabled }).catch((e: unknown) => {
+      setExperimental(prev);
       flashErr(`保存失败：${e instanceof Error ? e.message : String(e)}`);
     });
   };
@@ -81,6 +129,38 @@ export default function Settings() {
 
         <div class="flex-1 min-w-0 space-y-4">
           <Show when={section() === "通用"}>
+            <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] p-4 space-y-2">
+              <div class="text-sm">首次运行检查</div>
+              <For
+                each={
+                  [
+                    ["workspace", "Workspace 已选择"],
+                    ["provider", "至少一个 Provider 凭证可用"],
+                    ["routing", "至少一个角色路由落到可用 Provider"],
+                  ] as const
+                }
+              >
+                {([key, label]) => (
+                  <div class="flex items-center gap-2 text-xs">
+                    <span class={readiness()[key] ? "text-[var(--ok)]" : "text-[var(--warn)]"}>
+                      {readiness()[key] ? "PASS" : "需要处理"}
+                    </span>
+                    <span class="text-[var(--text-dim)]">{label}</span>
+                    <Show when={!readiness()[key] && key === "provider"}>
+                      <button
+                        class="text-[var(--accent-hover)] hover:underline"
+                        onClick={() => setSection("提供商")}
+                      >
+                        去配置
+                      </button>
+                    </Show>
+                  </div>
+                )}
+              </For>
+              <div class="text-2xs text-[var(--text-faint)]">
+                Shell 命令逐次审批；Browser automation、Remote MCP、自动知识沉淀默认关闭。
+              </div>
+            </div>
             <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
               <div class="flex items-center justify-between px-4 py-3">
                 <div>
@@ -164,10 +244,59 @@ export default function Settings() {
 
           <Show when={section() === "高级"}>
             <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] p-4 space-y-3 text-sm text-[var(--text-dim)]">
-              <div>
-                hooks：`~/.config/kxen/config.toml` 的 [hooks]（默认全关，pre_tool_use 可阻断）
+              <div class="space-y-2">
+                <div class="text-sm text-[var(--text)]">实验能力与数据边界</div>
+                <div class="text-xs text-[var(--text-faint)]">
+                  模型调用会把你的消息、显式附件、注入知识和工具结果发送给当前会话显示的
+                  Provider。以下能力会扩大自动外发或网络访问范围，默认全部关闭。
+                </div>
+                <For
+                  each={
+                    [
+                      [
+                        "automatic_knowledge_distillation",
+                        "自动知识沉淀",
+                        `每 30 分钟把近 24 小时活跃 Session 各自最近 20 条文本和注入上下文发送给 ${distillModel()}，只写个人知识库`,
+                      ],
+                      [
+                        "browser_automation",
+                        "Browser automation",
+                        "页面后续导航和全部子资源尚不能形成完整 SSRF 边界",
+                      ],
+                      [
+                        "remote_mcp",
+                        "Remote MCP",
+                        "允许 HTTP/SSE MCP server 接收工具参数；本地 stdio MCP 不受影响",
+                      ],
+                    ] as const
+                  }
+                >
+                  {([key, label, hint]) => (
+                    <div class="flex items-center justify-between gap-4 py-1.5">
+                      <div>
+                        <div class="text-xs text-[var(--text)]">{label}</div>
+                        <div class="text-2xs text-[var(--text-faint)]">{hint}</div>
+                      </div>
+                      <button
+                        class="pressable px-2.5 py-1 rounded-md text-xs border"
+                        classList={{
+                          "border-[var(--warn)] text-[var(--warn)]": experimental()[key],
+                          "border-[var(--border)] text-[var(--text-dim)]": !experimental()[key],
+                        }}
+                        onClick={() => void setExperimentalFlag(key, !experimental()[key])}
+                      >
+                        {experimental()[key] ? "已启用" : "已关闭"}
+                      </button>
+                    </div>
+                  )}
+                </For>
               </div>
-              <div>statusline：同文件 [statusline] items 白名单控制显隐</div>
+              <div class="pt-2 border-t border-[var(--border)]">
+                <div>
+                  hooks：`~/.config/kxen/config.toml` 的 [hooks]（默认全关，pre_tool_use 可阻断）
+                </div>
+                <div>statusline：同文件 [statusline] items 白名单控制显隐</div>
+              </div>
               <div class="pt-2 border-t border-[var(--border)]">
                 <McpSection />
               </div>

@@ -12,6 +12,7 @@ fn test_ctx() -> AgentContext {
         registry: Arc::new(kxen_app::tools::task::TaskRegistry::new()),
         tracker: kxen_app::tools::fs_tool::FileTracker::default(),
         workdir: Arc::from(Path::new("/tmp")),
+        path_grants: Arc::new(Default::default()),
         model: ModelRef::new("p", "m"),
         store: kxen_app::auth::credential::AuthStore::default(),
         max_turns: 1,
@@ -56,6 +57,31 @@ async fn task_start_ask_needs_approval_channel() {
     let ctx = test_ctx();
     let err = execute_task_tool(&json!({ "action": "start", "command": "sudo ls" }), &ctx).await.unwrap_err();
     assert!(err.contains("approval"), "got: {err}");
+}
+
+#[tokio::test]
+async fn project_knowledge_add_and_remove_need_approval_channel() {
+    let ctx = test_ctx();
+    let add = dispatch_tool(
+        "knowledge",
+        &json!({
+            "action": "add",
+            "scope": "project",
+            "type": "note",
+            "description": "preview",
+            "content": "content"
+        }),
+        "/tmp",
+        &ctx,
+    )
+    .await
+    .unwrap_err();
+    assert!(add.contains("preview and approval"), "got: {add}");
+
+    let remove = dispatch_tool("knowledge", &json!({ "action": "remove", "scope": "project", "slug": "existing-note" }), "/tmp", &ctx)
+        .await
+        .unwrap_err();
+    assert!(remove.contains("preview and approval"), "got: {remove}");
 }
 
 /// 只读分类（P2-04 并行执行白名单）：read/glob/grep/search 类可并行，写工具保持串行。

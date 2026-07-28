@@ -22,6 +22,15 @@ export function scheduleList(): Promise<ScheduleJob[]> {
   return client.rpc("schedule.list");
 }
 
+export function scheduleAdd(
+  cron: string,
+  prompt: string,
+  sessionId: string,
+  once: boolean,
+): Promise<ScheduleJob> {
+  return client.rpc("schedule.add", { cron, prompt, session_id: sessionId, once });
+}
+
 export function scheduleSetEnabled(id: string, enabled: boolean): Promise<boolean> {
   return client.rpc("schedule.set_enabled", { id, enabled });
 }

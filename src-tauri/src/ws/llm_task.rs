@@ -13,6 +13,7 @@ pub(crate) async fn run_llm(
     text: String,
     context: Vec<kxen_app::agent::context::ContextItem>,
     mut images: Vec<kxen_app::llm::types::ImagePart>,
+    queue_delivery_id: Option<String>,
     app: AppHandle,
 ) {
     use kxen_app::core::session as ses;
@@ -34,6 +35,9 @@ pub(crate) async fn run_llm(
                 &stream_id,
                 kxen_app::agent::agent_loop::AgentEvent::Error { message: format!("session unavailable: {e}") },
             );
+            if let Some(delivery_id) = queue_delivery_id.as_deref() {
+                super::queue_delivery::release(&state, &session_id, delivery_id);
+            }
             return;
         }
     };
@@ -43,34 +47,14 @@ pub(crate) async fn run_llm(
         Err(e) => {
             tracing::error!(session = session_id, error = %e, "session workspace runtime unavailable");
             finish_direct(&state, &session_id, &stream_id, kxen_app::agent::agent_loop::AgentEvent::Error { message: e });
+            if let Some(delivery_id) = queue_delivery_id.as_deref() {
+                super::queue_delivery::release(&state, &session_id, delivery_id);
+            }
             return;
         }
     };
 
-    // /compact 手动压缩：蒸馏旧段落检查点（原始 JSONL 不动，rewind 锚点保留），不走正常 run
-    if text.trim() == "/compact" {
-        let model = super::session_ops::effective_session_model(Some(&session_id), &state);
-        let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
-        let notice = match kxen_app::agent::compact::compact_session(&sessions_dir, &session_id, &model, &store, 4).await {
-            Some((before, after)) => format!("上下文已压缩：约 {before} -> {after} tokens"),
-            None => "历史太短，无需压缩".to_string(),
-        };
-        let msg = ses::new_message(&session_id, ses::Role::Assistant, vec![ses::Part::Text { text: notice }]);
-        let terminal = match ses::append_message(&sessions_dir, &msg) {
-            Ok(_) => kxen_app::agent::agent_loop::AgentEvent::Done { turns: 0, stats: None },
-            Err(e) => kxen_app::agent::agent_loop::AgentEvent::Error { message: format!("session append failed: {e}") },
-        };
-        finish_direct(&state, &session_id, &stream_id, terminal);
-        return;
-    }
-
-    // /doctor 环境自检：doctor 报告直出（落盘 + done 事件），不走 LLM
-    if crate::doctor::is_doctor_command(&text) {
-        let terminal = match crate::doctor::reply_with_report(&state, &sessions_dir, &session_id).await {
-            Ok(()) => kxen_app::agent::agent_loop::AgentEvent::Done { turns: 0, stats: None },
-            Err(e) => kxen_app::agent::agent_loop::AgentEvent::Error { message: e },
-        };
-        finish_direct(&state, &session_id, &stream_id, terminal);
+    if super::llm_special::handle(&text, queue_delivery_id.as_deref(), &state, &sessions_dir, &session_id, &stream_id).await {
         return;
     }
 
@@ -88,6 +72,7 @@ pub(crate) async fn run_llm(
 
     // @ 引用注入：chip -> 上下文块（文件/目录/Web/Docs），追加在用户消息尾部。
     // 图片 URL 分流：content-type 判定为图片的直挂 images 通道（公网图片输入），其余走文本注入。
+    let picked = state.picked_files.snapshot(&session_id).unwrap_or_default();
     let (context_block, context_failures) = {
         let mut text_items = Vec::new();
         for item in context {
@@ -110,8 +95,7 @@ pub(crate) async fn run_llm(
             (String::new(), Vec::new())
         } else {
             // picked 授权快照随 run 固定：run 中途新增授权不进本轮注入
-            let picked = state.picked_files.snapshot(&session_id);
-            kxen_app::agent::context::build_context(&text_items, &session_path, picked.as_ref()).await
+            kxen_app::agent::context::build_context(&text_items, &session_path, Some(&picked)).await
         }
     };
     for f in &context_failures {
@@ -127,9 +111,17 @@ pub(crate) async fn run_llm(
     for img in &images {
         parts.push(ses::Part::Image { media_type: img.media_type.clone(), data: img.data.clone() });
     }
-    let user_msg = ses::new_message(&session_id, ses::Role::User, parts);
+    let mut user_msg = ses::new_message(&session_id, ses::Role::User, parts);
+    if let Some(delivery_id) = &queue_delivery_id {
+        user_msg.id = delivery_id.clone();
+    }
     let with_images = !images.is_empty();
-    if let Err(e) = ses::append_message(&sessions_dir, &user_msg) {
+    let persisted = if queue_delivery_id.is_some() {
+        ses::append_message_idempotent(&sessions_dir, &user_msg)
+    } else {
+        ses::append_message(&sessions_dir, &user_msg)
+    };
+    if let Err(e) = persisted {
         tracing::error!(error = %e, "session append failed");
         finish_direct(
             &state,
@@ -137,7 +129,33 @@ pub(crate) async fn run_llm(
             &stream_id,
             kxen_app::agent::agent_loop::AgentEvent::Error { message: format!("session append failed: {e}") },
         );
+        if let Some(delivery_id) = queue_delivery_id.as_deref() {
+            super::queue_delivery::release(&state, &session_id, delivery_id);
+        }
         return;
+    }
+    if let Some(delivery_id) = queue_delivery_id.as_deref() {
+        match state.pending_messages.acknowledge(&session_id, delivery_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                finish_direct(
+                    &state,
+                    &session_id,
+                    &stream_id,
+                    kxen_app::agent::agent_loop::AgentEvent::Error { message: format!("pending queue delivery mismatch: {delivery_id}") },
+                );
+                return;
+            }
+            Err(error) => {
+                finish_direct(
+                    &state,
+                    &session_id,
+                    &stream_id,
+                    kxen_app::agent::agent_loop::AgentEvent::Error { message: format!("pending queue acknowledgement failed: {error}") },
+                );
+                return;
+            }
+        }
     }
     // checkpoint 屏障：turn 前状态打 shadow git 检查点，等落盘完成再进 run
     // （rewind 依赖该 commit 存在；失败只 warn 不阻塞 run）
@@ -203,6 +221,7 @@ pub(crate) async fn run_llm(
             t
         },
         workdir,
+        path_grants: Arc::new(picked),
         model,
         store,
         max_turns: 32,
@@ -294,7 +313,7 @@ pub(crate) async fn run_llm(
     .await;
 }
 
-fn finish_direct(state: &Arc<AppState>, session_id: &str, stream_id: &str, terminal: kxen_app::agent::agent_loop::AgentEvent) {
+pub(super) fn finish_direct(state: &Arc<AppState>, session_id: &str, stream_id: &str, terminal: kxen_app::agent::agent_loop::AgentEvent) {
     kxen_app::core::shared::lock(&state.run_streams).remove(stream_id);
     super::run_finalize::publish_terminal(&state.bus, session_id, stream_id, &terminal);
 }
@@ -307,9 +326,10 @@ pub(super) fn spawn_run(
     text: String,
     context: Vec<kxen_app::agent::context::ContextItem>,
     images: Vec<kxen_app::llm::types::ImagePart>,
+    queue_delivery_id: Option<String>,
     app: AppHandle,
 ) {
-    tokio::spawn(run_llm(stream_id, session_id, text, context, images, app));
+    tokio::spawn(run_llm(stream_id, session_id, text, context, images, queue_delivery_id, app));
 }
 
 /// 转录落盘的单行上限：截在 char 边界上（多字节字符不截烂）

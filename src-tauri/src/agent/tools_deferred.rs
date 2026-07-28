@@ -6,7 +6,7 @@ use crate::llm::tool::ToolDefinition;
 use serde_json::json;
 
 pub fn deferred_tools() -> Vec<ToolDefinition> {
-    vec![
+    let mut tools = vec![
         ToolDefinition::function(
             "delete",
             "Delete a file to the Trash (recoverable).",
@@ -115,5 +115,9 @@ pub fn deferred_tools() -> Vec<ToolDefinition> {
                 "required": ["action"]
             }),
         ),
-    ]
+    ];
+    if !crate::core::config::experimental_config().browser_automation {
+        tools.retain(|tool| tool.function.name != "browser");
+    }
+    tools
 }

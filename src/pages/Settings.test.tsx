@@ -82,3 +82,167 @@ describe("Settings 运行中发送", () => {
     dispose();
   });
 });
+
+describe("Settings 首次运行检查", () => {
+  it("只有角色路由落到可用 Provider 才判定 routing PASS", async () => {
+    h.cfg.mockResolvedValue({
+      roles: { chat: { provider: "anthropic", model: "claude-sonnet-4-6" } },
+      send_when_running: "queue",
+    });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "doctor") {
+        return Promise.resolve({
+          entries: [
+            {
+              provider: "xai",
+              display: "xAI",
+              status: "ok",
+              detail: "ready",
+            },
+          ],
+          system: { lsp_root: "/workspace" },
+        });
+      }
+      if (method === "current_model") {
+        return Promise.resolve({ provider: "xai", model: "grok-4" });
+      }
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <Settings />, document.body);
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("至少一个角色路由落到可用 Provider"),
+    );
+    const label = [...document.body.querySelectorAll("span")].find(
+      (el) => el.textContent === "至少一个角色路由落到可用 Provider",
+    );
+    const row = label?.parentElement;
+    expect(row?.textContent).toContain("需要处理");
+    dispose();
+  });
+
+  it("可用 Provider 与角色路由一致时判定 routing PASS", async () => {
+    h.cfg.mockResolvedValue({
+      roles: { chat: { provider: "xai", model: "grok-4" } },
+      send_when_running: "queue",
+    });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "doctor") {
+        return Promise.resolve({
+          entries: [
+            {
+              provider: "xai",
+              display: "xAI",
+              status: "imported",
+              detail: "imported",
+            },
+          ],
+          system: { lsp_root: "/workspace" },
+        });
+      }
+      if (method === "current_model") {
+        return Promise.resolve({ provider: "xai", model: "grok-4" });
+      }
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <Settings />, document.body);
+    await vi.waitFor(() => {
+      const label = [...document.body.querySelectorAll("span")].find(
+        (el) => el.textContent === "至少一个角色路由落到可用 Provider",
+      );
+      const row = label?.parentElement;
+      expect(row?.textContent).toContain("PASS");
+    });
+    dispose();
+  });
+});
+
+describe("Settings 实验能力与诊断导出", () => {
+  it("展示实际蒸馏模型，启用实验能力并成功导出诊断", async () => {
+    h.cfg.mockResolvedValue({
+      roles: {},
+      send_when_running: "interrupt",
+      experimental: {
+        automatic_knowledge_distillation: false,
+        browser_automation: false,
+        remote_mcp: false,
+      },
+    });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "doctor") return Promise.resolve({ entries: [], system: null });
+      if (method === "current_model") {
+        return Promise.resolve({ provider: "xai", model: "grok-4" });
+      }
+      if (method === "diagnostics.export") {
+        return Promise.resolve({ path: "/tmp/kxen-diagnostics.md" });
+      }
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <Settings />, document.body);
+    btnByText("高级").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("发送给 xai/grok-4"));
+    const toggles = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) => button.textContent === "已关闭",
+    );
+    expect(toggles).toHaveLength(3);
+    toggles[0].click();
+    await vi.waitFor(() =>
+      expect(h.rpc).toHaveBeenCalledWith("config.set_experimental", {
+        key: "automatic_knowledge_distillation",
+        enabled: true,
+      }),
+    );
+    expect(document.body.textContent).toContain("已启用");
+
+    btnByText("导出诊断包（markdown）").click();
+    await vi.waitFor(() =>
+      expect(
+        flash.msgs().some((message) => message.text.includes("/tmp/kxen-diagnostics.md")),
+      ).toBe(true),
+    );
+    dispose();
+  });
+
+  it("实验能力保存失败回滚，诊断导出失败显示错误", async () => {
+    h.cfg.mockResolvedValue({
+      roles: {},
+      experimental: {
+        automatic_knowledge_distillation: true,
+        browser_automation: true,
+        remote_mcp: true,
+      },
+    });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "doctor") return Promise.resolve({ entries: [] });
+      if (method === "current_model") return Promise.reject(new Error("no model"));
+      if (method === "config.set_experimental") return Promise.reject("read only");
+      if (method === "diagnostics.export") return Promise.reject(new Error("export denied"));
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <Settings />, document.body);
+    btnByText("高级").click();
+    await vi.waitFor(() => {
+      const enabled = [...document.body.querySelectorAll("button")].filter(
+        (button) => button.textContent === "已启用",
+      );
+      expect(enabled).toHaveLength(3);
+    });
+    const enabled = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) => button.textContent === "已启用",
+    );
+    enabled[1].click();
+    await vi.waitFor(() =>
+      expect(flash.msgs().some((message) => message.text.includes("read only"))).toBe(true),
+    );
+    expect(
+      [...document.body.querySelectorAll("button")].filter(
+        (button) => button.textContent === "已启用",
+      ),
+    ).toHaveLength(3);
+
+    btnByText("导出诊断包（markdown）").click();
+    await vi.waitFor(() =>
+      expect(flash.msgs().some((message) => message.text === "导出诊断包失败")).toBe(true),
+    );
+    dispose();
+  });
+});

@@ -14,9 +14,7 @@ pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<Strin
         "start" => {
             let params = DevServerParams {
                 command: args.get("command").and_then(Value::as_str).ok_or("missing command")?.to_string(),
-                workdir: resolve_path(args.get("workdir").and_then(Value::as_str).unwrap_or(&cwd), &ctx.workdir)
-                    .to_string_lossy()
-                    .into_owned(),
+                workdir: resolve_path(args.get("workdir").and_then(Value::as_str).unwrap_or(&cwd), ctx)?.to_string_lossy().into_owned(),
                 ready: args.get("ready").map(|r| ReadySpec {
                     pattern: r.get("pattern").and_then(Value::as_str).map(String::from),
                     port: r.get("port").and_then(Value::as_u64).map(|p| p as u16),
@@ -60,6 +58,16 @@ pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<Strin
         }
         "restart" => {
             let id = args.get("task_id").and_then(Value::as_str).ok_or("missing task_id")?;
+            let task = ctx.registry.get(id).ok_or_else(|| format!("task not found: {id}"))?;
+            let command = task.command.to_string();
+            let workdir = resolve_path(&task.workdir, ctx)?.to_string_lossy().into_owned();
+            let appr = crate::tools::exec::ApprovalCtx::new(
+                ctx.approvals.as_deref(),
+                ctx.bus.as_ref(),
+                ctx.cancel.as_ref(),
+                ctx.session_id.as_deref(),
+            );
+            crate::tools::exec::safety_gate(&command, &workdir, appr.as_ref()).await.map_err(|e| e.to_string())?;
             restart_task(id, &ctx.registry)
                 .await
                 .map(|id| {

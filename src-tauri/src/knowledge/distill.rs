@@ -1,4 +1,4 @@
-//! 删除会话兜底蒸馏：消息流 -> 当前 provider 一次性调用 -> 0..N 条 note 落 personal notes/。
+//! 显式或 opt-in 自动蒸馏：消息流 -> 当前 provider 一次性调用 -> 0..N 条 note 落 personal notes/。
 //! 纯函数（build_prompt/parse_output）可单测；流错误经 Result 上抛，是否阻塞由调用方决定。
 
 use super::{Scope, add};
@@ -30,9 +30,9 @@ Extract 0 to 5 durable learnings worth persisting as plain markdown notes: user 
 project conventions, non-obvious pitfalls, lasting preferences. Skip one-off task details, \
 ephemeral state, and anything already obvious from the code itself. \
 Reply with ONLY a JSON array (no prose, no code fence): \
-[{{\"scope\": \"project\"|\"personal\", \"type\": \"correction\"|\"convention\"|\"pitfall\"|\"preference\"|\"note\", \
+[{{\"scope\": \"personal\", \"type\": \"correction\"|\"convention\"|\"pitfall\"|\"preference\"|\"note\", \
 \"description\": \"<=60 chars\", \"content\": \"<=500 chars\"}}]. \
-scope project = true only about this codebase; personal = useful across projects. \
+Automatic writes are personal-only. Project knowledge requires a separate user preview and approval. \
 If nothing is worth keeping, reply [].\n\nSESSION TRANSCRIPT:\n{transcript}"
     )
 }
@@ -50,11 +50,11 @@ pub fn parse_output(text: &str) -> Vec<NewNote> {
 }
 
 /// 蒸馏整体限时：LLM 流可能僵死（连接挂起不再发帧），前端 RPC 30s 超时后删除还在被拖住会状态不一致；
-/// 超时按失败处理上抛，删除主流程不阻断（调用方记日志照删）。
+/// 超时按失败处理上抛；显式删除蒸馏会保留 Session，后台 consolidation 保留水位下轮重试。
 const DISTILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 删除前兜底蒸馏。返回沉淀条数；LLM 流报错（Delta::Error）与超时以 Err 传播，
-/// 由调用方决定记日志降级（删除路径）或留水位重试（consolidation）；单条落盘失败仍跳过不计数。
+/// 由调用方决定保留 Session（删除路径）或留水位重试（consolidation）；单条落盘失败仍跳过不计数。
 pub async fn distill_on_delete(
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
@@ -73,8 +73,7 @@ pub async fn distill_on_delete(
     let notes = parse_output(&text);
     let mut written = 0;
     for note in notes {
-        let scope = Scope::parse(&note.scope).unwrap_or(Scope::Personal);
-        if add(scope, workdir, None, &note.note_type, &note.description, &note.content).is_ok() {
+        if add(Scope::Personal, workdir, None, &note.note_type, &note.description, &note.content).is_ok() {
             written += 1;
         }
     }

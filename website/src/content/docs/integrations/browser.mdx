@@ -8,6 +8,8 @@ sidebar:
 
 Browser 让 Agent 操作真实网页，用于界面检查、交互验证和需要浏览器上下文的任务。
 
+Browser automation 是默认关闭的个人实验能力。必须先在 Settings 的高级区域显式开启，项目配置不能代替用户开启。关闭时 `browser` 不进入 `tool_search` 目录，直接调用也会被后端拒绝。
+
 ## 运行方式
 
 kxen 连接本机 Google Chrome 的 Chrome DevTools Protocol。它不下载或捆绑独立 Chromium。
@@ -30,7 +32,7 @@ Browser 可以导航页面、读取可见状态、点击、输入和执行页面
 
 ## 数据边界
 
-Browser 使用本机 Chrome 状态时，页面可能包含已登录账号和个人数据。Agent 只能在用户明确授权的任务范围内操作，发送表单和产生外部写入仍需要按风险处理。
+Browser 使用本机 Chrome 状态时，页面可能包含已登录账号和个人数据，页面内容和交互结果也可能进入当前模型 Provider 的上下文。Agent 只能在用户明确授权的任务范围内操作，发送表单和产生外部写入仍需要按风险处理。
 
 ## 与 Web Search 的区别
 

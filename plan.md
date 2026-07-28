@@ -94,7 +94,7 @@
 - [x] 接入 Tauri updater 和 process plugin。
 - [x] 生成 updater signing key，私钥写入 1Password 共享 vault，仓库只保存公钥。
 - [x] updater endpoint 改为 GitHub Releases `latest.json`。
-- [x] GitHub workflow 先创建 draft，上传 DMG、updater artifact、签名和 manifest，最终 DMG notarize、staple 和 Gatekeeper PASS 后才发布 latest Release。
+- [x] GitHub workflow 使用官方 `tauri-apps/tauri-action` 创建 draft，完成签名、公证、staple 并上传 DMG、updater artifact、签名和 manifest；发布前再运行 `codesign`、Gatekeeper 和 stapler 验证。
 - [x] GitHub workflow 构建 macOS ARM64 DMG 和 updater artifact。
 - [x] 执行 Developer ID Application 本地签名验证。
 - [x] 执行 Apple notarization 和 staple。

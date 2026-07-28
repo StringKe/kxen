@@ -1,7 +1,6 @@
 //! 参数/路径/结果摘要的小工具函数。
 
 use crate::tools::shell::ShellKind;
-use std::path::{Path, PathBuf};
 
 pub fn parse_shell(s: &str) -> Result<ShellKind, String> {
     match s {
@@ -12,9 +11,8 @@ pub fn parse_shell(s: &str) -> Result<ShellKind, String> {
     }
 }
 
-pub fn resolve_path(input: &str, workdir: &Path) -> PathBuf {
-    let p = PathBuf::from(input);
-    if p.is_absolute() { p } else { workdir.join(p) }
+pub fn resolve_path(input: &str, ctx: &super::context::AgentContext) -> Result<std::path::PathBuf, String> {
+    crate::tools::path_policy::resolve(input, &ctx.workdir, &ctx.path_grants).map(crate::tools::path_policy::ResolvedPath::into_path_buf)
 }
 
 /// 工具调用一行摘要：按工具提取关键参数（exec=command、fs=path、glob/grep=pattern），

@@ -5,34 +5,39 @@ use crate::AppState;
 
 pub(super) async fn delete(params: &Value, state: &Arc<AppState>) -> Result<Value, String> {
     let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
+    let distill = params.get("distill").and_then(Value::as_bool).unwrap_or(false);
     let sessions_dir = kxen_app::core::paths::sessions_dir();
     let meta = kxen_app::core::session::load_meta(&sessions_dir, id).map_err(|error| format!("session not found: {error}"))?;
 
-    let transcript: Vec<String> = kxen_app::core::session::load_messages(&sessions_dir, id)
-        .into_iter()
-        .map(|message| {
-            message
-                .parts
-                .iter()
-                .filter_map(|part| match part {
-                    kxen_app::core::session::Part::Text { text } | kxen_app::core::session::Part::Context { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|text| !text.is_empty())
-        .collect();
-    let model = super::session_ops::effective_session_model(Some(id), state);
-    let store = state.auth_store.lock().map(|store| store.clone()).unwrap_or_default();
-    match kxen_app::knowledge::distill::distill_on_delete(&model, &store, std::path::Path::new(&meta.directory), transcript).await {
-        Ok(written) if written > 0 => {
-            tracing::info!(written, "session distilled before delete");
+    if distill {
+        let transcript: Vec<String> = kxen_app::core::session::load_messages(&sessions_dir, id)
+            .into_iter()
+            .map(|message| {
+                message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        kxen_app::core::session::Part::Text { text } | kxen_app::core::session::Part::Context { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty())
+            .collect();
+        let model = super::session_ops::effective_session_model(Some(id), state);
+        let store = state.auth_store.lock().map(|store| store.clone()).unwrap_or_default();
+        match kxen_app::knowledge::distill::distill_on_delete(&model, &store, std::path::Path::new(&meta.directory), transcript).await {
+            Ok(written) if written > 0 => {
+                tracing::info!(written, "session explicitly distilled before delete");
+            }
+            Err(error) => {
+                return Err(format!("knowledge distillation failed; session was not deleted: {error}"));
+            }
+            _ => {}
         }
-        Err(error) => {
-            tracing::warn!(session = id, %error, "session delete distill failed");
-        }
-        _ => {}
     }
 
     if let Some(token) = kxen_app::core::shared::lock(&state.active_runs).get(id).cloned() {
@@ -67,7 +72,9 @@ pub(super) async fn delete(params: &Value, state: &Arc<AppState>) -> Result<Valu
 }
 
 fn cleanup_references(state: &Arc<AppState>, id: &str) {
-    state.pending_messages.clear(id);
+    if let Err(error) = state.pending_messages.clear(id) {
+        tracing::warn!(session = id, %error, "deleted session queue cleanup failed");
+    }
     state.approvals.cancel_session(id);
     kxen_app::core::schedule::remove_by_session(id);
     kxen_app::core::goal::Goal::remove_for_session(&kxen_app::core::paths::goals_dir(), id);

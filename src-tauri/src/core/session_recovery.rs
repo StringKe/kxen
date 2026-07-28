@@ -233,7 +233,12 @@ mod tests {
         goal.session_id = Some("ses_one".into());
         goal.activate().unwrap();
         let mut manifest = RecoveryManifest::new("ses_one");
-        manifest.queue.push(crate::core::pending_queue::QueuedMessage { text: "queued".into(), context: Vec::new(), images: Vec::new() });
+        manifest.queue.push(crate::core::pending_queue::QueuedMessage {
+            id: "queue-test".into(),
+            text: "queued".into(),
+            context: Vec::new(),
+            images: Vec::new(),
+        });
         manifest.schedules.push(crate::core::schedule::CronJob {
             id: "cron_one".into(),
             cron: "0 * * * *".into(),

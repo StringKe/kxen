@@ -4,7 +4,7 @@ macOS Apple Silicon 原生 Coding Agent Harness。kxen 使用 Tauri 2、Rust、S
 
 官网与权威文档: [https://kxen.ai](https://kxen.ai)
 
-当前状态: 开发预览。正式下载、签名、公证和自动更新尚未开放。
+当前状态: 开发预览。Developer ID 签名、公证和 GitHub Release 自动更新流水线已经完成验证，但公开签名安装包和更新通道尚未发布。
 
 ## 主要能力
 

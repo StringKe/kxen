@@ -33,9 +33,9 @@ pub(super) fn restore_bundle(state: &Arc<AppState>, bundle: &std::path::Path) ->
     if let Some(last_input) = manifest.last_input {
         kxen_app::core::shared::lock(&state.session_last_input).insert(id.clone(), last_input);
     }
-    state.pending_messages.clear(&id);
+    state.pending_messages.clear(&id)?;
     for queued in manifest.queue {
-        state.pending_messages.enqueue(&id, queued.text, queued.context, queued.images);
+        state.pending_messages.enqueue_existing(&id, queued)?;
     }
     state.team.restore_session(&id);
     kxen_app::core::session_recovery::complete_restore(bundle)?;

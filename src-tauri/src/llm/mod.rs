@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod client;
 pub mod models;
 pub mod mrm;
+pub mod mrm_health;
 pub mod openai;
 pub mod retry;
 pub mod sse;

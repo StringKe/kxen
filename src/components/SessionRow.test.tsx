@@ -6,11 +6,16 @@ import type { SessionMeta } from "../lib/chat";
 
 const h = vi.hoisted(() => ({
   sessionUpdateMeta: vi.fn(async (_id: string, _patch: unknown) => {}),
+  currentModel: vi.fn(async (_id?: string) => ({ provider: "xai", model: "grok-4" })),
 }));
 
 vi.mock("../lib/chat", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../lib/chat")>();
-  return { ...orig, sessionUpdateMeta: h.sessionUpdateMeta };
+  return {
+    ...orig,
+    currentModel: h.currentModel,
+    sessionUpdateMeta: h.sessionUpdateMeta,
+  };
 });
 
 import SessionRow from "./SessionRow";
@@ -49,6 +54,8 @@ afterEach(() => {
   document.body.innerHTML = "";
   for (const m of flash.msgs()) flash.dismiss(m.id);
   h.sessionUpdateMeta.mockReset();
+  h.currentModel.mockReset();
+  h.currentModel.mockResolvedValue({ provider: "xai", model: "grok-4" });
   setActiveSessionId("");
 });
 
@@ -91,6 +98,18 @@ describe("SessionRow 失败路径", () => {
     await flush();
     expect(document.body.querySelector("button[title='确认删除']")).toBeNull();
     expect(document.body.querySelector("button[title='删除会话（再点一次确认）']")).not.toBeNull();
+    dispose();
+  });
+
+  it("删除并沉淀前显示实际 Provider、传输范围和个人知识范围", async () => {
+    const dispose = renderRow();
+    const del = document.body.querySelector("button[title='删除会话（再点一次确认）']");
+    del?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await vi.waitFor(() => expect(h.currentModel).toHaveBeenCalledWith("s1"));
+    const disclosure = document.body.querySelector("span[title*='最近文本']");
+    expect(disclosure?.textContent).toContain("发送到 xai/grok-4");
+    expect(disclosure?.getAttribute("title")).toContain("最近文本");
+    expect(disclosure?.getAttribute("title")).toContain("只写个人知识");
     dispose();
   });
 });

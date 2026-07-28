@@ -148,6 +148,24 @@ export interface RoleBindingView {
 export async function configGet(): Promise<{
   roles: Record<string, RoleBindingView>;
   send_when_running?: string;
+  limits?: {
+    daily_token_budget?: number | null;
+    providers?: Record<
+      string,
+      {
+        input_usd_per_million?: number | null;
+        output_usd_per_million?: number | null;
+        daily_cost_budget_usd?: number | null;
+        circuit_failure_threshold?: number | null;
+        circuit_cooldown_seconds?: number | null;
+      }
+    >;
+  };
+  experimental?: {
+    automatic_knowledge_distillation?: boolean;
+    browser_automation?: boolean;
+    remote_mcp?: boolean;
+  };
 }> {
   return client.rpc("config.get");
 }
@@ -226,8 +244,8 @@ export async function sessionMessages(id: string): Promise<StoredMessage[]> {
   return client.rpc<StoredMessage[]>("session.messages", { id });
 }
 
-export async function sessionDelete(id: string): Promise<void> {
-  return client.rpc("session.delete", { id });
+export async function sessionDelete(id: string, distill = false): Promise<void> {
+  return client.rpc("session.delete", distill ? { id, distill: true } : { id });
 }
 
 export async function sessionFork(sessionId: string, messageId: string): Promise<SessionMeta> {

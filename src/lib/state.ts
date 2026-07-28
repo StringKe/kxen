@@ -143,10 +143,11 @@ export async function switchSession(id: string): Promise<void> {
 
 /** 删除会话并善后（SessionTree 行删除与 Cmd+W 共用）：错误上抛由调用方提示；
  *  删的是活跃会话则切同目录下一条，同目录无则切列表首条，全无回草稿态——activeSessionId 不得悬死。 */
-export async function deleteSession(id: string): Promise<void> {
+export async function deleteSession(id: string, distill = false): Promise<void> {
   const wasActive = activeSessionId() === id;
   const dir = sessions().find((s) => s.id === id)?.directory;
-  await sessionDelete(id);
+  if (distill) await sessionDelete(id, true);
+  else await sessionDelete(id);
   await refreshSessions();
   if (!wasActive) return;
   const next = sessions().find((s) => s.directory === dir) ?? sessions()[0];

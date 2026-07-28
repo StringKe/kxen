@@ -1,7 +1,7 @@
 // 会话行：活动点 / 标题(双击重命名) / 相对时间 / hover 操作（置顶、重命名、删除带确认）。
 import { createSignal, Show } from "solid-js";
-import { Check, Pin, PinOff, RefreshCw, X } from "lucide-solid";
-import { sessionUpdateMeta, type SessionMeta } from "../lib/chat";
+import { BookOpenCheck, Check, Pin, PinOff, RefreshCw, X } from "lucide-solid";
+import { currentModel, sessionUpdateMeta, type SessionMeta } from "../lib/chat";
 import { openMenu } from "../lib/context-menu";
 import { relTime } from "../lib/time";
 import { activeSessionId } from "../lib/state";
@@ -12,7 +12,7 @@ export default function SessionRow(props: {
   session: SessionMeta;
   deleting: boolean;
   onOpen: () => void;
-  onDelete: () => void;
+  onDelete: (distill?: boolean) => void;
   onChanged: () => void;
   draggable: boolean;
   /** 拖拽悬停落点：行顶画插入线。 */
@@ -23,12 +23,15 @@ export default function SessionRow(props: {
   onDrop: (e: DragEvent) => void;
   onDragEnd: (e: DragEvent) => void;
 }) {
+  const s = () => props.session;
+  const initialModel = props.session.model;
   const [renaming, setRenaming] = createSignal(false);
   const [confirming, setConfirming] = createSignal(false);
+  const [distillProvider, setDistillProvider] = createSignal(
+    initialModel ? `${initialModel.provider}/${initialModel.model}` : "当前默认 Provider",
+  );
   const [draft, setDraft] = createSignal("");
   let inputRef: HTMLInputElement | undefined;
-
-  const s = () => props.session;
 
   const commitRename = async () => {
     const t = draft().trim();
@@ -52,6 +55,13 @@ export default function SessionRow(props: {
     } catch (e) {
       flashErr(`置顶失败：${formatError(e instanceof Error ? e.message : String(e))}`);
     }
+  };
+
+  const beginDeleteChoice = () => {
+    setConfirming(true);
+    void currentModel(s().id)
+      .then((model) => setDistillProvider(`${model.provider}/${model.model}`))
+      .catch(() => {});
   };
 
   return (
@@ -80,7 +90,12 @@ export default function SessionRow(props: {
             label: s().pinned ? "取消置顶" : "置顶",
             action: () => void togglePin(),
           },
-          { label: "删除会话", danger: true, action: props.onDelete },
+          { label: "删除会话...", danger: true, action: beginDeleteChoice },
+          {
+            label: "删除并沉淀个人知识...",
+            danger: true,
+            action: beginDeleteChoice,
+          },
         ]);
       }}
       onDblClick={() => {
@@ -149,15 +164,31 @@ export default function SessionRow(props: {
             when={!confirming()}
             fallback={
               <>
+                <span
+                  class="max-w-32 truncate text-2xs text-[var(--text-faint)]"
+                  title={`沉淀会把此 Session 最近文本发送给 ${distillProvider()}，并且只写个人知识`}
+                >
+                  发送到 {distillProvider()}
+                </span>
                 <button
                   class="px-1 text-[var(--err)]"
                   title={s().running ? "会话正在运行，删除将终止" : "确认删除"}
                   onClick={(e) => {
                     e.stopPropagation();
-                    props.onDelete();
+                    props.onDelete(false);
                   }}
                 >
                   <Check size={11} />
+                </button>
+                <button
+                  class="px-1 text-[var(--warn)]"
+                  title={`把此 Session 最近文本发送给 ${distillProvider()}，沉淀为个人知识后删除`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    props.onDelete(true);
+                  }}
+                >
+                  <BookOpenCheck size={11} />
                 </button>
                 <button
                   class="px-1 text-[var(--text-faint)]"
@@ -179,7 +210,7 @@ export default function SessionRow(props: {
               }
               onClick={(e) => {
                 e.stopPropagation();
-                setConfirming(true);
+                beginDeleteChoice();
               }}
             >
               <X size={12} />

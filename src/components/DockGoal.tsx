@@ -1,9 +1,11 @@
 // Dock 目标分区：goal 徽标 / 判据 / 验证证据 / 操作按钮（自 Dock.tsx 拆出，350 行门禁）。
 // budget_limited 不给裸「恢复」：已用量 >= 限额不变，下一轮立刻再超限，只留「提高预算并继续」。
-import { Show } from "solid-js";
+import { createSignal, Show } from "solid-js";
 import { Target } from "lucide-solid";
-import type { GoalAction, GoalInfo } from "../lib/chat";
+import { goalCreate, type GoalAction, type GoalInfo } from "../lib/chat";
 import { insertComposerText } from "../lib/composer-bus";
+import { formatError } from "../lib/error-text";
+import { activeSessionId } from "../lib/state";
 import DockSection from "./DockSection";
 
 const GOAL_STATUS: Record<string, { text: string; cls: string }> = {
@@ -26,20 +28,71 @@ export default function DockGoal(props: {
   const act = props.act;
   const acting = props.acting;
   const badge = () => GOAL_STATUS[goal()?.status ?? ""] ?? { text: "", cls: "" };
+  const [creating, setCreating] = createSignal(false);
+  const [objective, setObjective] = createSignal("");
+  const [criteria, setCriteria] = createSignal("");
+  const [createErr, setCreateErr] = createSignal("");
+  const create = async () => {
+    if (!objective().trim() || !criteria().trim()) {
+      setCreateErr("目标和完成判据不能为空");
+      return;
+    }
+    try {
+      await goalCreate(objective().trim(), criteria().trim(), activeSessionId() || undefined);
+      setCreateErr("");
+      setCreating(false);
+    } catch (error) {
+      setCreateErr(formatError(error instanceof Error ? error.message : String(error)));
+    }
+  };
   return (
     <DockSection title="目标" icon={Target}>
       <Show
         when={goal()}
         fallback={
-          <div class="text-xs text-[var(--text-faint)]">
-            无焦点 goal。
-            <button
-              class="text-[var(--accent-hover)] hover:underline"
-              title="填入 composer，回车发送"
-              onClick={() => insertComposerText("/write-goal ")}
-            >
-              填入 /write-goal 创建
-            </button>
+          <div class="space-y-2 text-xs text-[var(--text-faint)]">
+            <div>无焦点 goal。</div>
+            <div class="flex gap-2">
+              <button
+                class="text-[var(--accent-hover)] hover:underline"
+                onClick={() => setCreating((value) => !value)}
+              >
+                直接创建
+              </button>
+              <button
+                class="text-[var(--accent-hover)] hover:underline"
+                title="填入 composer，回车发送"
+                onClick={() => insertComposerText("/write-goal ")}
+              >
+                填入 /write-goal 创建
+              </button>
+            </div>
+            <Show when={creating()}>
+              <div class="space-y-1.5">
+                <input
+                  class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text)]"
+                  placeholder="目标"
+                  value={objective()}
+                  onInput={(event) => setObjective(event.currentTarget.value)}
+                />
+                <textarea
+                  class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs text-[var(--text)] resize-y"
+                  rows={3}
+                  placeholder="可观察、可验证的完成判据"
+                  value={criteria()}
+                  onInput={(event) => setCriteria(event.currentTarget.value)}
+                />
+                <button
+                  class="pressable px-2 py-0.5 rounded text-2xs bg-[var(--accent)] text-white"
+                  onClick={() => void create()}
+                >
+                  创建草稿
+                </button>
+                <Show when={createErr()}>
+                  <div class="text-2xs text-[var(--err)]">{createErr()}</div>
+                </Show>
+              </div>
+            </Show>
           </div>
         }
       >

@@ -58,13 +58,18 @@ impl LeadRelay {
             return if r.notify(note) { LeadPath::Notify } else { LeadPath::Pending };
         }
         match &self.pending {
-            Some(p) => {
-                p.enqueue(session_id, note, vec![], vec![]);
-                if let Some(k) = lock(&self.kick).clone() {
-                    k(session_id.to_string());
+            Some(p) => match p.enqueue(session_id, note, vec![], vec![]) {
+                Ok(_) => {
+                    if let Some(k) = lock(&self.kick).clone() {
+                        k(session_id.to_string());
+                    }
+                    LeadPath::Pending
                 }
-                LeadPath::Pending
-            }
+                Err(error) => {
+                    tracing::error!(session = session_id, %error, "teammate report enqueue failed");
+                    LeadPath::Inbox
+                }
+            },
             None => LeadPath::Inbox,
         }
     }

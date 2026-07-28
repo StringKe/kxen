@@ -6,12 +6,14 @@ import type { ScheduleJob } from "../../lib/schedule";
 
 const h = vi.hoisted(() => ({
   list: vi.fn(async () => [] as ScheduleJob[]),
+  add: vi.fn(async () => JOB({})),
   setEnabled: vi.fn(async (_id: string, _enabled: boolean) => true),
   remove: vi.fn(async (_id: string) => true),
 }));
 
 vi.mock("../../lib/schedule", () => ({
   scheduleList: h.list,
+  scheduleAdd: h.add,
   scheduleSetEnabled: h.setEnabled,
   scheduleRemove: h.remove,
 }));

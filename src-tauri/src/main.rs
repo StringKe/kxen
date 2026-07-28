@@ -147,7 +147,7 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                         ticks += 1;
                         // 后台记忆 consolidation：120 tick（30min）一轮，best-effort
-                        if ticks.is_multiple_of(120) {
+                        if ticks.is_multiple_of(120) && kxen_app::core::config::experimental_config().automatic_knowledge_distillation {
                             let state = handle.state::<Arc<AppState>>();
                             let model = state.model.lock().map(|m| m.clone()).unwrap_or_default();
                             let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
@@ -170,12 +170,22 @@ pub fn run() {
                                     dispatched.insert(job.session_id.clone());
                                     let stream_id = ws::protocol::stream_id("run");
                                     kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), job.session_id.clone());
-                                    tokio::spawn(ws::llm_task::run_llm(stream_id, job.session_id, text, vec![], vec![], handle.clone()));
+                                    tokio::spawn(ws::llm_task::run_llm(
+                                        stream_id,
+                                        job.session_id,
+                                        text,
+                                        vec![],
+                                        vec![],
+                                        None,
+                                        handle.clone(),
+                                    ));
                                 }
                                 // 并发 run 会交叉写 JSONL 历史：投入队列由 run 结束续跑消化
                                 cron_dispatch::CronDispatch::Enqueue => {
-                                    let n = state.pending_messages.enqueue(&job.session_id, text, vec![], vec![]);
-                                    let note = format!("cron 触发时会话运行中，已排队（第 {n} 条）");
+                                    let note = match state.pending_messages.enqueue(&job.session_id, text, vec![], vec![]) {
+                                        Ok(n) => format!("cron 触发时会话运行中，已排队（第 {n} 条）"),
+                                        Err(error) => format!("cron 消息入队失败：{error}"),
+                                    };
                                     state.bus.publish(kxen_app::core::event::Event::notify(note, Some(job.session_id.clone())));
                                 }
                             }

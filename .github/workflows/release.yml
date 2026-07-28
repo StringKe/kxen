@@ -127,25 +127,11 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           args: --target aarch64-apple-darwin
-      - name: Notarize DMG and publish release
+      - name: Verify signed artifacts and publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          KXEN_DMG_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Kxen_${KXEN_VERSION}_aarch64.dmg"
-          if [[ ! -s "$KXEN_DMG_PATH" ]]; then
-            printf 'DMG not found: %s\n' "$KXEN_DMG_PATH"
-            exit 1
-          fi
-          xcrun notarytool submit "$KXEN_DMG_PATH" \
-            --key "$APPLE_API_KEY_PATH" \
-            --key-id "$APPLE_API_KEY" \
-            --issuer "$APPLE_API_ISSUER" \
-            --wait
-          xcrun stapler staple "$KXEN_DMG_PATH"
-          xcrun stapler validate "$KXEN_DMG_PATH"
-          codesign --verify --strict --verbose=2 "$KXEN_DMG_PATH"
-          spctl --assess --type open --context context:primary-signature --verbose=2 "$KXEN_DMG_PATH"
-          gh release upload "$RELEASE_TAG" "$KXEN_DMG_PATH" --clobber
+          bash scripts/verify-macos-release.sh
           gh release edit "$RELEASE_TAG" --draft=false --prerelease=false

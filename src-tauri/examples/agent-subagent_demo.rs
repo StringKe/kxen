@@ -24,6 +24,7 @@ async fn main() {
         registry: Arc::new(TaskRegistry::new()),
         tracker: FileTracker::default(),
         workdir: Arc::from(workdir.as_path()),
+        path_grants: Arc::new(Default::default()),
         model: ModelRef::new("xai", "grok-build-0.1"),
         store,
         max_turns: 8,

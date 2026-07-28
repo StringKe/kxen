@@ -139,6 +139,17 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
             // subagent 路径 ctx.mrm 为 None（槽由 dispatch 的 grant 持整轮），跳过。
             let slot = match &ctx.mrm {
                 Some(mrm) => {
+                    if let Err(message) = mrm.admit(&ctx.model.provider).await {
+                        let terminal = AgentEvent::Error { message: message.clone() };
+                        (ctx.on_event)(terminal.clone());
+                        return AgentOutcome {
+                            final_text: format!("(错误: {message})"),
+                            turns,
+                            aborted,
+                            stats: stats(ttft, &usage_acc),
+                            terminal,
+                        };
+                    }
                     let acquire = mrm.acquire(&ctx.model.provider, ctx.model.account.as_deref());
                     match &ctx.cancel {
                         Some(token) => tokio::select! {
@@ -192,7 +203,10 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                         produced = true;
                         acc.push(&fragments);
                     }
-                    Delta::Usage { input, output } => usage_acc.push(input, output),
+                    Delta::Usage { input, output } => {
+                        usage_acc.push(input, output);
+                        crate::core::usage_trend::record(&ctx.model.provider, input, output);
+                    }
                     Delta::Done => break,
                     Delta::Error(e) => {
                         // 401/403 反应式自愈：token 被服务端吊销时本地 expires 未到，上方 ensure_fresh
@@ -202,10 +216,16 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                             auth_refreshed = true;
                             if crate::auth::refresh::force_refresh(&mut ctx.store, &ctx.model.provider, ctx.model.account.as_deref()).await
                             {
+                                if let Some(mrm) = &ctx.mrm {
+                                    mrm.record_result(&ctx.model.provider, false).await;
+                                }
                                 continue 'attempt;
                             }
                         }
                         if produced || !crate::llm::retry::retryable(&e) || attempt + 1 >= crate::llm::retry::MAX_ATTEMPTS {
+                            if let Some(mrm) = &ctx.mrm {
+                                mrm.record_result(&ctx.model.provider, false).await;
+                            }
                             let terminal = AgentEvent::Error { message: e.clone() };
                             (ctx.on_event)(terminal.clone());
                             // 流错误（凭证缺失/不可重试/已尽）同样落终态，避免会话只剩用户消息
@@ -222,6 +242,9 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                     }
                     Delta::ToolCall { .. } => {}
                 }
+            }
+            if !aborted && let Some(mrm) = &ctx.mrm {
+                mrm.record_result(&ctx.model.provider, failed.is_none()).await;
             }
             let Some(err) = failed else { break 'attempt };
             attempt += 1;

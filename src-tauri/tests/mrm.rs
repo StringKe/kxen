@@ -20,7 +20,11 @@ fn config_with(roles: &[(&str, &str, &str, Option<&str>)], providers: &[(&str, O
             .collect(),
         limits: Limits {
             global_concurrent: global,
-            providers: providers.iter().map(|(p, c, rpm)| (p.to_string(), ProviderLimit { concurrent: *c, rpm: *rpm })).collect(),
+            daily_token_budget: None,
+            providers: providers
+                .iter()
+                .map(|(p, c, rpm)| (p.to_string(), ProviderLimit { concurrent: *c, rpm: *rpm, ..Default::default() }))
+                .collect(),
         },
         hooks: HashMap::new(),
         statusline: Default::default(),
@@ -30,6 +34,7 @@ fn config_with(roles: &[(&str, &str, &str, Option<&str>)], providers: &[(&str, O
         embedding: Default::default(),
         search: Default::default(),
         coding_rules: Default::default(),
+        experimental: Default::default(),
     }
 }
 

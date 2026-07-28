@@ -167,6 +167,18 @@ export interface DispatchRecord {
 export interface MrmStats {
   describe: string;
   history: DispatchRecord[];
+  health: MrmHealth[];
+}
+
+export interface MrmHealth {
+  provider: string;
+  consecutive_failures: number;
+  circuit_open: boolean;
+  cooldown_remaining_seconds: number;
+  today_input: number;
+  today_output: number;
+  estimated_cost_usd?: number | null;
+  daily_cost_budget_usd?: number | null;
 }
 
 export function mrmStats(): Promise<MrmStats> {

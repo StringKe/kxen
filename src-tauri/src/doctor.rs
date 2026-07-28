@@ -111,13 +111,23 @@ pub fn is_doctor_command(text: &str) -> bool {
 }
 
 /// 报告直出：凭证 + 子系统健康 -> markdown 落盘为 assistant 消息，不经 LLM（否则模型自由发挥，与菜单语义脱节）
-pub async fn reply_with_report(state: &Arc<AppState>, sessions_dir: &std::path::Path, session_id: &str) -> Result<(), String> {
+pub async fn reply_with_report(
+    state: &Arc<AppState>,
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    message_id: Option<&str>,
+) -> Result<(), String> {
     use kxen_app::core::session as ses;
     let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
     let mut report = doctor_report(&store);
     report.system = system_health(state).await.ok();
-    let msg = ses::new_message(session_id, ses::Role::Assistant, vec![ses::Part::Text { text: format_markdown(&report) }]);
-    ses::append_message(sessions_dir, &msg).map(|_| ()).map_err(|e| format!("session append failed: {e}"))
+    let mut msg = ses::new_message(session_id, ses::Role::Assistant, vec![ses::Part::Text { text: format_markdown(&report) }]);
+    if let Some(message_id) = message_id {
+        msg.id = message_id.to_string();
+    }
+    let result =
+        if message_id.is_some() { ses::append_message_idempotent(sessions_dir, &msg) } else { ses::append_message(sessions_dir, &msg) };
+    result.map(|_| ()).map_err(|e| format!("session append failed: {e}"))
 }
 
 /// 报告渲染为 markdown：/doctor 的会话内呈现（与 RPC 的结构化 JSON 共用同一数据源）

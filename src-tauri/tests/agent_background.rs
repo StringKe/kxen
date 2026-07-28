@@ -19,7 +19,7 @@ fn test_ctx(notify: Option<Arc<NotifyRouter>>) -> AgentContext {
     roles.insert("execution".into(), RoleBinding { provider: "xai".into(), model: "grok".into(), fallback: None, account: None });
     let config = Config {
         roles,
-        limits: Limits { global_concurrent: 4, providers: HashMap::<String, ProviderLimit>::new() },
+        limits: Limits { global_concurrent: 4, daily_token_budget: None, providers: HashMap::<String, ProviderLimit>::new() },
         hooks: HashMap::new(),
         statusline: Default::default(),
         voice: Default::default(),
@@ -28,11 +28,13 @@ fn test_ctx(notify: Option<Arc<NotifyRouter>>) -> AgentContext {
         embedding: Default::default(),
         search: Default::default(),
         coding_rules: Default::default(),
+        experimental: Default::default(),
     };
     AgentContext {
         registry: Arc::new(kxen_app::tools::task::TaskRegistry::new()),
         tracker: kxen_app::tools::fs_tool::FileTracker::default(),
         workdir: Arc::from(Path::new("/tmp")),
+        path_grants: Arc::new(Default::default()),
         model: ModelRef::new("xai", "grok"),
         store: kxen_app::auth::credential::AuthStore::default(),
         max_turns: 1,
@@ -185,7 +187,7 @@ fn late_kick_fires_after_enqueue() {
     let router = NotifyRouter::new();
     let p = pending.clone();
     router.close(Arc::new(move |text: String| {
-        p.enqueue("s1", text, vec![], vec![]);
+        p.enqueue("s1", text, vec![], vec![]).unwrap();
         kick_late("s1");
     }));
     router.notify("晚到通知".into());

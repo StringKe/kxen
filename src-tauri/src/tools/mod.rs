@@ -8,6 +8,7 @@ pub mod fs_tool;
 pub mod hashline;
 pub mod hooks;
 pub mod net_guard;
+pub mod path_policy;
 pub mod safety;
 pub mod search;
 pub mod shell;

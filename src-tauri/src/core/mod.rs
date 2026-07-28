@@ -18,6 +18,7 @@ pub mod session_recovery;
 pub mod shared;
 pub mod trust;
 pub mod usage;
+pub mod usage_trend;
 pub mod workspace;
 
 pub use error::{Error, Result};

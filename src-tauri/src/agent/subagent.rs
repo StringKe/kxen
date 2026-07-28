@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub struct SubagentDeps {
     pub registry: Arc<crate::tools::task::TaskRegistry>,
     pub workdir: Arc<Path>,
+    pub path_grants: Arc<std::collections::HashSet<std::path::PathBuf>>,
     pub store: crate::auth::credential::AuthStore,
     pub mrm: Arc<ModelResourceManager>,
     pub hooks: Option<Arc<crate::tools::hooks::HookRunner>>,
@@ -33,6 +34,7 @@ impl SubagentDeps {
         Some(Self {
             registry: ctx.registry.clone(),
             workdir: ctx.workdir.clone(),
+            path_grants: ctx.path_grants.clone(),
             store: ctx.store.clone(),
             mrm: ctx.mrm.clone()?,
             hooks: ctx.hooks.clone(),
@@ -200,6 +202,7 @@ pub async fn dispatch(
         registry: deps.registry.clone(),
         tracker: crate::tools::fs_tool::FileTracker::default(),
         workdir: deps.workdir.clone(),
+        path_grants: deps.path_grants.clone(),
         model: model.clone(),
         store: deps.store.clone(),
         max_turns: agent.max_turns,
@@ -255,6 +258,8 @@ pub async fn dispatch(
     }
     let mut messages = vec![Message::system(system_prompt), Message::user(prompt)];
     let outcome = run_turn(&mut child, &mut messages).await;
+    let success = matches!(outcome.terminal, crate::agent::agent_loop::AgentEvent::Done { .. });
+    deps.mrm.record_result(&model.provider, success).await;
     deps.agents.set_status(
         &session_id,
         &name,

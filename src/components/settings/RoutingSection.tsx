@@ -10,6 +10,7 @@ import {
   testDispatch,
   type AccountInfo,
   type DispatchRecord,
+  type MrmHealth,
   type ProviderInfo,
   type TestDispatchResult,
 } from "../../lib/provider";
@@ -43,6 +44,7 @@ export default function RoutingSection() {
   const [roles, setRoles] = createSignal<Record<string, RoleBindingView>>({});
   const [slots, setSlots] = createSignal<Slot[]>([]);
   const [history, setHistory] = createSignal<DispatchRecord[]>([]);
+  const [health, setHealth] = createSignal<MrmHealth[]>([]);
   const [accounts, setAccounts] = createSignal<AccountInfo[]>([]);
   const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
   const [cat, setCat] = createSignal<ProviderCatalog[]>([]);
@@ -65,6 +67,7 @@ export default function RoutingSection() {
     if (stats) {
       setSlots(parseSlots(stats.describe));
       setHistory(stats.history.slice(0, 10));
+      setHealth(stats.health ?? []);
     }
     setAccounts(accs);
     setCat(catalog);
@@ -157,6 +160,41 @@ export default function RoutingSection() {
         </div>
       </div>
 
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] px-4 py-3">
+        <div class="text-xs text-[var(--text-faint)] mb-2">Provider 健康与今日预算</div>
+        <div class="space-y-1.5">
+          <For
+            each={health()}
+            fallback={
+              <div class="text-xs text-[var(--text-faint)]">暂无 Provider 用量或熔断记录</div>
+            }
+          >
+            {(item) => (
+              <div class="flex items-center gap-3 text-xs">
+                <span class="w-24 truncate text-[var(--text-dim)]">{item.provider}</span>
+                <span class={item.circuit_open ? "text-[var(--err)]" : "text-[var(--ok)]"}>
+                  {item.circuit_open
+                    ? `熔断 ${item.cooldown_remaining_seconds}s`
+                    : `连续失败 ${item.consecutive_failures}`}
+                </span>
+                <span class="text-[var(--text-faint)] tabular-nums">
+                  今日 {item.today_input + item.today_output} tokens
+                </span>
+                <span class="ml-auto text-[var(--text-faint)] tabular-nums">
+                  {item.estimated_cost_usd == null
+                    ? "金额 UNKNOWN"
+                    : `$${item.estimated_cost_usd.toFixed(4)}${
+                        item.daily_cost_budget_usd == null
+                          ? ""
+                          : ` / $${item.daily_cost_budget_usd.toFixed(4)}`
+                      }`}
+                </span>
+              </div>
+            )}
+          </For>
+        </div>
+      </div>
+
       <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
         <For each={Object.keys(ROLE_LABELS)}>
           {(role) => {
@@ -225,7 +263,7 @@ export default function RoutingSection() {
                   </select>
                   <Show when={binding().fallback}>
                     <span class="text-2xs text-[var(--text-faint)]" title="降级目标角色">
-                      → {binding().fallback}
+                      {"->"} {binding().fallback}
                     </span>
                   </Show>
                   <Show

@@ -101,6 +101,19 @@ impl WorkspaceRuntimeRegistry {
         Ok(runtime)
     }
 
+    /// 用户改变全局数据外发边界时重载所有已创建的 Workspace runtime。
+    /// 先复制 Arc 再 await，避免持 registry mutex 跨异步边界。
+    pub async fn reload_all(&self) -> Result<(), String> {
+        let runtimes: Vec<_> = crate::core::shared::lock(&self.runtimes).values().cloned().collect();
+        let mut errors = Vec::new();
+        for runtime in runtimes {
+            if let Err(error) = runtime.reload().await {
+                errors.push(format!("{}: {error}", runtime.root().display()));
+            }
+        }
+        if errors.is_empty() { Ok(()) } else { Err(format!("workspace runtime reload failed: {}", errors.join("; "))) }
+    }
+
     pub fn invalidate_after_trust_change(&self, root: &Path) -> Result<(), String> {
         self.runtime(root)?.invalidate_after_trust_change()
     }
@@ -159,5 +172,18 @@ mod tests {
         let registry = WorkspaceRuntimeRegistry::default();
         let missing = std::env::temp_dir().join(format!("kxen-runtime-missing-{}", std::process::id()));
         assert!(registry.runtime(&missing).is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_all_covers_every_cached_workspace() {
+        let a = temp_workspace("reload-a");
+        let b = temp_workspace("reload-b");
+        let registry = WorkspaceRuntimeRegistry::default();
+        registry.runtime(&a).unwrap();
+        registry.runtime(&b).unwrap();
+        registry.reload_all().await.unwrap();
+        assert_eq!(registry.len(), 2);
+        std::fs::remove_dir_all(a).ok();
+        std::fs::remove_dir_all(b).ok();
     }
 }

@@ -6,15 +6,18 @@
 //! 端口启动时随机分配，前端经 ws_port command 获取。
 
 mod active_context;
+mod llm_special;
 pub mod llm_task;
 mod ops;
 mod ops_agents;
 mod ops_attach;
+mod ops_diagnostics;
 mod ops_mcp;
 mod ops_provider;
 mod ops_workspace;
 pub mod pending;
 pub mod protocol;
+mod queue_delivery;
 mod rpc;
 mod run_finalize;
 mod session_delete;

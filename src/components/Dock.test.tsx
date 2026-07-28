@@ -6,6 +6,7 @@ const h = vi.hoisted(() => ({
   goalFocus: vi.fn(async (_sid?: string): Promise<unknown> => null),
   goalList: vi.fn(async (): Promise<unknown[]> => []),
   goalTransit: vi.fn(async (_id: string, _action: string): Promise<unknown> => ({})),
+  goalCreate: vi.fn(async (): Promise<unknown> => ({})),
   taskList: vi.fn(async () => [] as unknown[]),
   taskRestart: vi.fn(async (_id: string) => ({ task_id: _id })),
   agentDiffStatus: vi.fn(async () => [] as unknown[]),
@@ -21,6 +22,7 @@ vi.mock("../lib/chat", async (importOriginal) => {
     goalFocus: h.goalFocus,
     goalList: h.goalList,
     goalTransit: h.goalTransit,
+    goalCreate: h.goalCreate,
     taskList: h.taskList,
     taskKill: vi.fn(async () => true),
     taskRestart: h.taskRestart,
@@ -67,6 +69,7 @@ afterEach(() => {
   h.goalList.mockClear();
   h.goalList.mockResolvedValue([]);
   h.goalTransit.mockClear();
+  h.goalCreate.mockClear();
   h.taskList.mockClear();
   h.taskList.mockResolvedValue([]);
   h.taskRestart.mockClear();
@@ -165,6 +168,33 @@ describe("Dock goal 口径与终态呈现", () => {
     } finally {
       window.removeEventListener("kxen:composer-insert", onInsert);
     }
+  });
+
+  it("空态可直接创建带完成判据的会话 goal", async () => {
+    setActiveSessionId("s-create");
+    const dispose = render(() => <Dock />, document.body);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const direct = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "直接创建",
+    );
+    direct?.click();
+    const input = document.querySelector<HTMLInputElement>('input[placeholder="目标"]');
+    const criteria = document.querySelector<HTMLTextAreaElement>(
+      'textarea[placeholder="可观察、可验证的完成判据"]',
+    );
+    if (!input || !criteria) throw new Error("goal form not found");
+    input.value = "完成发布准备";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    criteria.value = "全部质量门禁 PASS";
+    criteria.dispatchEvent(new Event("input", { bubbles: true }));
+    const create = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "创建草稿",
+    );
+    create?.click();
+    await vi.waitFor(() =>
+      expect(h.goalCreate).toHaveBeenCalledWith("完成发布准备", "全部质量门禁 PASS", "s-create"),
+    );
+    dispose();
   });
 
   it("焦点为空回落最近更新的 goal：终态徽标 + evidence 折叠 + 无操作按钮", async () => {

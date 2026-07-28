@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::AppState;
 
-/// 启动恢复：上次退出前排队的消息逐 session 弹首条续跑，run 收尾会依次消化剩余。
+/// 启动恢复：上次退出前排队的消息逐 session claim 首条续跑，run 收尾 ack 后依次消化剩余。
 /// 立即续跑而非等用户再发消息：「已排队」是后端对用户消息的承诺，重启不该变成无限搁置。
 pub(crate) fn restore_queues(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -13,15 +13,22 @@ pub(crate) fn restore_queues(app: AppHandle) {
         for sid in state.pending_messages.restore() {
             // 会话已删（队列文件残留）：清盘不续跑
             if kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), &sid).is_err() {
-                state.pending_messages.clear(&sid);
+                if let Err(error) = state.pending_messages.clear(&sid) {
+                    tracing::warn!(session = sid, %error, "orphan pending queue cleanup failed");
+                }
                 continue;
             }
-            let Some(q) = state.pending_messages.pop(&sid) else {
-                continue;
+            let q = match state.pending_messages.claim(&sid) {
+                Ok(Some(queue)) => queue,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::error!(session = sid, %error, "pending queue claim failed during restore");
+                    continue;
+                }
             };
             let stream_id = super::protocol::stream_id("run");
             kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), sid.clone());
-            tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, app.clone()));
+            tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
         }
     });
 }
@@ -35,10 +42,17 @@ pub(crate) fn kick_session(app: AppHandle, sid: String) {
         if kxen_app::core::shared::lock(&state.active_runs).contains_key(&sid) {
             return;
         }
-        let Some(q) = state.pending_messages.pop(&sid) else { return };
+        let q = match state.pending_messages.claim(&sid) {
+            Ok(Some(queue)) => queue,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(session = sid, %error, "pending queue claim failed");
+                return;
+            }
+        };
         let stream_id = super::protocol::stream_id("run");
         kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), sid.clone());
-        tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, app.clone()));
+        tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
     });
 }
 

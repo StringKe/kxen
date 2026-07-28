@@ -22,10 +22,16 @@ send_when_running = "queue"
 
 [limits]
 global_concurrent = 8
+daily_token_budget = 500000
 
 [limits.providers.anthropic]
 concurrent = 2
 rpm = 30
+input_usd_per_million = 3.0
+output_usd_per_million = 15.0
+daily_cost_budget_usd = 10.0
+circuit_failure_threshold = 3
+circuit_cooldown_seconds = 60
 
 [roles.execution]
 provider = "xai"
@@ -47,6 +53,11 @@ base_url = "http://localhost:11434"
 [search]
 engine = "auto"
 
+[experimental]
+automatic_knowledge_distillation = false
+browser_automation = false
+remote_mcp = false
+
 [custom_providers.example]
 base_url = "https://api.example.com/v1"
 protocol = "openai"
@@ -57,10 +68,23 @@ capabilities = ["text"]
 ## 资源限制
 
 - `global_concurrent`: 所有模型调用的全局并发上限，默认值为 8。
+- `daily_token_budget`: 按本地日期统计的全局 token 硬上限，留空表示不限。
 - `limits.providers.<id>.concurrent`: Provider 并发上限。
 - `limits.providers.<id>.rpm`: 每个账号的 60 秒请求上限。
+- `input_usd_per_million` 和 `output_usd_per_million`: 用户实际合同或账单的计价口径。
+- `daily_cost_budget_usd`: 按上述显式单价计算的 Provider 每日金额硬上限。
+- `circuit_failure_threshold`: 连续失败熔断阈值，默认 3，设置 0 关闭。
+- `circuit_cooldown_seconds`: 熔断冷却时间，默认 60 秒。
 
-多个账号共享 Provider 并发池，RPM 按账号分别记录。
+多个账号共享 Provider 并发池，RPM 按账号分别记录。Kxen 不内置可能漂移的公开模型价格；没有显式单价时金额保持 `UNKNOWN`，配置金额预算但缺少单价会失败关闭。token 趋势按本地日期持久化 90 天，Settings 展示最近 14 天。
+
+## 实验能力
+
+- `automatic_knowledge_distillation`: 定期把近期 Session 内容发送给当前 Provider，并且只写个人知识。
+- `browser_automation`: 允许 Agent 驱动本机 Chrome，页面数据可能进入当前 Provider 上下文。
+- `remote_mcp`: 加载 Streamable HTTP 和 SSE server，工具参数会发送给远端 server。
+
+三项默认都是 `false`，只读取个人配置。项目 `.kxen/config.toml` 不能扩大这些能力面。
 
 ## 运行中消息
 
@@ -73,4 +97,4 @@ Hook 可以在工具事件上运行命令，并通过 matcher 限定工具名。
 
 ## 凭证
 
-API key、OAuth access token 和 refresh token 不写入 TOML。配置文件只引用 Provider、账号名、模型和非敏感端点信息。
+API key、OAuth access token 和 refresh token 不写入 TOML。配置文件只引用 Provider、账号名、模型和非敏感端点信息。当前消息、附件、注入知识和工具结果会按需要发送给实际选中的模型 Provider，设置页会显示对应隐私提示。

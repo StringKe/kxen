@@ -122,11 +122,11 @@ export default function SessionTree() {
     await newSession();
   };
 
-  const remove = async (id: string) => {
+  const remove = async (id: string, distill = false) => {
     setDeleting((prev) => new Set(prev).add(id));
     try {
       // in-flight 去重：确认按钮/右键菜单双触发只删一次；善后切换收口在 state.deleteSession
-      await dedupeDelete(`session.delete:${id}`, () => deleteSession(id));
+      await dedupeDelete(`session.delete:${id}`, () => deleteSession(id, distill));
     } catch (e) {
       flashErr(`删除会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
     } finally {
@@ -243,7 +243,7 @@ export default function SessionTree() {
                         session={s}
                         deleting={deleting().has(s.id)}
                         onOpen={() => void open(s.id)}
-                        onDelete={() => void remove(s.id)}
+                        onDelete={(distill) => void remove(s.id, distill)}
                         onChanged={() => void refreshSessions()}
                         draggable
                         dropTarget={dropTarget() === s.id}
