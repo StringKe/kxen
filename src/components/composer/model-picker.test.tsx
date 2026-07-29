@@ -188,4 +188,16 @@ describe("ModelPicker 跟随全局默认 (webkit)", () => {
     const outside = [...root.children].filter((el) => !el.classList.contains("composer-popup"));
     expect(outside.every((el) => !el.textContent?.includes("✓"))).toBe(true);
   });
+
+  it("右下角打开时长列表完整留在 1280×800 viewport 内", async () => {
+    setActiveSessionId("s1");
+    setSessions([{ ...SESSION }]);
+    await openPicker();
+    const rect = document.querySelector(".composer-popup")!.getBoundingClientRect();
+    expect([window.innerWidth, window.innerHeight]).toEqual([1280, 800]);
+    expect(rect.left).toBeGreaterThanOrEqual(8);
+    expect(rect.right).toBeLessThanOrEqual(window.innerWidth - 8);
+    expect(rect.top).toBeGreaterThanOrEqual(8);
+    expect(rect.bottom).toBeLessThanOrEqual(window.innerHeight - 8);
+  });
 });

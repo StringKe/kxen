@@ -18,6 +18,16 @@ const MIRROR_PROPS = [
   "boxSizing",
 ] as const;
 
+export const COMPOSER_POPUP_WIDTH = 384;
+export const COMPOSER_POPUP_GUTTER = 8;
+
+export function clampComposerPopupLeft(caretLeft: number, viewportWidth: number): number {
+  return Math.max(
+    COMPOSER_POPUP_GUTTER,
+    Math.min(caretLeft, viewportWidth - COMPOSER_POPUP_WIDTH - COMPOSER_POPUP_GUTTER),
+  );
+}
+
 export function caretRect(textarea: HTMLTextAreaElement): DOMRect | null {
   const cs = getComputedStyle(textarea);
   const taRect = textarea.getBoundingClientRect();
@@ -49,6 +59,6 @@ export function caretPopupPos(
 ): { left: number; bottom: number } | null {
   const r = textarea ? caretRect(textarea) : null;
   if (!r) return null;
-  const left = Math.max(8, Math.min(r.left, window.innerWidth - 264));
+  const left = clampComposerPopupLeft(r.left, window.innerWidth);
   return { left, bottom: window.innerHeight - r.top + 4 };
 }

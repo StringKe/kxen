@@ -7,8 +7,9 @@ function cut(s: string): string {
   return s.length > MAX ? s.slice(0, MAX - 1) + "…" : s;
 }
 
-export function formatError(raw: string): string {
-  const text = raw.replace(/\s+/g, " ").trim();
+export function formatError(raw: unknown): string {
+  const value = raw instanceof Error ? raw.message : String(raw ?? "");
+  const text = value.replace(/\s+/g, " ").trim();
   const i = text.indexOf("{");
   if (i >= 0) {
     try {

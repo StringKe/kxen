@@ -8,6 +8,7 @@ import { sessionSetModel } from "../lib/session-model";
 import { insertComposerText, interruptComposer } from "../lib/composer-bus";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
+import { createExclusiveDisclosure } from "../lib/dismiss";
 
 interface Row {
   kind: "command" | "session" | "model";
@@ -17,7 +18,7 @@ interface Row {
 }
 
 export default function CommandPalette() {
-  const [open, setOpen] = createSignal(false);
+  const { open, setOpen } = createExclusiveDisclosure();
   const [query, setQuery] = createSignal("");
   const [selected, setSelected] = createSignal(0);
   const [commands, setCommands] = createSignal<CommandInfo[]>([]);
@@ -104,6 +105,9 @@ export default function CommandPalette() {
     <Show when={open()}>
       <div class="fixed inset-0 z-50 bg-black/40" onClick={() => setOpen(false)}>
         <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="命令面板"
           class="mx-auto mt-24 w-full max-w-lg rounded-xl border border-[var(--border)] bg-[var(--bg-raised)] shadow-2xl shadow-black/50 overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >

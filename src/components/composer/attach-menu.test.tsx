@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { userEvent } from "@vitest/browser/context";
 import AttachMenu from "./AttachMenu";
+import "../../styles.css";
 
 const dialogMock = vi.hoisted(() => ({
   result: null as unknown,
@@ -22,14 +23,20 @@ afterEach(() => {
 });
 
 async function openMenuAndClick(label: string, onPaths: (paths: string[]) => void) {
-  const dispose = render(() => <AttachMenu onPaths={onPaths} />, document.body);
-  await userEvent.click(document.querySelector<HTMLButtonElement>(".attach-btn")!);
-  const row = [...document.querySelectorAll<HTMLButtonElement>(".popup-row")].find((b) =>
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;bottom:8px;left:8px;";
+  document.body.append(host);
+  const dispose = render(() => <AttachMenu onPaths={onPaths} />, host);
+  await userEvent.click(host.querySelector<HTMLButtonElement>(".attach-btn")!);
+  const row = [...host.querySelectorAll<HTMLButtonElement>(".popup-row")].find((b) =>
     b.textContent?.includes(label),
   )!;
   await userEvent.click(row);
   await new Promise((r) => setTimeout(r, 50));
-  return dispose;
+  return () => {
+    dispose();
+    host.remove();
+  };
 }
 
 describe("AttachMenu (webkit)", () => {
@@ -60,6 +67,25 @@ describe("AttachMenu (webkit)", () => {
     let called = 0;
     const dispose = await openMenuAndClick("选择文件", () => called++);
     expect(called).toBe(0);
+    dispose();
+  });
+
+  it("左下角打开时完整留在 1280×800 viewport 内，resize 后关闭", async () => {
+    const host = document.createElement("div");
+    host.style.cssText = "position:fixed;bottom:8px;left:8px;";
+    document.body.append(host);
+    const dispose = render(() => <AttachMenu onPaths={() => {}} />, host);
+    await userEvent.click(host.querySelector<HTMLButtonElement>(".attach-btn")!);
+
+    const rect = host.querySelector(".composer-popup")!.getBoundingClientRect();
+    expect([window.innerWidth, window.innerHeight]).toEqual([1280, 800]);
+    expect(rect.left).toBeGreaterThanOrEqual(8);
+    expect(rect.right).toBeLessThanOrEqual(window.innerWidth - 8);
+    expect(rect.top).toBeGreaterThanOrEqual(8);
+    expect(rect.bottom).toBeLessThanOrEqual(window.innerHeight - 8);
+
+    window.dispatchEvent(new Event("resize"));
+    expect(host.querySelector(".composer-popup")).toBeNull();
     dispose();
   });
 });

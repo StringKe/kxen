@@ -1,6 +1,7 @@
 // NotificationCenter resync 自愈：bus lag 丢帧后服务端下发 resync，不等轮询立即重拉通知列表。
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import "../styles.css";
 
 const h = vi.hoisted(() => ({
   rpc: vi.fn(async (_method: string) => [] as unknown[]),
@@ -31,6 +32,7 @@ afterEach(() => {
   h.resync.clear();
   setSessions([]);
   setActiveSessionId("");
+  localStorage.clear();
 });
 
 describe("NotificationCenter 轮询生命周期", () => {
@@ -65,6 +67,45 @@ describe("NotificationCenter resync 自愈", () => {
   });
 });
 
+describe("NotificationCenter 开合与错误态", () => {
+  it("打开时立即重拉，Escape 关闭", async () => {
+    const dispose = render(() => <NotificationCenter />, document.body);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listCalls()).toBe(1);
+    (document.querySelector('button[title="通知中心"]') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(listCalls()).toBe(2);
+    expect(document.querySelector('[role="dialog"][aria-label="通知"]')).toBeTruthy();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await vi.waitFor(() =>
+      expect(document.querySelector('[role="dialog"][aria-label="通知"]')).toBeNull(),
+    );
+    dispose();
+  });
+
+  it("清空失败不伪造已读状态，也不重拉伪装成功", async () => {
+    localStorage.setItem("kxen-notif-read-at", "7");
+    h.rpc.mockImplementation(async (method: string) => {
+      if (method === "notifications.clear") throw new Error("denied");
+      return [{ at: 9, text: "仍然存在" }];
+    });
+    const dispose = render(() => <NotificationCenter />, document.body);
+    await new Promise((r) => setTimeout(r, 0));
+    (document.querySelector('button[title="通知中心"]') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 0));
+    const before = listCalls();
+    (
+      [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === "清空",
+      ) as HTMLButtonElement
+    ).click();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(localStorage.getItem("kxen-notif-read-at")).toBe("7");
+    expect(listCalls()).toBe(before);
+    dispose();
+  });
+});
+
 describe("NotificationCenter 条目跳转", () => {
   it("带来源会话的条目点击切到该会话，无 session_id 的条目不可点", async () => {
     h.rpc.mockImplementation(async (method: string) =>
@@ -86,6 +127,24 @@ describe("NotificationCenter 条目跳转", () => {
     expect(jumpBtns[0]?.textContent).toContain("teammate a: 已完成");
     (jumpBtns[0] as HTMLButtonElement).click();
     await vi.waitFor(() => expect(activeSessionId()).toBe("s9"));
+    dispose();
+  });
+
+  it("右下角打开时弹层完整留在 1280×800 viewport 内", async () => {
+    const host = document.createElement("div");
+    host.className = "fixed right-2 bottom-2";
+    document.body.append(host);
+    const dispose = render(() => <NotificationCenter />, host);
+    await new Promise((r) => setTimeout(r, 0));
+    (host.querySelector('button[title="通知中心"]') as HTMLButtonElement).click();
+    await new Promise((r) => setTimeout(r, 0));
+    const rect = host.querySelector('[role="dialog"]')!.getBoundingClientRect();
+    expect(window.innerWidth).toBe(1280);
+    expect(window.innerHeight).toBe(800);
+    expect(rect.left).toBeGreaterThanOrEqual(8);
+    expect(rect.right).toBeLessThanOrEqual(window.innerWidth - 8);
+    expect(rect.top).toBeGreaterThanOrEqual(8);
+    expect(rect.bottom).toBeLessThanOrEqual(window.innerHeight - 8);
     dispose();
   });
 });

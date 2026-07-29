@@ -4,7 +4,7 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Bell, Trash2 } from "lucide-solid";
 import EmptyLine from "./EmptyLine";
 import { client } from "../lib/client";
-import { onClickOutside } from "../lib/dismiss";
+import { createExclusiveDisclosure, onClickOutside } from "../lib/dismiss";
 import { relTime } from "../lib/time";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
@@ -19,7 +19,7 @@ interface Notice {
 const READ_KEY = "kxen-notif-read-at";
 
 export default function NotificationCenter() {
-  const [open, setOpen] = createSignal(false);
+  const { open, setOpen, toggle } = createExclusiveDisclosure();
   const [items, setItems] = createSignal<Notice[]>([]);
   let root: HTMLDivElement | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -48,8 +48,9 @@ export default function NotificationCenter() {
   onCleanup(offResync);
 
   const openPanel = () => {
-    setOpen(!open());
-    if (!open()) void reload();
+    const opening = !open();
+    toggle();
+    if (opening) void reload();
   };
 
   const markRead = () => {
@@ -58,9 +59,12 @@ export default function NotificationCenter() {
   };
 
   const clearAll = async () => {
-    await client
-      .rpc("notifications.clear")
-      .catch((e) => flashErr(`清空通知失败：${formatError(e)}`));
+    try {
+      await client.rpc("notifications.clear");
+    } catch (e) {
+      flashErr(`清空通知失败：${formatError(e)}`);
+      return;
+    }
     localStorage.setItem(READ_KEY, String(Date.now()));
     await reload();
   };
@@ -85,6 +89,8 @@ export default function NotificationCenter() {
         class="pressable relative px-1.5 py-1 rounded text-[var(--text-dim)] hover:bg-[var(--bg-overlay)]/60"
         onClick={openPanel}
         title="通知中心"
+        aria-expanded={open()}
+        aria-haspopup="dialog"
       >
         <Bell size={13} />
         <Show when={unread() > 0}>
@@ -94,7 +100,11 @@ export default function NotificationCenter() {
         </Show>
       </button>
       <Show when={open()}>
-        <div class="composer-popup absolute bottom-full left-0 mb-1.5 w-72 max-h-80 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] z-30">
+        <div
+          role="dialog"
+          aria-label="通知"
+          class="composer-popup absolute bottom-full right-0 mb-1.5 w-72 max-w-[calc(100vw-16px)] max-h-80 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] z-30"
+        >
           <div class="flex items-center justify-between px-3 py-2 border-b border-[var(--border)]">
             <span class="text-xs text-[var(--text-dim)]">通知</span>
             <div class="flex gap-2">

@@ -22,10 +22,18 @@ import { startAgentsPolling } from "./lib/agents-poll";
 import { mountShortcuts } from "./lib/shortcuts";
 import { openMenu } from "./lib/context-menu";
 import { mountOsNotificationJump } from "./lib/os-notify";
-import { adjustDock, adjustSidebar, dockWidth, resetDock, resetSidebar } from "./lib/panels";
+import {
+  adjustDock,
+  adjustSidebar,
+  dockWidth,
+  fitPanelWidths,
+  resetDock,
+  resetSidebar,
+  sidebarWidth,
+} from "./lib/panels";
 import ResizeHandle from "./components/ResizeHandle";
-import { useNavigate } from "@solidjs/router";
-import { onCleanup, onMount, Show } from "solid-js";
+import { useLocation, useNavigate } from "@solidjs/router";
+import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 
 function Home() {
   // agents 名单同时驱动 AgentRunCards 与 RightColumn，轮询上提到共同父级（原先 RightColumn 独占）
@@ -50,7 +58,6 @@ function Home() {
         {/* 右栏显隐：有对话或有 agent 即可见——无对话只剩 agent 现场时，概览卡的管理钮不能被藏 */}
         <div
           class="dock-wrap"
-          style={{ "--dock-w": `${dockWidth()}px` }}
           classList={{ "dock-hidden": !hasConversation() && agents().length === 0 }}
         >
           {/* 向左拖变宽：dx 取反 */}
@@ -69,11 +76,19 @@ function Home() {
 
 function Layout(props: { children?: import("solid-js").JSX.Element }) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const [viewportWidth, setViewportWidth] = createSignal(window.innerWidth);
+  const dockVisible = () => location.pathname === "/" && (hasConversation() || agents().length > 0);
+  const panelWidths = createMemo(() =>
+    fitPanelWidths(viewportWidth(), sidebarWidth(), dockWidth(), dockVisible()),
+  );
   setNavigator(navigate);
   let unmount: (() => void) | undefined;
   let unlistenOs: (() => void) | undefined;
+  const updateViewport = () => setViewportWidth(window.innerWidth);
   onMount(() => {
     unmount = mountShortcuts();
+    window.addEventListener("resize", updateViewport);
     window.addEventListener("contextmenu", onGlobalContextMenu);
     void mountOsNotificationJump()
       .then((u) => (unlistenOs = u))
@@ -83,10 +98,17 @@ function Layout(props: { children?: import("solid-js").JSX.Element }) {
   onCleanup(() => {
     unmount?.();
     unlistenOs?.();
+    window.removeEventListener("resize", updateViewport);
     window.removeEventListener("contextmenu", onGlobalContextMenu);
   });
   return (
-    <div class="h-screen flex overflow-hidden">
+    <div
+      class="h-screen flex overflow-hidden"
+      style={{
+        "--sidebar-w": `${panelWidths().sidebar}px`,
+        "--dock-w": `${panelWidths().dock}px`,
+      }}
+    >
       <Sidebar />
       <ResizeHandle onDrag={adjustSidebar} onReset={resetSidebar} />
       <main class="flex-1 min-w-0 flex">{props.children}</main>

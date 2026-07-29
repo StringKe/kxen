@@ -23,6 +23,22 @@ export default defineConfig({
   // Astro 7's Vite 8 bundler).
   vite: {
     plugins: [tailwindcss()],
+    build: {
+      rolldownOptions: {
+        output: {
+          // 与桌面端相同：单独命名 Mermaid 的 Langium runtime，供共享 chunk budget 精确设限。
+          codeSplitting: {
+            groups: [
+              {
+                // 上游把 Langium 打进单一 parser module，命名后由 chunk budget 对它单独设限。
+                name: "mermaid-parser-runtime",
+                test: /node_modules[\\/]@mermaid-js[\\/]parser[\\/]/,
+              },
+            ],
+          },
+        },
+      },
+    },
     resolve: {
       alias: [
         {

@@ -4,7 +4,7 @@ import { Check, ChevronDown, Search } from "lucide-solid";
 import { configSetRole, currentModel } from "../../lib/chat";
 import { sessionFollowGlobalModel, sessionSetModel } from "../../lib/session-model";
 import { activeSessionId, sessions } from "../../lib/state";
-import { onClickOutside } from "../../lib/dismiss";
+import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
 import { flashErr } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
 import {
@@ -36,7 +36,7 @@ export default function ModelPicker() {
   const [cur, setCur] = createSignal({ provider: "", model: "" });
   const [globalDef, setGlobalDef] = createSignal({ provider: "", model: "" });
   const [cat, setCat] = createSignal<ProviderCatalog[]>([]);
-  const [open, setOpen] = createSignal(false);
+  const { open, setOpen, toggle } = createExclusiveDisclosure();
   const [query, setQuery] = createSignal("");
   const [roleMsg, setRoleMsg] = createSignal("");
   // 键盘导航选中位：-1 = 未导航（Enter 落首行）；与 filtered() 同步失效（query 变即复位）
@@ -161,7 +161,12 @@ export default function ModelPicker() {
 
   return (
     <div class="relative" ref={(el) => (root = el)}>
-      <button class="pressable model-pill" onClick={() => setOpen(!open())}>
+      <button
+        class="pressable model-pill"
+        aria-expanded={open()}
+        aria-haspopup="listbox"
+        onClick={toggle}
+      >
         <span class="text-2xs text-[var(--text-faint)]">{curInfo()?.family ?? cur().provider}</span>
         <span class="model-pill-name">{curLabel()}</span>
         <Show when={curInfo()?.context}>
@@ -171,7 +176,10 @@ export default function ModelPicker() {
       </button>
 
       <Show when={open()}>
-        <div class="composer-popup absolute bottom-full right-0 mb-1.5 w-80 rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] overflow-hidden z-20">
+        <div
+          role="listbox"
+          class="composer-popup absolute bottom-full right-0 mb-1.5 w-80 max-w-[calc(100vw-16px)] rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] overflow-hidden z-20"
+        >
           <div class="flex items-center gap-1.5 px-2.5 py-1.5 border-b border-[var(--border)]">
             <Search size={12} class="text-[var(--text-faint)]" />
             <input

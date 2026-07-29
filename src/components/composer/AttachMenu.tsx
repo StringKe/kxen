@@ -1,14 +1,14 @@
 // AttachMenu：+ 按钮（开启时旋转为 ×）+ 原生对话框文件/图片选择。
 // 不用浏览器 file input：它只给 File 对象拿不到真实路径，附件授权与读取都要绝对路径。
-import { createSignal, Show } from "solid-js";
+import { Show } from "solid-js";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FilePlus2, ImagePlus, Plus } from "lucide-solid";
-import { onClickOutside } from "../../lib/dismiss";
+import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 export default function AttachMenu(props: { onPaths: (paths: string[]) => void }) {
-  const [open, setOpen] = createSignal(false);
+  const { open, setOpen, toggle } = createExclusiveDisclosure();
   let root: HTMLDivElement | undefined;
   onClickOutside(
     () => root,
@@ -32,12 +32,14 @@ export default function AttachMenu(props: { onPaths: (paths: string[]) => void }
         class="pressable action-icon attach-btn"
         classList={{ "attach-open": open() }}
         title="附件（选择文件或图片）"
-        onClick={() => setOpen(!open())}
+        aria-expanded={open()}
+        aria-haspopup="menu"
+        onClick={toggle}
       >
         <Plus size={15} class="attach-icon" />
       </button>
       <Show when={open()}>
-        <div class="composer-popup absolute bottom-full left-0 mb-1.5 w-44 rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] overflow-hidden z-20">
+        <div class="composer-popup absolute bottom-full left-0 mb-1.5 w-44 max-w-[calc(100vw-16px)] rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] overflow-hidden z-20">
           <button class="popup-row" onClick={() => void pick(true)}>
             <ImagePlus size={13} />
             选择图片

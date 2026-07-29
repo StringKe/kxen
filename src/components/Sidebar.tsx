@@ -5,7 +5,6 @@ import SessionTree from "./SessionTree";
 import { initSessions, mountSessionEvents, newSession } from "../lib/state";
 import { onDragStart } from "../lib/drag";
 import { theme, toggleTheme } from "../lib/theme";
-import { sidebarWidth } from "../lib/panels";
 
 /** 左栏：品牌 + 新会话 + 项目-会话树（Codex 式分组）+ 底部应用级入口。 */
 export default function Sidebar() {
@@ -18,7 +17,7 @@ export default function Sidebar() {
   return (
     <nav
       class="shrink-0 flex flex-col border-r border-[var(--border)] bg-[var(--bg-raised)]"
-      style={{ width: `${sidebarWidth()}px` }}
+      style={{ width: "var(--sidebar-w)" }}
     >
       <div class="traffic-pad" data-tauri-drag-region onMouseDown={onDragStart} />
       <div class="px-4 pb-2 text-lg font-semibold tracking-tight text-[var(--accent-hover)]">

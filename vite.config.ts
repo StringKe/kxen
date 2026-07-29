@@ -13,6 +13,19 @@ export default defineConfig({
   build: {
     target: "esnext",
     outDir: "dist",
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              // 上游把 Langium 打进单一 parser module，命名后由 chunk budget 对它单独设限。
+              name: "mermaid-parser-runtime",
+              test: /node_modules[\\/]@mermaid-js[\\/]parser[\\/]/,
+            },
+          ],
+        },
+      },
+    },
   },
   // shiki 细粒度子路径依赖：不预声明会在 dev/test 首跑时触发 dep optimizer 二次扫描，
   // browser mode 下页面中途 reload 直接 flaky（vitest 报 "unexpectedly reloaded a test"）。
@@ -24,10 +37,7 @@ export default defineConfig({
       "solid-js",
       "solid-js/web",
       "solid-js/store",
-      "@solidjs/router",
-      "@kobalte/core",
       "class-variance-authority",
-      "lucide-solid",
       "marked",
       "dompurify",
       "mermaid",
@@ -62,7 +72,7 @@ export default defineConfig({
       enabled: true,
       provider: playwright(),
       headless: true,
-      instances: [{ browser: "webkit" }],
+      instances: [{ browser: "webkit", viewport: { width: 1280, height: 800 } }],
     },
   },
 });

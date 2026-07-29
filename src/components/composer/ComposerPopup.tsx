@@ -1,6 +1,7 @@
 // 触发补全弹层：fixed 定位（bottom 锚定向上展开）+ 键盘/hover 合一选中态 + listbox ARIA。
 import { createEffect, For, Show } from "solid-js";
 import type { PopupItem } from "./triggers";
+import { COMPOSER_POPUP_GUTTER, COMPOSER_POPUP_WIDTH } from "./caret";
 
 export default function ComposerPopup(props: {
   items: PopupItem[];
@@ -19,12 +20,13 @@ export default function ComposerPopup(props: {
       ref={(el) => (root = el)}
       role="listbox"
       aria-activedescendant={`composer-opt-${props.selected}`}
-      class="composer-popup fixed w-96 max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] z-30"
-      style={
-        props.pos
-          ? `left:${props.pos.left}px;bottom:${props.pos.bottom}px`
-          : "left:16px;bottom:120px"
-      }
+      class="composer-popup fixed max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] z-30"
+      style={{
+        width: `min(${COMPOSER_POPUP_WIDTH}px, calc(100vw - ${COMPOSER_POPUP_GUTTER * 2}px))`,
+        ...(props.pos
+          ? { left: `${props.pos.left}px`, bottom: `${props.pos.bottom}px` }
+          : { left: "16px", bottom: "120px" }),
+      }}
     >
       <For each={props.items}>
         {(item, i) => (

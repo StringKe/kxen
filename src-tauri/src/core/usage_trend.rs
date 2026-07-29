@@ -49,14 +49,12 @@ fn persist_to(path: &Path, ledger: &Ledger) {
     }
 }
 
-pub fn record(provider: &str, input: u64, output: u64) {
+fn record_to(path: &Path, date: &str, provider: &str, input: u64, output: u64) {
     if input == 0 && output == 0 {
         return;
     }
-    let _guard = io_lock().lock().expect("usage trend lock");
-    let path = store_file();
-    let mut ledger = load_from(&path);
-    let day = ledger.days.entry(today_key()).or_default();
+    let mut ledger = load_from(path);
+    let day = ledger.days.entry(date.to_string()).or_default();
     day.input = day.input.saturating_add(input);
     day.output = day.output.saturating_add(output);
     let provider = day.by_provider.entry(provider.to_string()).or_default();
@@ -66,20 +64,33 @@ pub fn record(provider: &str, input: u64, output: u64) {
         let Some(first) = ledger.days.keys().next().cloned() else { break };
         ledger.days.remove(&first);
     }
-    persist_to(&path, &ledger);
+    persist_to(path, &ledger);
+}
+
+pub fn record(provider: &str, input: u64, output: u64) {
+    let _guard = io_lock().lock().expect("usage trend lock");
+    record_to(&store_file(), &today_key(), provider, input, output);
+}
+
+fn day_from(path: &Path, date: &str) -> DayUsage {
+    load_from(path).days.remove(date).unwrap_or_default()
 }
 
 pub fn today() -> DayUsage {
     let _guard = io_lock().lock().expect("usage trend lock");
-    load_from(&store_file()).days.remove(&today_key()).unwrap_or_default()
+    day_from(&store_file(), &today_key())
+}
+
+fn recent_from(path: &Path, days: usize) -> Vec<(String, DayUsage)> {
+    let ledger = load_from(path);
+    let mut out: Vec<_> = ledger.days.into_iter().rev().take(days).collect();
+    out.reverse();
+    out
 }
 
 pub fn recent(days: usize) -> Vec<(String, DayUsage)> {
     let _guard = io_lock().lock().expect("usage trend lock");
-    let ledger = load_from(&store_file());
-    let mut out: Vec<_> = ledger.days.into_iter().rev().take(days).collect();
-    out.reverse();
-    out
+    recent_from(&store_file(), days)
 }
 
 pub fn provider_cost_usd(usage: &ProviderUsage, limit: &crate::core::config::ProviderLimit) -> Option<f64> {
@@ -121,5 +132,29 @@ mod tests {
     #[test]
     fn unknown_rates_do_not_invent_cost() {
         assert_eq!(provider_cost_usd(&ProviderUsage { input: 1, output: 1 }, &Default::default()), None);
+    }
+
+    #[test]
+    fn record_and_query_preserve_provider_totals_and_date_order() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system time").as_nanos();
+        let path = std::env::temp_dir().join(format!("kxen-usage-trend-public-{nonce}.json"));
+
+        record_to(&path, "2026-07-27", "openai", 0, 0);
+        assert!(!path.exists());
+
+        record_to(&path, "2026-07-27", "openai", 10, 3);
+        record_to(&path, "2026-07-27", "openai", 5, 2);
+        record_to(&path, "2026-07-28", "anthropic", 7, 4);
+
+        let first = day_from(&path, "2026-07-27");
+        assert_eq!((first.input, first.output), (15, 5));
+        assert_eq!((first.by_provider["openai"].input, first.by_provider["openai"].output), (15, 5));
+        assert_eq!(day_from(&path, "missing").input, 0);
+
+        let recent = recent_from(&path, 2);
+        assert_eq!(recent.iter().map(|(date, _)| date.as_str()).collect::<Vec<_>>(), ["2026-07-27", "2026-07-28"]);
+        assert_eq!(recent[1].1.by_provider["anthropic"].output, 4);
+        assert_eq!(recent_from(&path, 1)[0].0, "2026-07-28");
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -88,4 +88,14 @@ describe("MicMenu (webkit)", () => {
     await openMenu();
     expect(document.querySelector(".composer-popup")!.textContent).toContain("无可用语音引擎");
   });
+
+  it("右下角打开时完整留在 1280×800 viewport 内", async () => {
+    const host = await openMenu();
+    const rect = host.querySelector(".composer-popup")!.getBoundingClientRect();
+    expect([window.innerWidth, window.innerHeight]).toEqual([1280, 800]);
+    expect(rect.left).toBeGreaterThanOrEqual(8);
+    expect(rect.right).toBeLessThanOrEqual(window.innerWidth - 8);
+    expect(rect.top).toBeGreaterThanOrEqual(8);
+    expect(rect.bottom).toBeLessThanOrEqual(window.innerHeight - 8);
+  });
 });

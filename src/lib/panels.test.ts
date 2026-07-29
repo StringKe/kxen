@@ -5,6 +5,9 @@ import {
   adjustSidebar,
   DOCK,
   dockWidth,
+  fitPanelWidths,
+  MIN_CONVERSATION_WIDTH,
+  RESIZE_HANDLE_WIDTH,
   resetDock,
   resetSidebar,
   SIDEBAR,
@@ -49,5 +52,28 @@ describe("panels 栏宽", () => {
     expect(() => adjustDock(10)).not.toThrow();
     expect(dockWidth()).toBe(DOCK.def + 10);
     setItem.mockRestore();
+  });
+
+  it("1280 最小窗口按共享预算收缩极限宽度，保留中央会话区", () => {
+    const fitted = fitPanelWidths(1280, SIDEBAR.max, DOCK.max, true);
+    expect(fitted).toEqual({ sidebar: 354, dock: 442 });
+    expect(RESIZE_HANDLE_WIDTH + fitted.sidebar + fitted.dock + MIN_CONVERSATION_WIDTH).toBe(1280);
+  });
+
+  it("默认宽度和宽窗口不收缩，dock 隐藏时不占共享预算", () => {
+    expect(fitPanelWidths(1280, SIDEBAR.def, DOCK.def, true)).toEqual({
+      sidebar: SIDEBAR.def,
+      dock: DOCK.def,
+    });
+    for (const viewport of [1440, 1728]) {
+      expect(fitPanelWidths(viewport, SIDEBAR.max, DOCK.max, true)).toEqual({
+        sidebar: SIDEBAR.max,
+        dock: DOCK.max,
+      });
+    }
+    expect(fitPanelWidths(1280, SIDEBAR.max, DOCK.max, false)).toEqual({
+      sidebar: SIDEBAR.max,
+      dock: DOCK.max,
+    });
   });
 });

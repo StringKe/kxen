@@ -56,4 +56,9 @@ describe("formatError", () => {
   it("空串返回空串", () => {
     expect(formatError("")).toBe("");
   });
+
+  it("Error 与非字符串拒绝值统一转为可展示文本", () => {
+    expect(formatError(new Error("permission denied"))).toBe("permission denied");
+    expect(formatError({ code: 7 })).toBe("[object Object]");
+  });
 });

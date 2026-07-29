@@ -3,6 +3,8 @@
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import CommandPalette from "./CommandPalette";
+import Popup from "./Popup";
+import "../styles.css";
 
 const mocks = vi.hoisted(() => ({ commandCalls: 0, catalogCalls: 0 }));
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -68,6 +70,35 @@ describe("CommandPalette", () => {
     await tick();
     expect(mocks.commandCalls).toBe(2);
     expect(document.body.textContent).toContain("/doctor");
+    dispose();
+  });
+
+  it("打开时关闭其他 popup，聚焦输入框且完整留在 1280×800 viewport 内", async () => {
+    const dispose = render(
+      () => (
+        <>
+          <Popup side="left" trigger={() => <button>打开 popup</button>}>
+            旧 popup
+          </Popup>
+          <CommandPalette />
+        </>
+      ),
+      document.body,
+    );
+    (document.querySelector("button") as HTMLButtonElement).click();
+    expect(document.body.textContent).toContain("旧 popup");
+
+    cmdK();
+    await tick();
+    expect(document.body.textContent).not.toContain("旧 popup");
+    const dialog = document.querySelector('[role="dialog"][aria-label="命令面板"]')!;
+    const rect = dialog.getBoundingClientRect();
+    expect(document.activeElement).toBe(dialog.querySelector("input"));
+    expect([window.innerWidth, window.innerHeight]).toEqual([1280, 800]);
+    expect(rect.left).toBeGreaterThanOrEqual(8);
+    expect(rect.right).toBeLessThanOrEqual(window.innerWidth - 8);
+    expect(rect.top).toBeGreaterThanOrEqual(8);
+    expect(rect.bottom).toBeLessThanOrEqual(window.innerHeight - 8);
     dispose();
   });
 });

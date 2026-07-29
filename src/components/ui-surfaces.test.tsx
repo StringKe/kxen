@@ -144,24 +144,32 @@ describe("基础交互组件", () => {
     dispose();
   });
 
-  it("Popup 支持左右锚点、开关和缺省宽度", async () => {
+  it("Popup 支持左右锚点、互斥、Escape 和缺省宽度", async () => {
     const dispose = render(
       () => (
-        <Popup
-          side="right"
-          class="extra"
-          trigger={(open) => <button>{open() ? "收起" : "展开"}</button>}
-        >
-          popup body
-        </Popup>
+        <>
+          <Popup
+            side="right"
+            class="extra"
+            trigger={(open) => <button>{open() ? "收起 A" : "展开 A"}</button>}
+          >
+            popup A
+          </Popup>
+          <Popup side="left" trigger={(open) => <button>{open() ? "收起 B" : "展开 B"}</button>}>
+            popup B
+          </Popup>
+        </>
       ),
       document.body,
     );
-    clickButton("展开");
-    await vi.waitFor(() => expect(document.body.textContent).toContain("popup body"));
+    clickButton("展开 A");
+    await vi.waitFor(() => expect(document.body.textContent).toContain("popup A"));
     expect(document.body.querySelector(".right-0.w-52.extra")).toBeTruthy();
-    clickButton("收起");
-    await vi.waitFor(() => expect(document.body.textContent).not.toContain("popup body"));
+    clickButton("展开 B");
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain("popup A"));
+    expect(document.body.textContent).toContain("popup B");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain("popup B"));
     dispose();
   });
 

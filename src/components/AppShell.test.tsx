@@ -22,6 +22,7 @@ vi.mock("@solidjs/router", () => ({
   Route: (props: { path: string; component: () => JSX.Element }) => (
     <section data-path={props.path}>{props.component()}</section>
   ),
+  useLocation: () => ({ pathname: "/" }),
   useNavigate: () => h.navigate,
 }));
 
@@ -64,8 +65,10 @@ vi.mock("../lib/panels", () => ({
   adjustDock: vi.fn(),
   adjustSidebar: vi.fn(),
   dockWidth: () => 320,
+  fitPanelWidths: (_viewport: number, sidebar: number, dock: number) => ({ sidebar, dock }),
   resetDock: vi.fn(),
   resetSidebar: vi.fn(),
+  sidebarWidth: () => 240,
 }));
 
 import App from "../App";

@@ -8,7 +8,7 @@ import { clearDraft, getDraft, setDraft, stripTruncMark } from "../../lib/drafts
 import { createInFlight } from "../../lib/async-guard";
 import { flashErr } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
-import { COMPOSER_INSERT_EVENT } from "../../lib/composer-bus";
+import { COMPOSER_INSERT_EVENT, COMPOSER_INTERRUPT_EVENT } from "../../lib/composer-bus";
 import { detectTrigger, type PopupState, type Trigger } from "./triggers";
 import { createAttachments } from "./composer-attachments";
 import { createVoicePtt } from "./voice-ptt";
@@ -112,7 +112,10 @@ export default function TextComposer(props: {
       ta?.focus();
     };
     window.addEventListener(COMPOSER_INSERT_EVENT, onInsert);
+    const onInterrupt = () => setPopup(null);
+    window.addEventListener(COMPOSER_INTERRUPT_EVENT, onInterrupt);
     onCleanup(() => window.removeEventListener(COMPOSER_INSERT_EVENT, onInsert));
+    onCleanup(() => window.removeEventListener(COMPOSER_INTERRUPT_EVENT, onInterrupt));
     onCleanup(listenComposerDragDrop(setDragOver, (paths) => void attachPaths(paths)));
     ta?.focus();
   });

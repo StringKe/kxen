@@ -10,6 +10,8 @@ interface PanelSpec {
 
 export const SIDEBAR: PanelSpec = { min: 176, max: 420, def: 208, key: "kxen.sidebar.w" };
 export const DOCK: PanelSpec = { min: 232, max: 520, def: 256, key: "kxen.dock.w" };
+export const RESIZE_HANDLE_WIDTH = 4;
+export const MIN_CONVERSATION_WIDTH = 480;
 
 function clamp(spec: PanelSpec, n: number): number {
   return Math.min(spec.max, Math.max(spec.min, Math.round(n)));
@@ -27,6 +29,39 @@ function persist(spec: PanelSpec, n: number): void {
   } catch {
     // 隐私模式等写不进去：宽度仅在本次会话内生效
   }
+}
+
+/**
+ * 用户拖拽值是偏好宽度；实际窗口不足时，两栏按各自超出最小值的比例共同收缩。
+ * 窗口重新变宽后直接从偏好值重算，因此不会把临时收缩覆盖进持久化设置。
+ */
+export function fitPanelWidths(
+  viewportWidth: number,
+  preferredSidebar: number,
+  preferredDock: number,
+  dockVisible: boolean,
+): { sidebar: number; dock: number } {
+  const sidebar = clamp(SIDEBAR, preferredSidebar);
+  const dock = clamp(DOCK, preferredDock);
+  if (!dockVisible) return { sidebar, dock };
+
+  const minimumPanels = SIDEBAR.min + DOCK.min;
+  const panelBudget = Math.max(
+    minimumPanels,
+    Math.floor(viewportWidth) - RESIZE_HANDLE_WIDTH - MIN_CONVERSATION_WIDTH,
+  );
+  if (sidebar + dock <= panelBudget) return { sidebar, dock };
+
+  const sidebarExtra = sidebar - SIDEBAR.min;
+  const dockExtra = dock - DOCK.min;
+  const requestedExtra = sidebarExtra + dockExtra;
+  const availableExtra = Math.max(0, panelBudget - minimumPanels);
+  const fittedSidebarExtra =
+    requestedExtra === 0 ? 0 : Math.round((availableExtra * sidebarExtra) / requestedExtra);
+  return {
+    sidebar: SIDEBAR.min + fittedSidebarExtra,
+    dock: DOCK.min + availableExtra - fittedSidebarExtra,
+  };
 }
 
 export const [sidebarWidth, setSidebarWidth] = createSignal(load(SIDEBAR));
