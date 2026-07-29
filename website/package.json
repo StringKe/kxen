@@ -5,15 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "astro dev",
-    "build": "node scripts/build.mjs",
+    "build": "node ../scripts/build.mjs website",
     "preview": "astro preview",
     "typecheck": "astro check",
     "lint:docs": "nimbus-docs lint",
     "lint:docs:fix": "nimbus-docs lint --fix",
     "check": "pnpm lint:docs && pnpm typecheck && pnpm build",
-    "prepreview:cf": "astro build",
+    "prepreview:cf": "pnpm build",
     "preview:cf": "wrangler dev",
-    "predeploy": "astro check && astro build",
+    "predeploy": "astro check && pnpm build",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

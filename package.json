@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vp dev",
-    "build": "node scripts/build.mjs",
+    "build": "node scripts/build.mjs app",
     "check": "vp check",
     "test": "node scripts/test.mjs",
     "coverage": "node scripts/test.mjs --coverage",
