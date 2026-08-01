@@ -54,6 +54,7 @@ async fn main() {
             AgentEvent::Aborted => println!("\n=== ABORTED ==="),
             AgentEvent::Error { message } => println!("\n!!! ERROR: {message}"),
         }),
+        stream_override: None,
     };
 
     let mut messages = vec![

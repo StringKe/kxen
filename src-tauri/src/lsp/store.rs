@@ -39,7 +39,7 @@ impl Store {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(parse_diagnostic).collect())
             .unwrap_or_default();
-        let mut map = self.by_path.lock().expect("lsp store");
+        let mut map = crate::core::shared::lock(&self.by_path);
         let entry = map.entry(path).or_insert_with(|| Entry { version: None, source: source.to_string(), diags: Vec::new() });
         if let (Some(new), Some(old)) = (version, entry.version)
             && new < old
@@ -55,12 +55,12 @@ impl Store {
 
     /// 该文件 server 最后发布的版本（等发布逻辑用；server 不报 version -> None）。
     pub fn version(&self, path: &Path) -> Option<u64> {
-        self.by_path.lock().expect("lsp store").get(path).and_then(|e| e.version)
+        crate::core::shared::lock(&self.by_path).get(path).and_then(|e| e.version)
     }
 
     /// 快照：path 过滤或全量；空 -> "no diagnostics"。格式 `[E] path:line:col message (server)`。
     pub fn snapshot(&self, filter: Option<&Path>) -> String {
-        let map = self.by_path.lock().expect("lsp store");
+        let map = crate::core::shared::lock(&self.by_path);
         let mut entries: Vec<_> = map.iter().filter(|(p, _)| filter.is_none_or(|f| *p == f)).collect();
         entries.sort_by_key(|(a, _)| *a);
         let mut out = String::new();
@@ -73,7 +73,7 @@ impl Store {
     }
 
     pub fn has_entry(&self, path: &Path) -> bool {
-        self.by_path.lock().expect("lsp store").contains_key(path)
+        crate::core::shared::lock(&self.by_path).contains_key(path)
     }
 }
 

@@ -73,13 +73,13 @@ impl StdioTransport {
                     continue;
                 }
                 if let Some(id) = v.get("id").and_then(|i| i.as_u64())
-                    && let Some(tx) = pending_rx.lock().expect("mcp pending").remove(&id)
+                    && let Some(tx) = crate::core::shared::lock(&pending_rx).remove(&id)
                 {
                     let _ = tx.send(v);
                 }
             }
             // EOF：全部挂起请求按失败结束（调用方走 lazy restart）
-            pending_rx.lock().expect("mcp pending").clear();
+            crate::core::shared::lock(&pending_rx).clear();
         });
         Ok(Arc::new(Self { child: tokio::sync::Mutex::new(child), stdin, pending, next_id: AtomicU64::new(1) }))
     }
@@ -88,7 +88,7 @@ impl StdioTransport {
     async fn request_inner(&self, method: &str, params: Value, timeout: std::time::Duration) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().expect("mcp pending").insert(id, tx);
+        crate::core::shared::lock(&self.pending).insert(id, tx);
         let frame = serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let line = format!("{}\n", serde_json::to_string(&frame).map_err(|e| e.to_string())?);
         self.stdin.lock().await.write_all(line.as_bytes()).await.map_err(|e| format!("mcp write: {e}"))?;

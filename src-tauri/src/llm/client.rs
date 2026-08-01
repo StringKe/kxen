@@ -5,6 +5,19 @@ use crate::llm::types::{Delta, Message, ModelRef};
 use futures::Stream;
 use std::pin::Pin;
 
+/// LLM 流式调用签名：run 主循环的注入缝（AgentContext::stream_override）。
+/// 生产路径为 None = LlmClient::stream_with_tools 静态分发；单测注入假流覆盖重试/终态/预算分支。
+pub type StreamFn = std::sync::Arc<
+    dyn Fn(
+            &ModelRef,
+            &[Message],
+            &[crate::llm::tool::ToolDefinition],
+            &crate::auth::credential::AuthStore,
+        ) -> Pin<Box<dyn Stream<Item = Delta> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct LlmClient;
 
 impl LlmClient {
@@ -15,6 +28,20 @@ impl LlmClient {
         store: &crate::auth::credential::AuthStore,
     ) -> Pin<Box<dyn Stream<Item = Delta> + Send>> {
         Self::stream_with_tools(model, messages, &[], store)
+    }
+
+    /// run 主循环入口：stream_override 注入缝优先（单测假流），否则静态分发。
+    pub fn stream_dispatch(
+        model: &ModelRef,
+        messages: &[Message],
+        tools: &[crate::llm::tool::ToolDefinition],
+        store: &crate::auth::credential::AuthStore,
+        stream_override: Option<&StreamFn>,
+    ) -> Pin<Box<dyn Stream<Item = Delta> + Send>> {
+        match stream_override {
+            Some(f) => f(model, messages, tools, store),
+            None => Self::stream_with_tools(model, messages, tools, store),
+        }
     }
 
     pub fn stream_with_tools(
@@ -47,9 +74,7 @@ impl LlmClient {
             other if other.starts_with("custom:") => {
                 // 自定义类型提供商：config.toml 给端点+协议，auth.json 给 key（custom:<name>）
                 let name = other[7..].to_string();
-                let cfg =
-                    crate::core::config::Config::load(&crate::core::paths::config_dir().join("config.toml"), None).unwrap_or_default();
-                let Some(def) = cfg.custom_providers.get(&name).cloned() else {
+                let Some(def) = crate::core::config::custom_provider_def(&name) else {
                     return Box::pin(futures::stream::once(async move { Delta::Error(format!("custom provider not configured: {name}")) }));
                 };
                 let Some(crate::auth::credential::CredentialKind::Api { key, .. }) = store.get(other) else {

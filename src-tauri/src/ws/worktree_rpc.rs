@@ -7,7 +7,7 @@ use crate::AppState;
 pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppState>) -> Result<Value, String> {
     match method {
         "worktree.list" => {
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let infos = kxen_app::tools::worktree::list(&dir).await?;
             Ok(json!(
                 infos
@@ -22,7 +22,7 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
         }
         "worktree.create" => {
             let name = params.get("name").and_then(Value::as_str).ok_or("missing name")?;
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let info = kxen_app::tools::worktree::create(&dir, name).await?;
             Ok(json!({
                 "name": info.name,
@@ -33,7 +33,7 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
         "worktree.remove" => {
             let name = params.get("name").and_then(Value::as_str).ok_or("missing name")?;
             let delete_branch = params.get("delete_branch").and_then(Value::as_bool).unwrap_or(false);
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let approval = kxen_app::tools::exec::ApprovalCtx::new(Some(state.approvals.as_ref()), Some(&state.bus), None, None);
             kxen_app::tools::worktree::remove_with_approval(&dir, name, delete_branch, approval.as_ref()).await?;
             Ok(json!(true))

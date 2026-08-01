@@ -164,7 +164,7 @@ pub(crate) async fn run_llm(
 
     let (model, store, registry, workdir, bus) = {
         // 主会话模型快过期先刷新（克隆出来刷避免持锁跨 await；成功则回写共享 store）
-        let model = super::session_ops::effective_session_model(Some(&session_id), &state);
+        let model = super::session_ops::effective_session_model(Some(&session_id), &state).await;
         let provider = model.provider.clone();
         let account = model.account.clone();
         let mut store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
@@ -172,7 +172,7 @@ pub(crate) async fn run_llm(
         if refreshed {
             let key = account.as_deref().map(|a| kxen_app::auth::credential::account_id(&provider, a)).unwrap_or(provider.clone());
             if let Some(cred) = store.get(&key).cloned() {
-                state.auth_store.lock().expect("auth_store").insert(key, cred);
+                kxen_app::core::shared::lock(&state.auth_store).insert(key, cred);
             }
         }
         (model, store, state.registry.clone(), std::sync::Arc::from(session_path.as_path()), state.bus.clone())
@@ -225,7 +225,7 @@ pub(crate) async fn run_llm(
         model,
         store,
         max_turns: 32,
-        mrm: Some(state.mrm.read().expect("mrm lock").clone()),
+        mrm: Some(kxen_app::core::shared::read(&state.mrm).clone()),
         allowed_tools: None,
         extras: Some(state.extras_for(&session_id)),
         hooks: Some(runtime.hooks()),
@@ -240,6 +240,7 @@ pub(crate) async fn run_llm(
         mcp: Some(runtime.mcp()),
         lsp: Some(runtime.lsp()),
         notify: Some(notify.clone()),
+        stream_override: None,
         on_event: Arc::new(move |event| {
             use kxen_app::agent::agent_loop::AgentEvent as AE;
             if matches!(&event, AE::Done { .. } | AE::Aborted | AE::Error { .. }) {
@@ -248,7 +249,7 @@ pub(crate) async fn run_llm(
             match &event {
                 AE::Reasoning { text } => {
                     // 分片落盘为整块：连续 reasoning delta 并入尾部 Reasoning part
-                    let mut guard = transcript_writer.lock().expect("transcript");
+                    let mut guard = kxen_app::core::shared::lock(&transcript_writer);
                     match guard.last_mut() {
                         Some(ses::Part::Reasoning { text: existing }) => existing.push_str(text),
                         _ => guard.push(ses::Part::Reasoning { text: text.clone() }),
@@ -257,7 +258,7 @@ pub(crate) async fn run_llm(
                 AE::ToolCall { name, summary, arguments } => {
                     // input 留一行摘要（UI 头行），args 存精确参数；parse 失败留原文不丢数据
                     let args = serde_json::from_str(arguments).unwrap_or_else(|_| json!(arguments));
-                    transcript_writer.lock().expect("transcript").push(ses::Part::ToolCall {
+                    kxen_app::core::shared::lock(&transcript_writer).push(ses::Part::ToolCall {
                         name: name.clone(),
                         input: json!(summary),
                         output: String::new(),
@@ -265,7 +266,7 @@ pub(crate) async fn run_llm(
                     });
                 }
                 AE::ToolResult { name, output, .. } => {
-                    let mut guard = transcript_writer.lock().expect("transcript");
+                    let mut guard = kxen_app::core::shared::lock(&transcript_writer);
                     if let Some(ses::Part::ToolCall { output: slot, .. }) = guard
                         .iter_mut()
                         .rev()

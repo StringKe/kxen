@@ -4,6 +4,9 @@ use super::EngineStatus;
 use super::objc;
 
 pub fn status() -> EngineStatus {
+    if let Err(detail) = objc::availability() {
+        return EngineStatus { id: "apple".into(), label: "Apple 本地识别".into(), status: "unavailable".into(), detail };
+    }
     let (status, detail) = match objc::authorization_status() {
         objc::SpeechAuth::Authorized => ("ready", "Speech.framework 已授权"),
         objc::SpeechAuth::NotDetermined => ("needs_auth", "首次使用将请求语音识别权限"),
@@ -12,28 +15,8 @@ pub fn status() -> EngineStatus {
     EngineStatus { id: "apple".into(), label: "Apple 本地识别".into(), status: status.into(), detail: detail.into() }
 }
 
-/// 整文件识别 -> 最终文本（E2E 与排障共用；90s 超时）。
-pub fn recognize_file(path: &str, locale: &str) -> Result<String, String> {
-    ensure_authorized()?;
-    let recognizer = on_device_recognizer(locale)?;
-    let request = objc::url_request(path).ok_or("无法创建识别请求")?;
-    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let handler = objc::ResultHandler::new(move |result, error| {
-        if let Some(err) = objc::error_text(error) {
-            let _ = tx.send(Err(err));
-            return;
-        }
-        if let Some((text, true)) = unsafe { objc::result_text(result) } {
-            let _ = tx.send(Ok(text));
-        }
-    });
-    let task = objc::recognition_task(&recognizer, &request, &handler).ok_or("无法启动识别任务")?;
-    let out = rx.recv_timeout(std::time::Duration::from_secs(90)).map_err(|_| "识别超时（90s）".to_string());
-    objc::cancel_task(&task);
-    out?
-}
-
 fn ensure_authorized() -> Result<(), String> {
+    objc::availability()?;
     match objc::authorization_status() {
         objc::SpeechAuth::Authorized => Ok(()),
         objc::SpeechAuth::NotDetermined => {
@@ -68,6 +51,15 @@ mod tests {
         let s = super::status();
         assert_eq!(s.id, "apple");
         assert!(["ready", "needs_auth", "unavailable"].contains(&s.status.as_str()));
+    }
+
+    #[test]
+    fn availability_is_explicit_result_not_panic() {
+        // 标准 macOS 上框架齐全应 Ok；缺失时须是带 detail 的 Err（引擎标 unavailable），不得 panic
+        match super::objc::availability() {
+            Ok(()) => {}
+            Err(detail) => assert!(detail.contains("ObjC"), "detail 须指明缺失类: {detail}"),
+        }
     }
 }
 

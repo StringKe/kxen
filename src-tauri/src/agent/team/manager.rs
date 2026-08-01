@@ -2,7 +2,7 @@
 
 use crate::core::event::EventBus;
 use crate::core::pending_queue::PendingQueues;
-use crate::core::shared::lock;
+use crate::core::shared::{lock, read};
 use crate::llm::ModelRef;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ impl TeamManager {
                     }
                     None => {
                         // 共享句柄读当前 MRM：set_role 热换后 teammate 派发也走新路由
-                        let mrm = state.deps.mrm.read().expect("mrm").clone();
+                        let mrm = read(&state.deps.mrm).clone();
                         // 凭证取操作点实时快照（先克隆再 await）：冻结副本看不到探测/刷新后的新凭证
                         let store = lock(&state.deps.store).clone();
                         let resolved = mrm.resolve(&role, &store).await.ok_or_else(|| format!("no available model for role {role}"))?;

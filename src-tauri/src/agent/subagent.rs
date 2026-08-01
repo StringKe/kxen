@@ -221,6 +221,7 @@ pub async fn dispatch(
         mcp: deps.mcp.clone(),
         lsp: deps.lsp.clone(),
         notify: None, // 子代理不开通知通道：不嵌套派发（background 只从主会话发起）
+        stream_override: None,
         loop_detector: crate::agent::loop_detect::LoopDetector::new(),
         on_event: {
             let bus = deps.bus.clone();

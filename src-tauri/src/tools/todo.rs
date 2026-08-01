@@ -17,15 +17,15 @@ pub struct TodoStore {
 
 impl TodoStore {
     pub fn add(&self, content: String) -> TodoItem {
-        let mut next = self.next_id.lock().expect("todo id");
+        let mut next = crate::core::shared::lock(&self.next_id);
         *next += 1;
         let item = TodoItem { id: *next, content, done: false };
-        self.items.lock().expect("todo").push(item.clone());
+        crate::core::shared::lock(&self.items).push(item.clone());
         item
     }
 
     pub fn complete(&self, id: u32) -> bool {
-        let mut items = self.items.lock().expect("todo");
+        let mut items = crate::core::shared::lock(&self.items);
         if let Some(item) = items.iter_mut().find(|i| i.id == id) {
             item.done = true;
             true
@@ -35,14 +35,14 @@ impl TodoStore {
     }
 
     pub fn clear_done(&self) -> usize {
-        let mut items = self.items.lock().expect("todo");
+        let mut items = crate::core::shared::lock(&self.items);
         let before = items.len();
         items.retain(|i| !i.done);
         before - items.len()
     }
 
     pub fn list(&self) -> Vec<TodoItem> {
-        self.items.lock().expect("todo").clone()
+        crate::core::shared::lock(&self.items).clone()
     }
 
     pub fn render(&self) -> String {

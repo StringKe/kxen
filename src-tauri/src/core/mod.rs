@@ -3,6 +3,7 @@
 
 pub mod attachment;
 pub mod config;
+pub mod config_cache;
 pub mod error;
 pub mod event;
 pub mod goal;

@@ -58,7 +58,7 @@ pub fn load_history(dir: &Path, id: &str) -> Vec<Message> {
 pub fn rewrite_messages(dir: &Path, id: &str, messages: &[Message]) -> std::io::Result<()> {
     crate::core::ids::validate_id_io(id)?;
     let lock = write_lock(id);
-    let _guard = lock.lock().expect("session write lock");
+    let _guard = crate::core::shared::lock(&lock);
     let target = messages_path(dir, id);
     let tmp = target.with_extension("jsonl.tmp");
     let mut file = std::fs::File::create(&tmp)?;

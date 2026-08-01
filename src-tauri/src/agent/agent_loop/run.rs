@@ -25,6 +25,8 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
     let mut ttft: Option<std::time::Duration> = None;
     // 跨 request 累加：一轮 tool loop 多次 LLM 请求，覆盖式只记末轮是漏算根因（P1-12）
     let mut usage_acc = UsageAcc::default();
+    // goal wall 快照缓存（run 粒度）：目录 mtime 失效，见 usage::GoalWallCache
+    let mut wall_cache = super::usage::GoalWallCache::default();
     let stats = |ttft: Option<std::time::Duration>, acc: &UsageAcc| {
         let (input, output) = acc.total();
         let duration = started.elapsed();
@@ -161,7 +163,7 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                 }
                 None => None,
             };
-            let mut stream = LlmClient::stream_with_tools(&ctx.model, messages, &tools, &ctx.store);
+            let mut stream = LlmClient::stream_dispatch(&ctx.model, messages, &tools, &ctx.store, ctx.stream_override.as_ref());
             let mut failed: Option<String> = None;
             // wall 检查节流（P2-07）：focus_for 读盘，逐 delta 查太贵
             let mut last_wall_check = std::time::Instant::now();
@@ -178,7 +180,7 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                 // goal wall 轮内检查点：长 stream 中途超限即终止，不等轮末记账才发现
                 if last_wall_check.elapsed() >= std::time::Duration::from_millis(500) {
                     last_wall_check = std::time::Instant::now();
-                    if goal_wall_over(ctx) {
+                    if goal_wall_over(ctx, &mut wall_cache) {
                         wall_stop = true;
                         break;
                     }

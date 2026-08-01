@@ -50,7 +50,7 @@ fn cache_file() -> std::path::PathBuf {
 /// 目录读取：内存 -> 磁盘 -> 静态兜底；磁盘过期/缺失时后台刷新（不阻塞调用方）。
 pub fn catalog() -> Vec<ProviderCatalog> {
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(c) = cache.lock().expect("catalog").as_ref() {
+    if let Some(c) = crate::core::shared::lock(&cache).as_ref() {
         return c.clone();
     }
     let disk = std::fs::read_to_string(cache_file()).ok().and_then(|text| serde_json::from_str::<Vec<ProviderCatalog>>(&text).ok());
@@ -61,7 +61,7 @@ pub fn catalog() -> Vec<ProviderCatalog> {
         }
         _ => (static_catalog(), true),
     };
-    *cache.lock().expect("catalog") = Some(out.clone());
+    *crate::core::shared::lock(&cache) = Some(out.clone());
     if stale {
         refresh_async();
     }
@@ -73,7 +73,7 @@ pub fn refresh_async() {
     static REFRESHING: OnceLock<Mutex<bool>> = OnceLock::new();
     let flag = REFRESHING.get_or_init(|| Mutex::new(false));
     {
-        let mut running = flag.lock().expect("refresh");
+        let mut running = crate::core::shared::lock(&flag);
         if *running {
             return;
         }
@@ -81,7 +81,7 @@ pub fn refresh_async() {
     }
     // 纯同步上下文（如同步单测）没有 reactor：tokio::spawn 会 panic，跳过本次后台刷新
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        *flag.lock().expect("refresh") = false;
+        *crate::core::shared::lock(&flag) = false;
         return;
     };
     handle.spawn(async move {
@@ -102,12 +102,12 @@ pub fn refresh_async() {
                     let _ = std::fs::write(cache_file(), json);
                 }
                 let cache = CACHE.get_or_init(|| Mutex::new(None));
-                *cache.lock().expect("catalog") = Some(c);
+                *crate::core::shared::lock(&cache) = Some(c);
                 tracing::info!("models.dev catalog refreshed");
             }
             Err(e) => tracing::warn!(error = %e, "models.dev refresh failed (keep old cache)"),
         }
-        *flag.lock().expect("refresh") = false;
+        *crate::core::shared::lock(&flag) = false;
     });
 }
 

@@ -116,6 +116,63 @@ fn ssrf_blocked_before_driver_call() {
 }
 
 #[test]
+fn inpage_navigation_to_public_url_allowed() {
+    rt().block_on(async {
+        let (slot, fake) = seeded(page_nodes()).await;
+        dispatch(&json!({"action": "navigate", "url": "http://93.184.215.14"}), Some(&slot), None).await.unwrap();
+        // 页内跳转（点击/meta refresh）落到公网地址：事后复检放行，后续动作正常
+        fake.state.lock().unwrap().url = "http://1.1.1.1/landing".into();
+        let snap = dispatch(&json!({"action": "snapshot"}), Some(&slot), None).await.unwrap();
+        assert!(snap.contains("[1] link \"About\""), "{snap}");
+        assert!(!fake.state.lock().unwrap().closed);
+    });
+}
+
+#[test]
+fn inpage_navigation_to_blocked_address_closes_browser() {
+    rt().block_on(async {
+        for bad in ["http://127.0.0.1/admin", "http://169.254.169.254/latest/meta-data", "http://192.168.1.1/"] {
+            let (slot, fake) = seeded(page_nodes()).await;
+            dispatch(&json!({"action": "navigate", "url": "http://93.184.215.14"}), Some(&slot), None).await.unwrap();
+            // 页面自己跳去内网/metadata：下一个动作时落地复检拦截
+            fake.state.lock().unwrap().url = bad.into();
+            let err = dispatch(&json!({"action": "snapshot"}), Some(&slot), None).await.unwrap_err();
+            assert!(err.contains("in-page navigation blocked") && err.contains("browser closed"), "{bad} -> {err}");
+            // 复检窗口内请求可能已发出：driver 被断开，实例随之释放
+            assert!(fake.state.lock().unwrap().closed, "{bad}");
+            let err = dispatch(&json!({"action": "snapshot"}), Some(&slot), None).await.unwrap_err();
+            assert!(err.contains("no page open yet"), "{err}");
+        }
+    });
+}
+
+#[test]
+fn click_landing_on_blocked_address_blocked() {
+    rt().block_on(async {
+        let (slot, fake) = seeded(page_nodes()).await;
+        dispatch(&json!({"action": "navigate", "url": "http://93.184.215.14"}), Some(&slot), None).await.unwrap();
+        dispatch(&json!({"action": "snapshot"}), Some(&slot), None).await.unwrap();
+        // 点击触发跳转，落地内网：点击本身已执行，复检拦截并断开
+        fake.state.lock().unwrap().url = "http://10.0.0.8/internal".into();
+        let err = dispatch(&json!({"action": "click", "ref": 1}), Some(&slot), None).await.unwrap_err();
+        assert!(err.contains("in-page navigation blocked"), "{err}");
+        assert!(fake.state.lock().unwrap().closed);
+    });
+}
+
+#[test]
+fn redirect_landing_on_blocked_address_blocked() {
+    rt().block_on(async {
+        let (slot, fake) = seeded(page_nodes()).await;
+        // 初始 URL 公网合法但 302 落到 metadata：事前守卫管不到，navigate 后复检拦截
+        fake.state.lock().unwrap().nav_land_as = Some("http://169.254.169.254/latest/meta-data".into());
+        let err = dispatch(&json!({"action": "open", "url": "http://93.184.215.14"}), Some(&slot), None).await.unwrap_err();
+        assert!(err.contains("in-page navigation blocked"), "{err}");
+        assert!(fake.state.lock().unwrap().closed);
+    });
+}
+
+#[test]
 fn snapshot_output_capped() {
     rt().block_on(async {
         // 4000 个文本节点 >> 50k 上限

@@ -217,8 +217,8 @@ pub async fn diff_file(repo: &Path, path: &str) -> Result<String, String> {
     if text.trim().is_empty() { Err("no diff (unchanged or not a file)".into()) } else { Ok(text) }
 }
 
-/// .kxen/ 进 .gitignore（幂等）。
-fn ensure_gitignore(repo: &Path) -> Result<(), String> {
+/// .kxen/ 进 .gitignore（幂等）。fs_tool 的覆盖备份也落在 .kxen/ 下，共用此入口。
+pub(crate) fn ensure_gitignore(repo: &Path) -> Result<(), String> {
     let path = repo.join(".gitignore");
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     if content.lines().any(|l| l.trim() == ".kxen/") {

@@ -1,6 +1,5 @@
 //! AppState：全局服务与运行时共享状态（从 main.rs 拆出，350 行门禁收口）。
 
-use kxen_app::llm::ModelRef;
 use std::sync::{Arc, Mutex};
 
 pub struct AppState {
@@ -10,7 +9,6 @@ pub struct AppState {
     pub(crate) ws_port: Mutex<u16>,
     /// ws 握手 token（启动时 /dev/urandom 生成，ws_port command 一并发给前端）
     pub ws_token: String,
-    pub(crate) model: Mutex<ModelRef>,
     pub bus: kxen_app::core::event::EventBus,
     pub registry: std::sync::Arc<kxen_app::tools::task::TaskRegistry>,
     /// 角色路由可热更新（设置页改角色 -> 重建换 Arc）；与 SpawnDeps 共享同一 RwLock 句柄
@@ -53,7 +51,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    #[allow(dead_code)]
     pub(crate) fn new() -> Result<Self, String> {
         let path = kxen_app::core::paths::auth_file();
         // 共享句柄：与 TeamManager SpawnDeps 同一把锁，后台探测写入的凭证两边即时可见；
@@ -66,8 +63,8 @@ impl AppState {
         let registry = std::sync::Arc::new(kxen_app::tools::task::TaskRegistry::new());
         let extras = std::sync::Arc::new(kxen_app::agent::agent_loop::SessionExtrasRegistry::default());
         let mrm = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(kxen_app::llm::mrm::ModelResourceManager::new(config))));
-        let workdir: std::sync::Arc<std::path::Path> =
-            std::sync::Arc::from(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let workdir: std::sync::Arc<std::path::Path> = std::sync::Arc::from(initial_workdir(&cwd, dirs::home_dir()));
         let bus = kxen_app::core::event::EventBus::default();
         let agents = std::sync::Arc::new(kxen_app::agent::activity::AgentRegistry::default());
         let approvals = std::sync::Arc::new(kxen_app::agent::approval::production_broker(bus.clone()));
@@ -96,7 +93,6 @@ impl AppState {
             auth_store: store,
             ws_port: Mutex::new(0),
             ws_token: crate::ws::gen_ws_token(),
-            model: Mutex::new(ModelRef::new("xai", "grok-build-0.1")),
             bus,
             registry,
             extras,
@@ -128,7 +124,6 @@ impl AppState {
     }
 
     /// 会话销毁时清理该 Session 的运行期 extras。
-    #[allow(dead_code)]
     pub fn drop_extras(&self, session_id: &str) {
         self.extras.drop_extras(session_id);
     }
@@ -151,5 +146,59 @@ impl AppState {
         let meta = kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), session_id)
             .map_err(|e| format!("session {session_id}: {e}"))?;
         self.workspace_runtimes.ready(std::path::Path::new(&meta.directory)).await
+    }
+}
+
+/// 初始 workspace 根（纯函数，直接可测）：Finder 启动 .app 时进程 cwd 恒为 `/`，
+/// 以之为 workspace 根会让 path_policy 的 starts_with(workspace) 边界全盘失效。
+/// cwd 为根目录或不可写时回退 home；home 不可得（极端环境）兜底保留 cwd，不引入第三选择。
+fn initial_workdir(cwd: &std::path::Path, home: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    if cwd != std::path::Path::new("/") && dir_writable(cwd) {
+        return cwd.to_path_buf();
+    }
+    home.unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// 权限位只读判定：kxen 不以 root 运行（root 下位判断失真），元数据读取失败按不可写处理。
+fn dir_writable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir() && !m.permissions().readonly()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kxen-workdir-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn initial_workdir_prefers_writable_cwd() {
+        let dir = tmp_dir("ok");
+        let home = std::path::PathBuf::from("/home/fallback");
+        assert_eq!(initial_workdir(&dir, Some(home)), dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn initial_workdir_root_falls_back_to_home() {
+        let home = std::path::PathBuf::from("/home/fallback");
+        assert_eq!(initial_workdir(std::path::Path::new("/"), Some(home.clone())), home);
+        // home 不可得时保留 cwd（与修复前行为一致的最差兜底）
+        assert_eq!(initial_workdir(std::path::Path::new("/"), None), std::path::PathBuf::from("/"));
+    }
+
+    #[test]
+    fn initial_workdir_unwritable_falls_back_to_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("ro");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let home = std::path::PathBuf::from("/home/fallback");
+        assert_eq!(initial_workdir(&dir, Some(home.clone())), home);
+        // 恢复可写才能清理
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

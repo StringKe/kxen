@@ -4,7 +4,7 @@ use block2::RcBlock;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool};
-use objc2_foundation::{NSError, NSLocale, NSString, NSURL};
+use objc2_foundation::{NSError, NSLocale, NSString};
 
 #[link(name = "Speech", kind = "framework")]
 unsafe extern "C" {}
@@ -12,8 +12,19 @@ unsafe extern "C" {}
 #[link(name = "AVFAudio", kind = "framework")]
 unsafe extern "C" {}
 
-fn class(name: &std::ffi::CStr) -> &'static AnyClass {
-    AnyClass::get(name).unwrap_or_else(|| panic!("missing ObjC class {name:?}"))
+fn class(name: &std::ffi::CStr) -> Option<&'static AnyClass> {
+    AnyClass::get(name)
+}
+
+/// 框架探测：Speech/AVFAudio 类缺失（框架被裁的非标准系统）时引擎必须降级报错，
+/// 不能 panic 拖垮进程（fail-fast 语义保留：调用方拿到 Err 即标记引擎 unavailable）。
+pub fn availability() -> Result<(), String> {
+    for c in [c"SFSpeechRecognizer", c"SFSpeechAudioBufferRecognitionRequest", c"AVAudioEngine"] {
+        if class(c).is_none() {
+            return Err(format!("系统缺少 ObjC 类 {c:?}（Speech/AVFAudio 框架不可用）"));
+        }
+    }
+    Ok(())
 }
 
 /// +0（autoreleased）返回的安全持有：显式 retain 后交接所有权。
@@ -51,21 +62,30 @@ impl SpeechAuth {
 
 /// 当前识别授权状态（同步，不触发弹窗）。
 pub fn authorization_status() -> SpeechAuth {
-    let status: isize = unsafe { msg_send![class(c"SFSpeechRecognizer"), authorizationStatus] };
+    // 入口已经 availability() 门禁；这里的兜底只是防御（类缺失按受限处理 = unavailable）
+    let Some(cls) = class(c"SFSpeechRecognizer") else {
+        return SpeechAuth::Restricted;
+    };
+    let status: isize = unsafe { msg_send![cls, authorizationStatus] };
     SpeechAuth::of(status)
 }
 
 /// 请求识别授权（异步回调；未决时系统弹 TCC 窗）。
 pub fn request_authorization(cb: impl Fn(SpeechAuth) + Send + Sync + 'static) {
+    let Some(cls) = class(c"SFSpeechRecognizer") else {
+        cb(SpeechAuth::Restricted);
+        return;
+    };
     let block = RcBlock::new(move |status: isize| cb(SpeechAuth::of(status)));
-    let _: () = unsafe { msg_send![class(c"SFSpeechRecognizer"), requestAuthorization: &*block] };
+    let _: () = unsafe { msg_send![cls, requestAuthorization: &*block] };
 }
 
 /// 创建指定 locale 的识别器（如 zh-CN / en-US）。
 pub fn new_recognizer(locale_id: &str) -> Option<Retained<AnyObject>> {
+    let cls = class(c"SFSpeechRecognizer")?;
     unsafe {
         let locale = NSLocale::localeWithLocaleIdentifier(&NSString::from_str(locale_id));
-        let obj: *mut AnyObject = msg_send![class(c"SFSpeechRecognizer"), alloc];
+        let obj: *mut AnyObject = msg_send![cls, alloc];
         let obj: *mut AnyObject = msg_send![obj, initWithLocale: &*locale];
         Retained::from_raw(obj)
     }
@@ -84,25 +104,13 @@ pub fn supports_on_device(recognizer: &AnyObject) -> bool {
     v.as_bool()
 }
 
-/// 整文件识别请求（开启部分结果回报 + 强制本地识别）。
-pub fn url_request(path: &str) -> Option<Retained<AnyObject>> {
-    unsafe {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
-        let req: *mut AnyObject = msg_send![class(c"SFSpeechURLRecognitionRequest"), alloc];
-        let req: *mut AnyObject = msg_send![req, initWithURL: &*url];
-        let req = Retained::from_raw(req)?;
-        let _: () = msg_send![&*req, setShouldReportPartialResults: Bool::YES];
-        let _: () = msg_send![&*req, setRequiresOnDeviceRecognition: Bool::YES];
-        Some(req)
-    }
-}
-
 pub type ResultHandler = RcBlock<dyn Fn(*mut AnyObject, *mut AnyObject)>;
 
-/// 流式缓冲识别请求（麦克风/文件灌流共用；强制本地识别）。
+/// 流式缓冲识别请求（麦克风灌流专用；强制本地识别）。
 pub fn buffer_request() -> Option<Retained<AnyObject>> {
+    let cls = class(c"SFSpeechAudioBufferRecognitionRequest")?;
     unsafe {
-        let req: *mut AnyObject = msg_send![class(c"SFSpeechAudioBufferRecognitionRequest"), alloc];
+        let req: *mut AnyObject = msg_send![cls, alloc];
         let req: *mut AnyObject = msg_send![req, init];
         let req = Retained::from_raw(req)?;
         let _: () = msg_send![&*req, setShouldReportPartialResults: Bool::YES];
@@ -127,7 +135,10 @@ pub type TapHandler = RcBlock<dyn Fn(*mut AnyObject, *mut AnyObject)>;
 /// 返回 (engine, 采样率)。
 pub fn start_mic_capture(make_handler: impl FnOnce(*mut AnyObject) -> TapHandler) -> Result<(Retained<AnyObject>, f64), String> {
     unsafe {
-        let engine: *mut AnyObject = msg_send![class(c"AVAudioEngine"), alloc];
+        let Some(cls) = class(c"AVAudioEngine") else {
+            return Err("系统缺少 ObjC 类 AVAudioEngine（AVFAudio 框架不可用）".into());
+        };
+        let engine: *mut AnyObject = msg_send![cls, alloc];
         let engine: *mut AnyObject = msg_send![engine, init];
         let engine = Retained::from_raw(engine).ok_or("AVAudioEngine 创建失败")?;
         let input: *mut AnyObject = msg_send![&*engine, inputNode];

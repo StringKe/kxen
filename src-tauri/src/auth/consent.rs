@@ -19,7 +19,7 @@ fn load_from(file: &Path) -> Vec<String> {
 fn approve_into(file: &Path, source: &str) {
     // 读-改-写竞态防护与原子写：与 trust.rs 同因（并发批准互相覆盖 / 半截文件）
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = WRITE_LOCK.lock().expect("consent write lock");
+    let _guard = crate::core::shared::lock(&WRITE_LOCK);
     let mut list = load_from(file);
     if !list.iter().any(|s| s == source) {
         list.push(source.to_string());

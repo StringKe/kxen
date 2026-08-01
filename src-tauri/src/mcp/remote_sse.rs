@@ -152,10 +152,10 @@ impl SseTransport {
     async fn request_inner(&self, method: &str, params: Value, timeout: std::time::Duration) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().expect("mcp pending").insert(id, tx);
+        crate::core::shared::lock(&self.pending).insert(id, tx);
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(e) = self.post(frame).await {
-            self.pending.lock().expect("mcp pending").remove(&id);
+            crate::core::shared::lock(&self.pending).remove(&id);
             return Err(e);
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -222,7 +222,7 @@ async fn read_loop(
                         continue;
                     }
                     if let Some(id) = v.get("id").and_then(|i| i.as_u64())
-                        && let Some(tx) = pending.lock().expect("mcp pending").remove(&id)
+                        && let Some(tx) = crate::core::shared::lock(&pending).remove(&id)
                     {
                         let _ = tx.send(v);
                     }
@@ -231,7 +231,7 @@ async fn read_loop(
         }
     }
     // 流断：挂起请求全部按失败结束（调用方走 lazy restart）
-    pending.lock().expect("mcp pending").clear();
+    crate::core::shared::lock(&pending).clear();
 }
 
 impl Transport for SseTransport {

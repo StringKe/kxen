@@ -187,8 +187,8 @@ impl Config {
         Ok(config)
     }
 
-    /// 五角色默认绑定：只补缺位（用户 config 逐项覆盖）。面向四订阅持有者择型：
-    /// 思考/评审走 claude（评审需独立产出质量），执行走 grok-build（命令调度快），
+    /// 六角色默认绑定：只补缺位（用户 config 逐项覆盖）。面向四订阅持有者择型：
+    /// 思考/评审走 claude（评审需独立产出质量），主会话/执行走 grok-build（命令调度快），
     /// 研究走 grok-4.5（长上下文检索），规划走 kimi-for-coding 的 k3（1M 上下文推理型；
     /// provider key 必须对齐订阅探测导入键，否则探测到的凭证不会被该角色命中）。
     /// 用户没有的订阅由 mrm candidates 跳过（无凭证 provider 不出候选），降级链走到真实持有的订阅。
@@ -199,7 +199,8 @@ impl Config {
             fallback: fallback.map(String::from),
             account: None,
         };
-        let defaults: [(&str, RoleBinding); 5] = [
+        let defaults: [(&str, RoleBinding); 6] = [
+            ("chat", binding("xai", "grok-build-0.1", Some("execution"))),
             ("thinking", binding("anthropic", "claude-opus-4-8", Some("planning"))),
             ("planning", binding("kimi-for-coding", "k3", Some("review"))),
             ("execution", binding("xai", "grok-build-0.1", Some("research"))),
@@ -245,10 +246,15 @@ impl Config {
     }
 }
 
+/// custom provider 路由的端点定义（llm/client.rs 每次 LLM 请求都取，走 mtime 缓存）。
+pub(crate) fn custom_provider_def(name: &str) -> Option<CustomProviderDef> {
+    super::config_cache::cached_user_config()?.custom_providers.get(name).cloned()
+}
+
 /// 内置编码规则开关（缺省开启；config.toml [coding_rules] enabled = false 关闭）。
-/// prompt 组装每次现读：设置页开关下一轮即生效，无需重启。
+/// 设置页写盘即触碰 mtime，开关下一轮即生效，无需重启。
 pub fn coding_rules_enabled() -> bool {
-    Config::load(&crate::core::paths::config_dir().join("config.toml"), None).map(|c| c.coding_rules.enabled).unwrap_or(true)
+    super::config_cache::cached_user_config().map(|c| c.coding_rules.enabled).unwrap_or(true)
 }
 
 /// 实验能力只读取个人配置，项目配置不能替用户扩大数据外发或宿主机能力面。
@@ -280,7 +286,7 @@ mod tests {
     fn default_role_providers_align_with_registry_and_probe() {
         let mut config = Config::default();
         config.seed_default_roles();
-        let expected = ["thinking", "planning", "execution", "review", "research"];
+        let expected = ["chat", "thinking", "planning", "execution", "review", "research"];
         let probe_keys: Vec<&str> = crate::auth::probe::RULES.iter().map(|r| r.provider).collect();
         for role in expected {
             let b = config.roles.get(role).unwrap_or_else(|| panic!("缺角色 {role} 默认绑定"));

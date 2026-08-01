@@ -53,7 +53,7 @@ impl LspClient {
                 for frame in decoder.feed(&chunk[..n]) {
                     let Ok(v) = serde_json::from_str::<Value>(&frame) else { continue };
                     if let Some(id) = v.get("id").and_then(Value::as_u64) {
-                        if let Some(tx) = pending_rx.lock().expect("lsp pending").remove(&id) {
+                        if let Some(tx) = crate::core::shared::lock(&pending_rx).remove(&id) {
                             let _ = tx.send(v);
                         }
                     } else if v.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
@@ -63,7 +63,7 @@ impl LspClient {
                     }
                 }
             }
-            pending_rx.lock().expect("lsp pending").clear();
+            crate::core::shared::lock(&pending_rx).clear();
         });
         let client = Arc::new(Self {
             spec,
@@ -104,7 +104,7 @@ impl LspClient {
         let uri = uri::encode(path);
         // guard 不跨 await：块内定 method/params，落锁后再发
         let (method, params) = {
-            let mut opened = self.opened.lock().expect("lsp opened");
+            let mut opened = crate::core::shared::lock(&self.opened);
             match opened.get_mut(path) {
                 Some(version) => {
                     *version += 1;
@@ -132,7 +132,7 @@ impl LspClient {
 
     /// 已同步到 server 的文档版本（等发布逻辑用；未同步过 -> None）。
     pub fn synced_version(&self, path: &Path) -> Option<u64> {
-        self.opened.lock().expect("lsp opened").get(path).copied()
+        crate::core::shared::lock(&self.opened).get(path).copied()
     }
 
     /// line/character 1-based 入参（协议侧转 0-based）。
@@ -172,7 +172,7 @@ impl LspClient {
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().expect("lsp pending").insert(id, tx);
+        crate::core::shared::lock(&self.pending).insert(id, tx);
         let frame = encode(
             &serde_json::to_string(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
                 .map_err(|e| e.to_string())?,

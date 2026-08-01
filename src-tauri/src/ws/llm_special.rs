@@ -49,7 +49,7 @@ pub(super) async fn handle(
 }
 
 async fn compact_session(state: &Arc<AppState>, sessions_dir: &Path, session_id: &str, delivery_id: Option<&str>) -> AgentEvent {
-    let model = super::session_ops::effective_session_model(Some(session_id), state);
+    let model = super::session_ops::effective_session_model(Some(session_id), state).await;
     let store = state.auth_store.lock().map(|store| store.clone()).unwrap_or_default();
     let notice = match kxen_app::agent::compact::compact_session(sessions_dir, session_id, &model, &store, 4).await {
         Some((before, after)) => format!("上下文已压缩：约 {before} -> {after} tokens"),

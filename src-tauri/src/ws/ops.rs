@@ -24,7 +24,6 @@ const METHODS: &[&str] = &[
     "notifications.list",
     "notifications.clear",
     "voice.engines",
-    "voice.transcribe_file",
     "voice.set_provider_key",
     "voice.set_engine",
     "config.set_send_policy",
@@ -55,7 +54,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
     match method {
         "mrm.stats" => {
             let state = app.state::<Arc<AppState>>();
-            let mrm = state.mrm.read().expect("mrm").clone();
+            let mrm = kxen_app::core::shared::read(&state.mrm).clone();
             Ok(json!({
                 "describe": mrm.describe().await,
                 "history": mrm.history().await,
@@ -65,7 +64,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
         "agent.test_dispatch" => test_dispatch(app, params).await,
         "knowledge.list" => {
             let state = app.state::<Arc<AppState>>();
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             serde_json::to_value(kxen_app::knowledge::list(&dir)).map_err(|e| e.to_string())
         }
         "knowledge.add" => {
@@ -75,7 +74,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let description = params.get("description").and_then(Value::as_str).ok_or("missing description")?;
             let content = params.get("content").and_then(Value::as_str).ok_or("missing content")?;
             let state = app.state::<Arc<AppState>>();
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let path = kxen_app::knowledge::add(scope, &dir, slug, kind, description, content)?;
             Ok(json!({ "path": path }))
         }
@@ -83,7 +82,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let scope = kxen_app::knowledge::Scope::parse(params.get("scope").and_then(Value::as_str).ok_or("missing scope")?)?;
             let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
             let state = app.state::<Arc<AppState>>();
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             kxen_app::knowledge::remove(scope, &dir, slug)?;
             Ok(json!({ "removed": true }))
         }
@@ -92,7 +91,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
             let enabled = params.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
             let state = app.state::<Arc<AppState>>();
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             kxen_app::knowledge::set_enabled(scope, &dir, slug, enabled)?;
             Ok(json!({ "scope": scope.as_str(), "slug": slug, "enabled": enabled }))
         }
@@ -101,7 +100,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
             let to = kxen_app::knowledge::Scope::parse(params.get("to").and_then(Value::as_str).ok_or("missing to")?)?;
             let state = app.state::<Arc<AppState>>();
-            let dir = state.active_workspace.read().expect("workspace").clone();
+            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let path = kxen_app::knowledge::move_entry(scope, &dir, slug, to)?;
             Ok(json!({ "path": path }))
         }
@@ -111,7 +110,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let session_id = params.get("session_id").and_then(Value::as_str);
             let dir = match session_id {
                 Some(sid) => state.runtime_for_session(sid)?.root().to_path_buf(),
-                None => state.active_workspace.read().expect("workspace").clone(),
+                None => kxen_app::core::shared::read(&state.active_workspace).clone(),
             };
             let involved =
                 session_id.and_then(|sid| kxen_app::core::shared::lock(&state.session_involved).get(sid).cloned()).unwrap_or_default();
@@ -125,7 +124,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let total_input: u64 = tokens.values().map(|t| t.0).sum();
             let total_output: u64 = tokens.values().map(|t| t.1).sum();
             let history = {
-                let mrm = state.mrm.read().expect("mrm").clone();
+                let mrm = kxen_app::core::shared::read(&state.mrm).clone();
                 mrm.history().await
             };
             let mut by_model: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -190,17 +189,6 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
                 "locale": config.voice.locale,
                 "engines": kxen_app::voice::engines(&config, &store),
             }))
-        }
-        "voice.transcribe_file" => {
-            let engine = params.get("engine").and_then(Value::as_str);
-            let path = params.get("path").and_then(Value::as_str).ok_or("missing path")?;
-            let locale = params.get("locale").and_then(Value::as_str);
-            let config = load_config()?;
-            let locale = locale.unwrap_or(&config.voice.locale);
-            let state = app.state::<Arc<AppState>>();
-            let store = state.auth_store.lock().map_err(|e| e.to_string())?.clone();
-            let text = kxen_app::voice::transcribe_file(&config, &store, engine, path, locale).await?;
-            Ok(json!({ "text": text }))
         }
         "voice.set_provider_key" => {
             let provider = params.get("provider").and_then(Value::as_str).ok_or("missing provider")?;
@@ -289,7 +277,7 @@ async fn test_dispatch(app: &AppHandle, params: &Value) -> Result<Value, String>
     let role = params.get("role").and_then(Value::as_str).ok_or("missing role")?;
     let state = app.state::<Arc<AppState>>();
     let store = state.auth_store.lock().map_err(|e| e.to_string())?.clone();
-    let mrm = state.mrm.read().expect("mrm").clone();
+    let mrm = kxen_app::core::shared::read(&state.mrm).clone();
     let resolved = mrm.resolve(role, &store).await.ok_or_else(|| format!("no available model for role {role}"))?;
     let degraded = resolved.degraded_from.clone();
     let active = state.active_workspace.read().map_err(|_| "workspace lock poisoned".to_string())?.clone();

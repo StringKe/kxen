@@ -68,7 +68,7 @@ fn record_to(path: &Path, date: &str, provider: &str, input: u64, output: u64) {
 }
 
 pub fn record(provider: &str, input: u64, output: u64) {
-    let _guard = io_lock().lock().expect("usage trend lock");
+    let _guard = crate::core::shared::lock(io_lock());
     record_to(&store_file(), &today_key(), provider, input, output);
 }
 
@@ -77,7 +77,7 @@ fn day_from(path: &Path, date: &str) -> DayUsage {
 }
 
 pub fn today() -> DayUsage {
-    let _guard = io_lock().lock().expect("usage trend lock");
+    let _guard = crate::core::shared::lock(io_lock());
     day_from(&store_file(), &today_key())
 }
 
@@ -89,7 +89,7 @@ fn recent_from(path: &Path, days: usize) -> Vec<(String, DayUsage)> {
 }
 
 pub fn recent(days: usize) -> Vec<(String, DayUsage)> {
-    let _guard = io_lock().lock().expect("usage trend lock");
+    let _guard = crate::core::shared::lock(io_lock());
     recent_from(&store_file(), days)
 }
 

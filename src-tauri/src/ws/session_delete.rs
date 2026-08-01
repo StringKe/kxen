@@ -27,7 +27,7 @@ pub(super) async fn delete(params: &Value, state: &Arc<AppState>) -> Result<Valu
             })
             .filter(|text| !text.is_empty())
             .collect();
-        let model = super::session_ops::effective_session_model(Some(id), state);
+        let model = super::session_ops::effective_session_model(Some(id), state).await;
         let store = state.auth_store.lock().map(|store| store.clone()).unwrap_or_default();
         match kxen_app::knowledge::distill::distill_on_delete(&model, &store, std::path::Path::new(&meta.directory), transcript).await {
             Ok(written) if written > 0 => {

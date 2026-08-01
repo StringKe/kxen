@@ -190,6 +190,16 @@ impl BrowserDriver for ChromeDriver {
         })
     }
 
+    fn current_url<'a>(&'a mut self) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            self.page
+                .url()
+                .await
+                .map_err(|e| format!("failed to read current url: {e}"))?
+                .ok_or_else(|| "current url unavailable".to_string())
+        })
+    }
+
     fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             // 已退出的浏览器 close/kill 会报错，清理语义下吞掉（幂等）；进程兜底是 child 的 kill_on_drop

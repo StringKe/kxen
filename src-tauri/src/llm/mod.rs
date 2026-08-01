@@ -16,5 +16,5 @@ pub mod types;
 pub mod verify;
 pub mod xai;
 
-pub use client::LlmClient;
+pub use client::{LlmClient, StreamFn};
 pub use types::{Delta, Message, ModelRef, Role};

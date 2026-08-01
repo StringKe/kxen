@@ -27,11 +27,11 @@ impl HookRunner {
 
     /// 热重载（workspace 切换时按信任门换入/换出项目 hooks，无需重建 AppState）。
     pub fn reload(&self, config: &Config) {
-        *self.hooks.write().expect("hooks") = compile_hooks(config);
+        *crate::core::shared::write(&self.hooks) = compile_hooks(config);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.read().expect("hooks").values().all(|v| v.is_empty())
+        crate::core::shared::read(&self.hooks).values().all(|v| v.is_empty())
     }
 
     /// pre_tool_use：任一匹配 hook 失败（非零退出 / 被 safety 拦 / 超时）即阻断。

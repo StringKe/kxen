@@ -102,7 +102,7 @@ impl ApprovalBroker {
     pub fn register(&self, session_id: &str, command: &str, reason: &str) -> (String, oneshot::Receiver<bool>) {
         let id = crate::core::ids::new_id("appr");
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("approvals").insert(
+        crate::core::shared::lock(&self.pending).insert(
             id.clone(),
             PendingEntry { tx, session_id: session_id.to_string(), command: command.to_string(), reason: reason.to_string() },
         );
@@ -127,7 +127,7 @@ impl ApprovalBroker {
     /// 用户应答（RPC 通道）：id 存在则送达并返回 true。应答即落盘（allow/deny）——
     /// 发送失败（等待方已随 run 消失）也照落：用户确实做过决定，痕迹按决定记。
     pub fn respond(&self, id: &str, allow: bool) -> bool {
-        let entry = self.pending.lock().expect("approvals").remove(id);
+        let entry = crate::core::shared::lock(&self.pending).remove(id);
         let Some(e) = entry else { return false };
         let delivered = e.tx.send(allow).is_ok();
         self.persist_decision(&e.session_id, &e.command, &e.reason, if allow { "allow" } else { "deny" });
@@ -139,7 +139,7 @@ impl ApprovalBroker {
     /// 每条被清审批落盘 cancel：取消也是决定，历史里要能看到「审批被中断」。
     pub fn cancel_session(&self, session_id: &str) -> usize {
         let entries: Vec<(String, PendingEntry)> = {
-            let mut map = self.pending.lock().expect("approvals");
+            let mut map = crate::core::shared::lock(&self.pending);
             let ids: Vec<String> = map.iter().filter(|(_, e)| e.session_id == session_id).map(|(id, _)| id.clone()).collect();
             ids.into_iter().filter_map(|id| map.remove(&id).map(|e| (id, e))).collect()
         };
@@ -181,7 +181,7 @@ impl ApprovalBroker {
             Ok(Wake::Aborted) => (ApprovalOutcome::Deny, Some("cancelled")),
             Err(_) => (ApprovalOutcome::Timeout, Some("timeout")),
         };
-        let entry = self.pending.lock().expect("approvals").remove(id);
+        let entry = crate::core::shared::lock(&self.pending).remove(id);
         if let Some(entry) = entry {
             let decision = match (outcome, lapsed) {
                 (ApprovalOutcome::Timeout, _) => Some("timeout"),

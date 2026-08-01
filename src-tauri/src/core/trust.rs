@@ -20,7 +20,7 @@ fn load_from(file: &Path) -> Vec<String> {
 fn trust_into(file: &Path, workdir: &Path) {
     // 读-改-写竞态防护：并发 trust 会互相覆盖丢失条目（并行测试抓出来的真 bug）
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = WRITE_LOCK.lock().expect("trust write lock");
+    let _guard = crate::core::shared::lock(&WRITE_LOCK);
     let mut list = load_from(file);
     let w = workdir.to_string_lossy().into_owned();
     if !list.contains(&w) {

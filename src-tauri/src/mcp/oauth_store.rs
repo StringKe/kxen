@@ -97,7 +97,7 @@ impl BearerAuth {
 
     /// Authorization 头值（每请求现取：refresh 后必须生效于下一帧）。
     pub fn header_value(&self) -> String {
-        let t = self.token.lock().expect("oauth token");
+        let t = crate::core::shared::lock(&self.token);
         format!("Bearer {}", t.access_token)
     }
 
@@ -105,7 +105,7 @@ impl BearerAuth {
     /// 调用方据此前提 needs_auth（对齐 Claude Code：refresh 被拒才要求重新认证）。
     pub async fn refresh(&self) -> Result<(), String> {
         let (endpoint, refresh_token, client_id, client_secret) = {
-            let t = self.token.lock().expect("oauth token");
+            let t = crate::core::shared::lock(&self.token);
             (
                 t.token_endpoint.clone(),
                 t.refresh_token.clone().ok_or("oauth 无 refresh_token")?,
@@ -115,7 +115,7 @@ impl BearerAuth {
         };
         let grant = refresh_grant(&self.http, &endpoint, &refresh_token, &client_id, client_secret.as_deref(), self.guard).await?;
         let mut all = load_all(&self.store_path);
-        let mut t = self.token.lock().expect("oauth token");
+        let mut t = crate::core::shared::lock(&self.token);
         t.access_token = grant.access_token;
         // RFC 6749：refresh 应答可不带新 refresh_token，此时旧 token 继续有效
         if let Some(rt) = grant.refresh_token {

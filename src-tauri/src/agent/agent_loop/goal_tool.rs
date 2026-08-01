@@ -9,6 +9,22 @@ pub struct GoalJudge<'a> {
     pub store: &'a crate::auth::credential::AuthStore,
 }
 
+/// 状态串与 GoalUpdate 事件同一收口（GoalStatus::as_str，snake_case）：
+/// 旧 Debug lowercase 产出 "budgetlimited"，前端配色板对不上。
+fn show_goal(g: &crate::core::goal::Goal) -> String {
+    format!(
+        "goal {} [{}] {}\ncriteria: {}\nturns: {} tokens: {} blocks: {}{}",
+        g.id,
+        g.status.as_str(),
+        g.contract.objective,
+        g.contract.completion_criteria,
+        g.turns_used,
+        g.tokens_used,
+        g.consecutive_blocks,
+        g.block_reason.as_deref().map(|r| format!("\nblocked: {r}")).unwrap_or_default()
+    )
+}
+
 pub async fn execute_goal_tool(
     args: &Value,
     session_id: Option<&str>,
@@ -17,23 +33,10 @@ pub async fn execute_goal_tool(
 ) -> Result<String, String> {
     let action = args.get("action").and_then(Value::as_str).ok_or("missing action")?;
     let dir = crate::core::paths::goals_dir();
-    let show = |g: &crate::core::goal::Goal| {
-        format!(
-            "goal {} [{}] {}\ncriteria: {}\nturns: {} tokens: {} blocks: {}{}",
-            g.id,
-            format!("{:?}", g.status).to_lowercase(),
-            g.contract.objective,
-            g.contract.completion_criteria,
-            g.turns_used,
-            g.tokens_used,
-            g.consecutive_blocks,
-            g.block_reason.as_deref().map(|r| format!("\nblocked: {r}")).unwrap_or_default()
-        )
-    };
     match action {
         "list" => {
             let goals = crate::core::goal::Goal::list(&dir);
-            Ok(if goals.is_empty() { "no goals".into() } else { goals.iter().map(&show).collect::<Vec<_>>().join("\n---\n") })
+            Ok(if goals.is_empty() { "no goals".into() } else { goals.iter().map(show_goal).collect::<Vec<_>>().join("\n---\n") })
         }
         "create" => {
             let contract = crate::core::goal::GoalContract {
@@ -55,7 +58,7 @@ pub async fn execute_goal_tool(
             goal.session_id = session_id.map(String::from);
             goal.save(&dir).map_err(|e| e.to_string())?;
             publish(bus, &goal);
-            Ok(show(&goal))
+            Ok(show_goal(&goal))
         }
         other => {
             let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
@@ -97,7 +100,7 @@ pub async fn execute_goal_tool(
             if other != "get" {
                 publish(bus, &goal);
             }
-            Ok(show(&goal))
+            Ok(show_goal(&goal))
         }
     }
 }
@@ -106,5 +109,35 @@ pub async fn execute_goal_tool(
 fn publish(bus: Option<&crate::core::event::EventBus>, goal: &crate::core::goal::Goal) {
     if let Some(bus) = bus {
         bus.publish(crate::core::event::Event::GoalUpdate { id: goal.id.clone(), status: goal.status.as_str() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::goal::{Goal, GoalBudget, GoalContract, GoalStatus};
+
+    /// show 状态串与 GoalUpdate 事件同一口径（snake_case）：goal_rpc.rs 的
+    /// to_json_status_matches_as_str 是另一半回归点，两处必须同时守住。
+    #[test]
+    fn show_renders_status_snake_case() {
+        let mut goal = Goal::create(
+            GoalContract { objective: "o".into(), completion_criteria: "c".into(), constraints: None, budget: GoalBudget::default() },
+            "goal-t1".into(),
+        )
+        .expect("create");
+        for (status, expected) in [
+            (GoalStatus::Draft, "[draft]"),
+            (GoalStatus::Queued, "[queued]"),
+            (GoalStatus::Active, "[active]"),
+            (GoalStatus::Paused, "[paused]"),
+            (GoalStatus::Blocked, "[blocked]"),
+            (GoalStatus::BudgetLimited, "[budget_limited]"),
+            (GoalStatus::Complete, "[complete]"),
+            (GoalStatus::Canceled, "[canceled]"),
+        ] {
+            goal.status = status;
+            assert!(show_goal(&goal).contains(expected), "{status:?} 须渲染为 {expected}: {}", show_goal(&goal));
+        }
     }
 }

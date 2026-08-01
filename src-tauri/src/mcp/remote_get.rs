@@ -104,7 +104,7 @@ impl StreamableHttpTransport {
         }
         // response 帧：按 id 路由给等待方；正常应答走 POST 内联读取，无等待方属异常形态，记日志丢弃
         if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
-            let tx = self.pending.lock().expect("mcp pending").remove(&id);
+            let tx = crate::core::shared::lock(&self.pending).remove(&id);
             match tx {
                 Some(tx) => {
                     let _ = tx.send(v);

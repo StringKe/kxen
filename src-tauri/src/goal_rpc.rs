@@ -1,5 +1,6 @@
-//! goal RPC 方法（goal.{list,create,activate,pause,resume,complete,cancel,get,adjust}）。
+//! goal RPC 方法（goal.{list,focus,create,activate,pause,resume,cancel,adjust}）。
 //! 状态迁移成功后 publish GoalUpdate（Dock goal 面板实时刷新，此前变体只有定义无发布点）。
+//! complete/record_turn 只走 agent loop 内部 Rust 方法直连（goal_tool / usage），不暴露 RPC。
 
 use kxen_app::core::event::Event;
 use kxen_app::core::goal::{Goal, GoalBudget, GoalContract};
@@ -57,26 +58,12 @@ pub fn call(method: &str, params: Value, bus: &kxen_app::core::event::EventBus) 
             publish(bus, &goal);
             Ok(to_json(&goal))
         }
-        "goal.get" => {
-            let goal = load(params.get("id").and_then(Value::as_str).ok_or("missing id")?)?;
-            Ok(to_json(&goal))
-        }
         "goal.activate" => transit(params, bus, |g| g.activate()),
         "goal.pause" => transit(params, bus, |g| g.pause()),
         "goal.resume" => transit(params, bus, |g| g.resume()),
         "goal.cancel" => transit(params, bus, |g| g.cancel()),
         // 预算耗尽后的唯一自助出口：提高预算并 resume（Dock「提高预算并继续」按钮）
         "goal.adjust" => transit(params, bus, |g| g.adjust_budget_and_resume()),
-        "goal.complete" => {
-            let evidence = params.get("evidence").and_then(Value::as_str).ok_or("missing evidence")?.to_string();
-            transit(params, bus, |g| g.complete(&evidence))
-        }
-        "goal.record_turn" => {
-            let tokens = params.get("tokens").and_then(Value::as_u64).unwrap_or(0);
-            let reason = params.get("blocked_reason").and_then(Value::as_str).map(String::from);
-            let terminal = params.get("terminal").and_then(Value::as_bool).unwrap_or(false);
-            transit(params, bus, |g| g.record_turn(tokens, reason.as_deref(), terminal))
-        }
         other => Err(format!("unknown goal method: {other}")),
     }
 }

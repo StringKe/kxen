@@ -20,6 +20,8 @@ pub struct FakeState {
     pub fail_navigate: Option<String>,
     /// 预设 evaluate 返回（输出 cap 测试用；None 时返回 "null"）
     pub eval_result: Option<String>,
+    /// 预设 navigate 落地 URL（模拟 302 落别处：输入 URL 过事前守卫、落地地址进事后复检）
+    pub nav_land_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -46,8 +48,9 @@ impl BrowserDriver for FakeDriver {
                 return Err(e.clone());
             }
             s.navigated.push(url.to_string());
-            s.url = url.to_string();
-            Ok(NavOutcome { url: url.to_string(), title: s.title.clone() })
+            let landed = s.nav_land_as.clone().unwrap_or_else(|| url.to_string());
+            s.url = landed.clone();
+            Ok(NavOutcome { url: landed, title: s.title.clone() })
         })
     }
 
@@ -90,6 +93,10 @@ impl BrowserDriver for FakeDriver {
             s.backs += 1;
             Ok(NavOutcome { url: s.url.clone(), title: s.title.clone() })
         })
+    }
+
+    fn current_url<'a>(&'a mut self) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move { Ok(self.lock().url.clone()) })
     }
 
     fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), String>> {

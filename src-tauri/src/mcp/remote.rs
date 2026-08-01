@@ -93,7 +93,7 @@ impl StreamableHttpTransport {
         if let Some(auth) = &self.auth {
             req = req.header(reqwest::header::AUTHORIZATION, auth.header_value());
         }
-        if let Some(s) = self.session.lock().expect("mcp session").clone() {
+        if let Some(s) = crate::core::shared::lock(&self.session).clone() {
             req = req.header("mcp-session-id", s);
         }
         req
@@ -108,7 +108,7 @@ impl StreamableHttpTransport {
             .await
             .map_err(|e| PostReject::Other(format!("mcp http post {}: {e}", self.url)))?;
         if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-            *self.session.lock().expect("mcp session") = Some(sid.to_string());
+            *crate::core::shared::lock(&self.session) = Some(sid.to_string());
             // 规范里 session 由 initialize 响应下发：首个 session 到手即具备开 GET 流的前提
             self.ensure_get_stream();
         }
@@ -182,7 +182,7 @@ impl StreamableHttpTransport {
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         // 挂上路由表：response 若经 GET 流推回（规范允许 server 用 standalone 流应答），可投递到本等待方
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().expect("mcp pending").insert(id, tx);
+        crate::core::shared::lock(&self.pending).insert(id, tx);
         let start = std::time::Instant::now();
         let outcome = self.post(frame, timeout).await;
         let result = match outcome {
@@ -218,7 +218,7 @@ impl StreamableHttpTransport {
                 }
             }
         };
-        self.pending.lock().expect("mcp pending").remove(&id);
+        crate::core::shared::lock(&self.pending).remove(&id);
         result
     }
 
@@ -229,11 +229,11 @@ impl StreamableHttpTransport {
 
     async fn close_inner(&self) {
         // 先停 GET 流：session DELETE 之后它的重连只会吃 404，白绕一轮退避
-        if let Some(task) = self.get_task.lock().expect("mcp get task").take() {
+        if let Some(task) = crate::core::shared::lock(&self.get_task).take() {
             task.abort();
         }
         // 按规范：client 不再需要会话时发 DELETE；无会话或失败都静默（shutdown 路径不可失败）
-        let Some(session) = self.session.lock().expect("mcp session").take() else {
+        let Some(session) = crate::core::shared::lock(&self.session).take() else {
             return;
         };
         let req = self.client.delete(&self.url).header("mcp-session-id", session);
@@ -243,7 +243,7 @@ impl StreamableHttpTransport {
 
     /// 首个 session 到手即拉起 standalone GET 流（每 transport 只起一次；remote_get.rs 实现）。
     fn ensure_get_stream(&self) {
-        let mut slot = self.get_task.lock().expect("mcp get task");
+        let mut slot = crate::core::shared::lock(&self.get_task);
         if slot.is_none() {
             *slot = Some(super::remote_get::spawn(self.self_weak.clone()));
         }
@@ -251,7 +251,7 @@ impl StreamableHttpTransport {
 
     /// GET 流任务在跑（连着或退避中）：request_inner 据此决定要不要等 GET 流推回应答。
     fn get_stream_alive(&self) -> bool {
-        self.get_task.lock().expect("mcp get task").as_ref().is_some_and(|t| !t.is_finished())
+        crate::core::shared::lock(&self.get_task).as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 

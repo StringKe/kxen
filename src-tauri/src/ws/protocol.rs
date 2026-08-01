@@ -87,17 +87,41 @@ impl StreamChunk {
 }
 
 /// 错误码（2.0 标准 + kxen 扩展段；规范表面，未全用属正常）。
-#[allow(dead_code)]
 pub const PARSE_ERROR: i64 = -32700;
 #[allow(dead_code)]
 pub const INVALID_REQUEST: i64 = -32600;
-#[allow(dead_code)]
 pub const METHOD_NOT_FOUND: i64 = -32601;
 #[allow(dead_code)]
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 #[allow(dead_code)]
 pub const STREAM_NOT_FOUND: i64 = -32801;
+
+/// RPC 调用失败：携带 JSON-RPC 错误码。unknown method 必须回 METHOD_NOT_FOUND（-32601），
+/// 此前与内部错误同回 INTERNAL_ERROR（-32603），客户端无法区分「方法不存在」与「调用炸了」。
+pub struct CallError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl CallError {
+    pub fn method_not_found(method: &str) -> Self {
+        Self { code: METHOD_NOT_FOUND, message: format!("unknown method: {method}") }
+    }
+}
+
+/// 各 handler 的 String/&str 错误一律按内部错误处理。
+impl From<String> for CallError {
+    fn from(message: String) -> Self {
+        Self { code: INTERNAL_ERROR, message }
+    }
+}
+
+impl From<&str> for CallError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
 
 /// 系统方法名（rpc. 前缀保留）。
 pub const M_SUBSCRIBE: &str = "rpc.subscribe";
@@ -136,6 +160,18 @@ mod tests {
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["error"]["code"], METHOD_NOT_FOUND);
         assert!(v.get("result").is_none());
+    }
+
+    #[test]
+    fn call_error_codes() {
+        let not_found = CallError::method_not_found("nope");
+        assert_eq!(not_found.code, METHOD_NOT_FOUND);
+        assert_eq!(not_found.code, -32601);
+        assert!(not_found.message.contains("nope"));
+
+        let internal = CallError::from("boom".to_string());
+        assert_eq!(internal.code, INTERNAL_ERROR);
+        assert_eq!(CallError::from("boom").code, INTERNAL_ERROR);
     }
 
     #[test]

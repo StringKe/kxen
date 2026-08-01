@@ -38,6 +38,8 @@ pub trait BrowserDriver: Send {
     /// 当前视口 PNG 截图字节。
     fn screenshot<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<u8>, String>>;
     fn back<'a>(&'a mut self) -> BoxFuture<'a, Result<NavOutcome, String>>;
+    /// 当前页面 URL（页内跳转守卫在每个动作后复检落地地址，见 mod.rs）。
+    fn current_url<'a>(&'a mut self) -> BoxFuture<'a, Result<String, String>>;
     /// 释放浏览器进程；重复调用必须幂等。
     fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), String>>;
 }

@@ -102,7 +102,7 @@ pub fn should_auth_retry(err: &str, produced: bool, already_refreshed: bool) -> 
 /// RECENT 中另有 fresh 凭证则采用（跨 clone 去重）：采用成功返回 true。
 /// must_differ_from：与刚失败的 access 同源时拒绝采用（采用等于没换，重试只会再 401）。
 fn adopt_recent(store: &mut AuthStore, key: &str, must_differ_from: Option<&str>) -> bool {
-    let Some(fresh) = recent().lock().expect("recent").get(key).cloned() else { return false };
+    let Some(fresh) = crate::core::shared::lock(recent()).get(key).cloned() else { return false };
     if fresh.is_expired_within(BUFFER_MS) {
         return false;
     }
@@ -139,7 +139,7 @@ fn apply_refresh(store: &mut AuthStore, key: &str, parsed: RefreshResponse, old_
         expires: now_ms() + parsed.expires_in.unwrap_or(28_800) * 1000,
         account_id: acc_id.clone(),
     };
-    recent().lock().expect("recent").insert(key.to_string(), new_cred.clone());
+    crate::core::shared::lock(recent()).insert(key.to_string(), new_cred.clone());
     store.insert(key.to_string(), new_cred.clone());
     // 回写登记的共享 store：本 run 外的克隆点（父 run 下一 run / teammate 下一轮 / 下次 dispatch）即时拿到新凭证
     crate::auth::shared_store::propagate(key, &new_cred);

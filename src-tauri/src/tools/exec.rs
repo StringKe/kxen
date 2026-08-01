@@ -300,7 +300,7 @@ pub async fn spawn_task(
     tokio::spawn(async move {
         let status = child.wait().await;
         let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-        *exit_code.lock().expect("exit") = Some(code);
+        *lock(&exit_code) = Some(code);
     });
 
     Ok(())

@@ -53,7 +53,7 @@ pub async fn system_health(state: &Arc<AppState>) -> Result<SystemHealth, String
         (root, entries)
     };
     let (mrm_describe, mrm_dispatches) = {
-        let mrm = state.mrm.read().expect("mrm").clone();
+        let mrm = kxen_app::core::shared::read(&state.mrm).clone();
         (mrm.describe().await, mrm.history().await.len())
     };
     let (bus_capacity, bus_receivers) = state.bus.stats();

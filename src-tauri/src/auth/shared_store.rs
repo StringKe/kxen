@@ -14,15 +14,15 @@ fn shared() -> &'static Mutex<Vec<Weak<Mutex<AuthStore>>>> {
 
 /// 登记共享 store（进程启动时一次；Weak 持有，句柄销毁后自动失效不泄漏）。
 pub fn register_shared_store(store: &Arc<Mutex<AuthStore>>) {
-    shared().lock().expect("shared_store").push(Arc::downgrade(store));
+    crate::core::shared::lock(shared()).push(Arc::downgrade(store));
 }
 
 /// 刷新产物回写全部存活共享 store（只 insert 刷新过的 key，其余键不动）。
 pub fn propagate(key: &str, cred: &CredentialKind) {
-    let mut stores = shared().lock().expect("shared_store");
+    let mut stores = crate::core::shared::lock(shared());
     stores.retain(|w| w.strong_count() > 0);
     for store in stores.iter().filter_map(Weak::upgrade) {
-        store.lock().expect("auth_store").insert(key.to_string(), cred.clone());
+        crate::core::shared::lock(&store).insert(key.to_string(), cred.clone());
     }
 }
 

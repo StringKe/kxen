@@ -10,7 +10,7 @@ const USER_AGENT: &str = "claude-cli/1.0.0";
 const OAUTH_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 const IDENTITY_LINE: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// 内置工具名 allow-list 重映射（Claude OAuth 契约）。
+/// 内置工具名 allow-list 重映射（Claude OAuth 契约）。kxen 名以 tools_spec/tools_deferred 为准。
 pub fn remap_tool_name(name: &str) -> &str {
     match name {
         "exec" => "Bash",
@@ -19,9 +19,9 @@ pub fn remap_tool_name(name: &str) -> &str {
         "edit" => "Edit",
         "glob" => "Glob",
         "grep" => "Grep",
-        "subagent" => "Agent",
+        "agent" => "Agent",
         "schedule" => "ScheduleWakeup",
-        "skill_manage" => "Skill",
+        "skill" => "Skill",
         other => other,
     }
 }
@@ -35,9 +35,9 @@ pub(super) fn unmap_tool_name(name: &str) -> String {
         "Edit" => "edit",
         "Glob" => "glob",
         "Grep" => "grep",
-        "Agent" => "subagent",
+        "Agent" => "agent",
         "ScheduleWakeup" => "schedule",
-        "Skill" => "skill_manage",
+        "Skill" => "skill",
         other => other,
     }
     .to_string()
@@ -333,3 +333,6 @@ mod tests {
 
 #[cfg(test)]
 mod wire_tests;
+
+#[cfg(test)]
+mod remap_tests;

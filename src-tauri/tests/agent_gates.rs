@@ -32,6 +32,7 @@ fn test_ctx() -> AgentContext {
         lsp: None,
         notify: None,
         on_event: Arc::new(|_| {}),
+        stream_override: None,
     }
 }
 

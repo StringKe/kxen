@@ -22,21 +22,6 @@ pub fn engines(config: &crate::core::config::Config, store: &crate::auth::creden
     out
 }
 
-/// 文件识别统一入口（E2E 与排障共用）：按引擎 id 分发，空 id 走默认链。
-pub async fn transcribe_file(
-    config: &crate::core::config::Config,
-    store: &crate::auth::credential::AuthStore,
-    engine: Option<&str>,
-    path: &str,
-    locale: &str,
-) -> Result<String, String> {
-    let id = engine.unwrap_or(&config.voice.engine);
-    match id {
-        "apple" => apple::recognize_file(path, locale),
-        other => provider::transcribe_file(config, store, other, path).await,
-    }
-}
-
 // ---------------- 活跃 PTT 会话（按 chat session 键控，多会话并发 PTT 互不打断） ----------------
 
 // ObjC 对象句柄跨线程存放（Speech/AVAudio 回调均走框架队列，stop 路径单线程）

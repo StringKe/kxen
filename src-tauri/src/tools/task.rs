@@ -64,7 +64,7 @@ pub struct TaskRegistry {
 
 impl TaskHandle {
     pub fn status(&self) -> TaskStatus {
-        match *self.exit_code.lock().expect("exit") {
+        match *lock(&self.exit_code) {
             // 失连标 Failed 优先于 killed：健康检查失连后补的 kill 会同时置上两个标记
             Some(_) if self.health_failed.load(Ordering::Relaxed) => TaskStatus::Failed,
             // kill 的退出码（-1/143）与自身失败同形，须靠 killed 标记区分
@@ -99,7 +99,7 @@ impl TaskRegistry {
                 status: t.status(),
                 uptime_ms: now.saturating_sub(t.started_at),
                 port: *lock(&t.port),
-                tail: tail_of(&t.output.lock().expect("output"), 400),
+                tail: tail_of(&lock(&t.output), 400),
             })
             .collect()
     }
@@ -120,7 +120,7 @@ impl TaskRegistry {
         let kill_quiet = |args: [&str; 2]| {
             std::process::Command::new("kill").args(args).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
         };
-        if task.exit_code.lock().expect("exit").is_none() {
+        if lock(&task.exit_code).is_none() {
             task.killed.store(true, Ordering::Relaxed);
             if let Some(pid) = task.pid {
                 let pid = pid.to_string();
@@ -131,7 +131,7 @@ impl TaskRegistry {
                     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                 }
                 // SIGKILL 前复查：宽限内已退出的进程（探测不到或 exit_code 已写）跳过补刀
-                if alive() && task.exit_code.lock().expect("exit").is_none() {
+                if alive() && lock(&task.exit_code).is_none() {
                     let _ = kill_quiet(["-KILL", &format!("-{pid}")]);
                 }
             }
@@ -152,13 +152,13 @@ pub fn tail_of(output: &str, max: usize) -> String {
 }
 
 pub fn append_capped(output: &Arc<Mutex<String>>, truncated: &Arc<Mutex<bool>>, chunk: &str, cap: usize) {
-    let mut out = output.lock().expect("output");
+    let mut out = lock(&output);
     out.push_str(chunk);
     if out.len() > cap {
         let cut = out.floor_char_boundary(out.len() - cap / 2);
         // drain 原地截头：每个输出块都过这里，to_string 重分配是白拷一份
         out.drain(..cut);
-        *truncated.lock().expect("truncated") = true;
+        *lock(&truncated) = true;
     }
 }
 

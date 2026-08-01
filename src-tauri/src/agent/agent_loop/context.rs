@@ -86,4 +86,7 @@ pub struct AgentContext {
     /// 后台 agent 完成通知路由（仅主会话 ctx 开；子代理不再嵌套派发，None）。
     pub notify: Option<Arc<crate::agent::background::NotifyRouter>>,
     pub on_event: Arc<dyn Fn(AgentEvent) + Send + Sync>,
+    /// 测试注入缝：替换 LLM 流式调用（None = LlmClient::stream_with_tools 静态分发）。
+    /// 生产路径不设置；单测注入假流以直接覆盖 run 的重试/终态/预算分支。
+    pub stream_override: Option<crate::llm::StreamFn>,
 }

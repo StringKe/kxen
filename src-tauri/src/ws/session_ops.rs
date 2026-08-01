@@ -150,15 +150,35 @@ pub(super) fn session_rewind(params: &Value, state: &crate::AppState) -> Result<
     Ok(json!({ "commit": hash, "truncated_to": idx + 1 }))
 }
 
-/// ws 内共用的生效模型解析：session 覆盖 > 全局默认（AppState.model）。
-pub(super) fn effective_session_model(session_id: Option<&str>, state: &crate::AppState) -> kxen_app::llm::ModelRef {
-    let default = state.model.lock().map(|m| m.clone()).unwrap_or_default();
+/// ws 内共用的生效模型解析：session 覆盖 > MRM "chat" 角色 > 硬编码兜底。
+pub(crate) async fn effective_session_model(session_id: Option<&str>, state: &crate::AppState) -> kxen_app::llm::ModelRef {
     let session_override =
         session_id.and_then(|id| kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), id).ok()).and_then(|m| m.model);
+    let default = chat_default_model(state).await;
     kxen_app::core::session::effective_model(session_override.as_ref(), &default).clone()
 }
 
-/// session.set_model RPC：写会话级模型覆盖（落盘 meta JSON；全局默认仍走 set_model / config.set_role）。
+/// 主会话全局默认模型：设置页「设为主会话模型」写 roles.chat（config.set_role），
+/// 经 MRM peek 解析（含凭证可用性与降级链；peek 不记派发历史，轮询路径不污染 mrm.stats）。
+pub(crate) async fn chat_default_model(state: &crate::AppState) -> kxen_app::llm::ModelRef {
+    let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
+    let mrm = kxen_app::core::shared::read(&state.mrm).clone();
+    chat_model_or_fallback(mrm.peek("chat", &store).await)
+}
+
+/// resolve 命中即用（含钉选账号）；None = 无任何可用凭证，回退硬编码默认，行为不劣化于路由修复前。
+fn chat_model_or_fallback(resolved: Option<kxen_app::llm::mrm::Resolved>) -> kxen_app::llm::ModelRef {
+    match resolved {
+        Some(r) => {
+            let mut m = kxen_app::llm::ModelRef::new(r.provider, r.model);
+            m.account = r.account;
+            m
+        }
+        None => kxen_app::llm::ModelRef::new("xai", "grok-build-0.1"),
+    }
+}
+
+/// session.set_model RPC：写会话级模型覆盖（落盘 meta JSON；全局默认走 config.set_role 的 roles.chat）。
 /// provider/model 同缺 = 清除覆盖（跟随全局默认）；只给一个属调用方错误。
 pub(super) fn session_set_model(params: &Value) -> Result<Value, String> {
     let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
@@ -257,5 +277,21 @@ mod tests {
         // 只给一个 = 调用方错误
         assert!(parse_model_override(&json!({ "provider": "xai" })).is_err());
         assert!(parse_model_override(&json!({ "model": "grok" })).is_err());
+    }
+
+    #[test]
+    fn chat_model_or_fallback_arms() {
+        // resolve 命中：provider/model/account 全保留
+        let resolved = kxen_app::llm::mrm::Resolved {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            account: Some("work".into()),
+            degraded_from: None,
+        };
+        let m = chat_model_or_fallback(Some(resolved));
+        assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("anthropic", "claude-sonnet-4-6", Some("work")));
+        // 无可用凭证：回退修复前硬编码默认（行为不劣化）
+        let m = chat_model_or_fallback(None);
+        assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("xai", "grok-build-0.1", None));
     }
 }

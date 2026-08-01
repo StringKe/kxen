@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-pub(super) fn statusline_report(session_id: &str, state: &Arc<AppState>) -> Value {
+pub(super) async fn statusline_report(session_id: &str, state: &Arc<AppState>) -> Value {
     let items = kxen_app::core::shared::lock(&state.statusline_items).clone();
     let workdir = if session_id.is_empty() {
-        state.active_workspace.read().expect("workspace").clone()
+        kxen_app::core::shared::read(&state.active_workspace).clone()
     } else {
         kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), session_id)
             .map(|meta| std::path::PathBuf::from(meta.directory))
-            .unwrap_or_else(|_| state.active_workspace.read().expect("workspace").clone())
+            .unwrap_or_else(|_| kxen_app::core::shared::read(&state.active_workspace).clone())
     };
 
     // git 分支（5s 缓存）
@@ -44,7 +44,7 @@ pub(super) fn statusline_report(session_id: &str, state: &Arc<AppState>) -> Valu
     let tasks_running = state.registry.list().iter().filter(|t| matches!(t.status, kxen_app::tools::task::TaskStatus::Running)).count();
     let tokens = kxen_app::core::shared::lock(&state.session_tokens).get(session_id).copied().unwrap_or((0, 0));
     let last_input = kxen_app::core::shared::lock(&state.session_last_input).get(session_id).copied().unwrap_or(0);
-    let model = super::session_ops::effective_session_model(if session_id.is_empty() { None } else { Some(session_id) }, state);
+    let model = super::session_ops::effective_session_model(if session_id.is_empty() { None } else { Some(session_id) }, state).await;
     // ctx 占用近似：最近一次 run 的 input / 模型上下文窗（catalog 实测值，非 200k 硬编码）
     let window = kxen_app::agent::compact::context_window(&model) as f64;
     let ctx_pct = ((last_input as f64 / window) * 100.0).min(100.0) as u32;
@@ -85,9 +85,10 @@ pub(super) fn set_role(
     std::fs::write(&tmp, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
 
-    // 重建 MRM 热换
+    // 重建 MRM 热换：沿用旧实例共享状态，在飞槽位/熔断/RPM 不复位
     let config = kxen_app::core::config::Config::load(&path, None).map_err(|e| e.to_string())?;
-    *state.mrm.write().expect("mrm lock") = std::sync::Arc::new(kxen_app::llm::mrm::ModelResourceManager::new(config));
+    let mut guard = kxen_app::core::shared::write(&state.mrm);
+    *guard = std::sync::Arc::new(guard.reconfigured(config));
     Ok(json!({ "role": role, "provider": provider, "model": model }))
 }
 
@@ -215,7 +216,8 @@ pub(super) fn set_limits(params: &Value, state: &Arc<AppState>) -> Result<Value,
     std::fs::write(&tmp, toml::to_string(&doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     let config = kxen_app::core::config::Config::load(&path, None).map_err(|e| e.to_string())?;
-    *state.mrm.write().expect("mrm lock") = std::sync::Arc::new(kxen_app::llm::mrm::ModelResourceManager::new(config));
+    let mut guard = kxen_app::core::shared::write(&state.mrm);
+    *guard = std::sync::Arc::new(guard.reconfigured(config));
     Ok(json!({ "saved": true }))
 }
 

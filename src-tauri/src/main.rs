@@ -65,7 +65,7 @@ pub fn run() {
                         Ok(port) => {
                             tracing::info!(port, "ws server listening");
                             if let Some(state) = handle.try_state::<Arc<AppState>>() {
-                                *state.ws_port.lock().expect("ws_port") = port;
+                                *kxen_app::core::shared::lock(&state.ws_port) = port;
                             }
                         }
                         Err(e) => tracing::error!(error = %e, "ws server failed"),
@@ -88,13 +88,11 @@ pub fn run() {
                             RecvVerdict::Stop => break,
                         };
                         // 非前台会话的 run 完成：OS 桌面通知（前台会话用户在看，不打扰）
-                        if let kxen_app::core::event::Event::LlmDelta(payload) = &event
-                            && payload.get("kind").and_then(|k| k.as_str()) == Some("done")
-                        {
-                            let sid = payload.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
+                        if let kxen_app::core::event::Event::LlmDelta(payload) = &event {
                             let state = handle.state::<Arc<AppState>>();
-                            let fg = state.foreground_session.read().expect("foreground").clone();
-                            if !sid.is_empty() && sid != fg {
+                            let fg = kxen_app::core::shared::read(&state.foreground_session).clone();
+                            if os_notify::should_notify_done(payload, &fg) {
+                                let sid = payload.get("session_id").and_then(|s| s.as_str()).unwrap_or("");
                                 let title = kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), sid)
                                     .map(|m| m.title)
                                     .unwrap_or_else(|_| sid.to_string());
@@ -105,7 +103,7 @@ pub fn run() {
                         if let kxen_app::core::event::Event::Notification { text, session_id } = event {
                             // notification hook（全部 Notification 事件的单一收口点；Ask 档走审批）
                             let state = handle.state::<Arc<AppState>>();
-                            let active = state.active_workspace.read().expect("workspace").clone();
+                            let active = kxen_app::core::shared::read(&state.active_workspace).clone();
                             let runtime = notification_workdir(&kxen_app::core::paths::sessions_dir(), &active, session_id.as_deref())
                                 .and_then(|workdir| state.workspace_runtimes.runtime(&workdir));
                             // broker/bus 克隆进任务（借用无法跨 spawn 的 'static 边界）
@@ -133,7 +131,7 @@ pub fn run() {
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
                             let state = handle.state::<Arc<AppState>>();
-                            let mut buf = state.notifications.lock().expect("notifications");
+                            let mut buf = kxen_app::core::shared::lock(&state.notifications);
                             kxen_app::core::notifications::push(&mut buf, now, text, session_id);
                             kxen_app::core::notifications::persist(&buf);
                         }
@@ -149,7 +147,7 @@ pub fn run() {
                         // 后台记忆 consolidation：120 tick（30min）一轮，best-effort
                         if ticks.is_multiple_of(120) && kxen_app::core::config::experimental_config().automatic_knowledge_distillation {
                             let state = handle.state::<Arc<AppState>>();
-                            let model = state.model.lock().map(|m| m.clone()).unwrap_or_default();
+                            let model = ws::session_ops::chat_default_model(&state).await;
                             let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
                             let written = kxen_app::knowledge::consolidate::run_once(&model, &store).await;
                             if written > 0 {
@@ -197,7 +195,7 @@ pub fn run() {
                     let handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
                         let state = handle.state::<Arc<AppState>>();
-                        let workdir = state.active_workspace.read().expect("workspace").clone();
+                        let workdir = kxen_app::core::shared::read(&state.active_workspace).clone();
                         if let Err(e) = state.workspace_runtimes.ready(&workdir).await {
                             tracing::warn!(error = %e, "initial workspace runtime failed");
                         }
@@ -221,7 +219,7 @@ pub fn run() {
                             tracing::info!(provider, ?outcome, "credential probe");
                         }
                         if let Some(state) = handle.try_state::<Arc<AppState>>() {
-                            let mut current = state.auth_store.lock().expect("auth_store");
+                            let mut current = kxen_app::core::shared::lock(&state.auth_store);
                             kxen_app::auth::probe::merge_probe_delta(&baseline, &store, &mut current);
                             if let Err(e) = kxen_app::auth::credential::write_auth_file(&kxen_app::core::paths::auth_file(), &current) {
                                 tracing::error!(error = %e, "credential probe persistence failed");
@@ -258,7 +256,7 @@ fn notification_workdir(
 /// 前端拿 ws 端口 + 握手 token（替代 window.eval 注入：页面重载后注入丢失的竞态根治）。
 #[tauri::command]
 fn ws_port(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
-    let port = *state.ws_port.lock().expect("ws_port");
+    let port = *kxen_app::core::shared::lock(&state.ws_port);
     serde_json::json!({ "port": port, "token": state.ws_token })
 }
 

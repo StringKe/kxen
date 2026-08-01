@@ -149,20 +149,20 @@ pub async fn run_script(
                 let journal = journal.clone();
                 let stats = stats_agent.clone();
                 async move {
-                    if let Some(cached) = journal.lock().expect("journal").as_ref().and_then(|j| j.cached(&role, &prompt).cloned()) {
-                        *stats.lock().expect("stats").ok_by_role.entry(role).or_insert(0) += 1;
+                    if let Some(cached) = crate::core::shared::lock(&journal).as_ref().and_then(|j| j.cached(&role, &prompt).cloned()) {
+                        *crate::core::shared::lock(&stats).ok_by_role.entry(role).or_insert(0) += 1;
                         return Ok(cached);
                     }
                     let n = counter.fetch_add(1, Ordering::Relaxed);
                     if n >= MAX_AGENTS_PER_WORKFLOW {
                         let msg = format!("workflow agent budget exhausted ({MAX_AGENTS_PER_WORKFLOW})");
-                        stats.lock().expect("stats").failures.push((label.unwrap_or(role), msg.clone()));
+                        crate::core::shared::lock(&stats).failures.push((label.unwrap_or(role), msg.clone()));
                         return Err(workflow_err(msg));
                     }
                     match dispatch(&role, prompt.clone(), &deps, crate::agent::activity::AgentKind::Workflow).await {
                         Ok((_name, degraded, result)) => {
-                            *stats.lock().expect("stats").ok_by_role.entry(role.clone()).or_insert(0) += 1;
-                            if let Some(j) = journal.lock().expect("journal").as_mut() {
+                            *crate::core::shared::lock(&stats).ok_by_role.entry(role.clone()).or_insert(0) += 1;
+                            if let Some(j) = crate::core::shared::lock(&journal).as_mut() {
                                 j.record(&role, &prompt, &result);
                             }
                             // 降级标注回给脚本：编排逻辑可感知换型（journal 缓存只存正文，标注不进缓存键）
@@ -174,7 +174,7 @@ pub async fn run_script(
                         Err(e) => {
                             // error 截断 120 字符：信封是单行摘要，完整错误在 agent 自身结果里
                             let short: String = e.chars().take(120).collect();
-                            stats.lock().expect("stats").failures.push((label.unwrap_or_else(|| role.clone()), short));
+                            crate::core::shared::lock(&stats).failures.push((label.unwrap_or_else(|| role.clone()), short));
                             Err(workflow_err(e))
                         }
                     }
@@ -222,7 +222,7 @@ pub async fn run_script(
 
             let wf_name = meta.as_ref().and_then(|m| m.get("name")).and_then(|n| n.as_str()).unwrap_or("workflow");
             let phases_total = meta.as_ref().and_then(|m| m.get("phases")).and_then(|p| p.as_array()).map(|a| a.len() as u32);
-            let stats = stats.lock().expect("stats");
+            let stats = crate::core::shared::lock(&stats);
             let mut text = text;
             text.push_str(&js::envelope(
                 wf_name,

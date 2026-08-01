@@ -1,7 +1,7 @@
 //! browser 工具：CDP 驱动系统 Chrome headless（deferred 工具，经 tool_search 挂载）。
 //! per-session 懒启动单实例（SessionExtras 键控）；同 session 复用同一页面，导航累加历史。
-//! 已知边界：SSRF 守卫只钉初始 URL（net_guard 与 webfetch 同口径），页内跳转/资源加载不经守卫——
-//! 逐跳拦截需要 CDP request interception，超出 v1 范围。
+//! SSRF 守卫：初始 URL 事前过 net_guard；页内跳转（点击/回退/JS/meta refresh）在每个动作后
+//! 复检落地 URL，命中拒绝段即断开浏览器并报错（事前拦截不可行的取舍见 dispatch 尾部注释）。
 
 pub mod ax;
 pub mod chrome;
@@ -71,7 +71,7 @@ pub async fn dispatch(args: &Value, slot: Option<&BrowserSlot>, session_id: Opti
     let slot = slot.ok_or("browser unavailable in this context")?;
     let action = args.get("action").and_then(Value::as_str).ok_or("missing action")?;
     let mut guard = slot.inner.lock().await;
-    match action {
+    let out = match action {
         "open" | "navigate" => {
             let url = args.get("url").and_then(Value::as_str).ok_or("missing url")?;
             crate::tools::net_guard::check_url(url).await?;
@@ -131,12 +131,45 @@ pub async fn dispatch(args: &Value, slot: Option<&BrowserSlot>, session_id: Opti
         "close" => {
             if let Some(mut instance) = guard.take() {
                 let _ = instance.driver.close().await;
-                return Ok("browser closed".into());
+                Ok("browser closed".into())
+            } else {
+                Ok("browser was not running".into())
             }
-            Ok("browser was not running".into())
         }
         other => Err(format!("unknown browser action: {other}")),
+    }?;
+    // 页内跳转守卫：click/back/evaluate 乃至页面自己的 meta refresh/JS 定时跳转都会改当前 URL。
+    // CDP 的 frameRequestedNavigation 是 experimental 纯通知事件，没有否决跳转的配套命令
+    // （旧 processNavigation 已从协议删除），事前拦截不可行，只能事后复检落地 URL。
+    // 复检窗口内目标请求可能已发出、脚本已执行，所以拦截时关掉整个浏览器进程而不是只停加载：
+    // 既停止后续加载，也保证被拦页面内容不经 snapshot/evaluate 进入 prompt。
+    // close 跳过：实例已释放，无落地 URL 可检。
+    if action != "close" {
+        let landed = match guard.as_mut() {
+            Some(instance) => Some(instance.driver.current_url().await?),
+            None => None,
+        };
+        if let Some(url) = landed {
+            enforce_landed(&mut guard, &url).await?;
+        }
     }
+    Ok(out)
+}
+
+/// 落地 URL 复检，与初始 URL 同一 net_guard 口径（字面 IP 直判，域名全量 A/AAAA 逐跳检查）。
+/// 拦截即释放实例并断开浏览器（理由见 dispatch 尾部注释），错误文案给用户可读。
+async fn enforce_landed(slot: &mut Option<Instance>, url: &str) -> Result<(), String> {
+    // 空串/about:blank 是实例初始态，不是导航目标
+    if url.is_empty() || url == "about:blank" {
+        return Ok(());
+    }
+    if let Err(reason) = crate::tools::net_guard::check_url(url).await {
+        if let Some(mut instance) = slot.take() {
+            let _ = instance.driver.close().await;
+        }
+        return Err(format!("in-page navigation blocked: {url} - {reason}; browser closed to stop the load"));
+    }
+    Ok(())
 }
 
 /// 懒启动：首个导航动作时才拉起 Chrome（snapshot/click 等只读已有实例，不隐式启动）。

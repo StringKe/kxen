@@ -34,7 +34,7 @@ fn lock_for(path: &Path) -> Arc<Mutex<()>> {
 /// Team Session 生命周期终点：该目录不会再接收 inbox 写入后回收路径锁。
 pub(super) fn drop_session_locks(session_dir: &Path) {
     if let Some(locks) = INBOX_LOCKS.get() {
-        locks.lock().expect("inbox locks").retain(|path, _| !path.starts_with(session_dir));
+        crate::core::shared::lock(&locks).retain(|path, _| !path.starts_with(session_dir));
     }
 }
 

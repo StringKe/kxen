@@ -217,7 +217,7 @@ async fn handle_client_frame(text: &str, subs: &mut Vec<SubBinding>, sequences: 
     let result = rpc::rpc_call(&req.method, req.params, app).await;
     let resp = match result {
         Ok(value) => Response::ok(req.id, value),
-        Err(e) => Response::err(req.id, protocol::INTERNAL_ERROR, e),
+        Err(e) => Response::err(req.id, e.code, e.message),
     };
     serde_json::to_string(&resp).ok()
 }

@@ -27,19 +27,19 @@ pub struct SnapshotEntry {
 impl SnapshotStore {
     /// 写/改/删前调用：只记首次（后续修改都以第一次的原文为基线）。
     pub fn record_before(&self, path: &Path) {
-        let mut map = self.originals.lock().expect("snapshot");
+        let mut map = crate::core::shared::lock(&self.originals);
         if !map.contains_key(path) {
             map.insert(path.to_path_buf(), std::fs::read_to_string(path).ok());
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.originals.lock().expect("snapshot").is_empty()
+        crate::core::shared::lock(&self.originals).is_empty()
     }
 
     /// 全量状态：每文件 +added/-deleted/status（按路径排序）。
     pub fn status(&self) -> Vec<SnapshotEntry> {
-        let map = self.originals.lock().expect("snapshot").clone();
+        let map = crate::core::shared::lock(&self.originals).clone();
         let mut out: Vec<SnapshotEntry> = map
             .into_iter()
             .map(|(path, before)| {
@@ -62,13 +62,13 @@ impl SnapshotStore {
 
     /// 单文件统一 diff（快照 vs 当前；文件已删则 vs 空）。
     pub fn diff(&self, path: &Path) -> Option<String> {
-        let before = self.originals.lock().expect("snapshot").get(path).cloned()??;
+        let before = crate::core::shared::lock(&self.originals).get(path).cloned()??;
         Some(unified_diff(&before, &std::fs::read_to_string(path).unwrap_or_default(), path))
     }
 
     /// 新建文件的 diff（before 为空）。
     pub fn diff_created(&self, path: &Path) -> Option<String> {
-        let map = self.originals.lock().expect("snapshot");
+        let map = crate::core::shared::lock(&self.originals);
         let before = map.get(path)?.clone();
         if before.is_some() {
             return None;
@@ -80,7 +80,7 @@ impl SnapshotStore {
     /// rewind 回滚后清理：磁盘内容已回到基线的条目不再是 agent 改动——
     /// 被回滚掉的新建文件 before/after 双 None，留着会在面板渲染成「新增 +0 -0」幻影行。
     pub fn prune_reverted(&self) -> usize {
-        let mut map = self.originals.lock().expect("snapshot");
+        let mut map = crate::core::shared::lock(&self.originals);
         let before_len = map.len();
         map.retain(|path, orig| match (orig, std::fs::read_to_string(path).ok()) {
             (None, None) => false,

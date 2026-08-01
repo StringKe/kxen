@@ -107,9 +107,9 @@ impl McpManager {
 
     async fn reload_inner(&self, configs: Vec<ServerConfig>, policies: PolicySet, roots: Vec<String>, guard: remote::Guard) {
         let _guard = self.reload_lock.lock().await;
-        *self.policies.lock().expect("mcp") = policies;
-        *self.roots.lock().expect("mcp") = roots;
-        let old: Vec<Entry> = std::mem::take(&mut *self.servers.lock().expect("mcp")).into_values().collect();
+        *crate::core::shared::lock(&self.policies) = policies;
+        *crate::core::shared::lock(&self.roots) = roots;
+        let old: Vec<Entry> = std::mem::take(&mut *crate::core::shared::lock(&self.servers)).into_values().collect();
         for entry in old {
             if let Some(c) = entry.client {
                 c.shutdown().await;
@@ -121,7 +121,7 @@ impl McpManager {
                 .lock()
                 .expect("mcp")
                 .insert(name.clone(), Entry { config: config.clone(), client: None, needs_auth: false, last_auth_error: None });
-            let roots = self.roots.lock().expect("mcp").clone();
+            let roots = crate::core::shared::lock(&self.roots).clone();
             let connect = match guard {
                 remote::Guard::Enforced => McpClient::connect(&name, &config, &roots).await,
                 remote::Guard::Bypassed => McpClient::connect_bypassing_guard_for_test(&name, &config, &roots).await,
@@ -129,7 +129,7 @@ impl McpManager {
             match connect {
                 Ok(client) => {
                     tracing::info!(server = name, tools = client.tools.len(), "mcp server connected");
-                    if let Some(e) = self.servers.lock().expect("mcp").get_mut(&name) {
+                    if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(&name) {
                         e.client = Some(Arc::new(client));
                     }
                 }
@@ -144,14 +144,14 @@ impl McpManager {
     }
 
     fn mark_needs_auth(&self, server: &str, on: bool) {
-        if let Some(e) = self.servers.lock().expect("mcp").get_mut(server) {
+        if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(server) {
             e.needs_auth = on;
         }
     }
 
     /// 交互授权结果落状态：新一次发起/成功传 None 清除，失败传原因（status 透出给设置页）。
     pub fn set_auth_error(&self, server: &str, err: Option<String>) {
-        if let Some(e) = self.servers.lock().expect("mcp").get_mut(server) {
+        if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(server) {
             e.last_auth_error = err;
         }
     }
@@ -159,7 +159,7 @@ impl McpManager {
     /// 交互授权第一段：discovery + (DCR) + 起回调端口，返回含授权 URL 的会话。
     /// 第二段 finish_auth 由调用方 spawn（等待上限 CALLBACK_TIMEOUT，不能堵 RPC）。
     pub async fn begin_auth(&self, server: &str) -> Result<oauth_flow::LoginSession, String> {
-        let config = self.servers.lock().expect("mcp").get(server).map(|e| e.config.clone());
+        let config = crate::core::shared::lock(&self.servers).get(server).map(|e| e.config.clone());
         let Some(ServerConfig::Remote(rc)) = config else {
             return Err(format!("mcp server 不是 remote 或不存在: {server}"));
         };
@@ -198,11 +198,11 @@ impl McpManager {
     }
 
     pub fn all_tools(&self) -> Vec<McpTool> {
-        self.servers.lock().expect("mcp").values().filter_map(|e| e.client.as_ref().map(|c| c.tools.clone())).flatten().collect()
+        crate::core::shared::lock(&self.servers).values().filter_map(|e| e.client.as_ref().map(|c| c.tools.clone())).flatten().collect()
     }
 
     pub fn policy_for(&self, server: &str, tool: &str) -> ToolPolicy {
-        self.policies.lock().expect("mcp").for_tool(server, tool)
+        crate::core::shared::lock(&self.policies).for_tool(server, tool)
     }
 
     /// 工具调用：down 的先 lazy 重启一次；仍失败原样报错。返回路径过 50K cap。
@@ -215,7 +215,7 @@ impl McpManager {
             Err(e) => {
                 if oauth::is_auth_required(&e) {
                     self.mark_needs_auth(server, true);
-                    let dead = self.servers.lock().expect("mcp").get_mut(server).and_then(|e| e.client.take());
+                    let dead = crate::core::shared::lock(&self.servers).get_mut(server).and_then(|e| e.client.take());
                     if let Some(c) = dead {
                         c.shutdown().await;
                     }
@@ -234,7 +234,8 @@ impl McpManager {
         approval: Option<&crate::tools::exec::ApprovalCtx<'_>>,
     ) -> Result<String, String> {
         let (server, tool) = tools::split_prefixed(prefixed).ok_or_else(|| format!("invalid mcp tool name: {prefixed}"))?;
-        let remote = self.servers.lock().expect("mcp").get(server).is_some_and(|entry| matches!(&entry.config, ServerConfig::Remote(_)));
+        let remote =
+            crate::core::shared::lock(&self.servers).get(server).is_some_and(|entry| matches!(&entry.config, ServerConfig::Remote(_)));
         if remote && !crate::core::config::experimental_config().remote_mcp {
             return Err(format!("remote MCP tool {prefixed} is experimental and disabled; enable it explicitly in Settings > Advanced"));
         }
@@ -257,14 +258,14 @@ impl McpManager {
     }
 
     async fn client_or_restart(&self, server: &str) -> Result<Arc<McpClient>, String> {
-        let entry = self.servers.lock().expect("mcp").get(server).map(|e| (e.config.clone(), e.client.clone()));
+        let entry = crate::core::shared::lock(&self.servers).get(server).map(|e| (e.config.clone(), e.client.clone()));
         let Some((config, client)) = entry else {
             return Err(format!("mcp server not found: {server}"));
         };
         if let Some(c) = client {
             return Ok(c);
         }
-        let roots = self.roots.lock().expect("mcp").clone();
+        let roots = crate::core::shared::lock(&self.roots).clone();
         let client = match McpClient::connect(server, &config, &roots).await {
             Ok(c) => c,
             Err(e) => {
@@ -275,7 +276,7 @@ impl McpManager {
             }
         };
         let client = Arc::new(client);
-        if let Some(e) = self.servers.lock().expect("mcp").get_mut(server) {
+        if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(server) {
             e.client = Some(client.clone());
             e.needs_auth = false;
         }
@@ -284,7 +285,7 @@ impl McpManager {
 
     /// 手动重启（设置页按钮）。
     pub async fn restart(&self, server: &str) -> Result<(), String> {
-        let old = self.servers.lock().expect("mcp").get_mut(server).and_then(|e| e.client.take());
+        let old = crate::core::shared::lock(&self.servers).get_mut(server).and_then(|e| e.client.take());
         if let Some(c) = old {
             c.shutdown().await;
         }

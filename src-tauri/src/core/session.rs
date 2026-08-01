@@ -235,7 +235,7 @@ fn append_message_inner(dir: &Path, message: &Message, idempotent: bool) -> std:
     use std::io::Write;
     crate::core::ids::validate_id_io(&message.session_id)?;
     let lock = write_lock(&message.session_id);
-    let _guard = lock.lock().expect("session write lock");
+    let _guard = crate::core::shared::lock(&lock);
     // 已删会话拒绝写入：meta 不在即拒，防孤儿 JSONL 重建
     if !meta_path(dir, &message.session_id).exists() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("session not found: {}", message.session_id)));

@@ -250,13 +250,28 @@ pub fn write(path: &Path, content: &str, tracker: &FileTracker, cwd: &str) -> Re
     }
     if path.exists() && !tracker.fresh(path) {
         // 覆盖前自动快照（会话级 undo）
-        let backup = path.with_extension("kxen-bak");
-        std::fs::copy(path, &backup).ok();
+        backup(path, cwd);
     }
     tracker.snapshots.record_before(path);
     std::fs::write(path, content)?;
     tracker.mark(path);
     Ok(())
+}
+
+/// 覆盖备份：落到 <cwd>/.kxen/backups/ 并按 workspace 相对路径镜像（同名文件互不覆盖），
+/// 旧实现 <name>.kxen-bak 散在工作区根目录，无清理也未 gitignore。best-effort：失败不阻断写。
+fn backup(path: &Path, cwd: &str) {
+    let root = Path::new(cwd);
+    let fallback = Path::new(path.file_name().unwrap_or_default());
+    let rel = path.strip_prefix(root).unwrap_or(fallback);
+    let backup = root.join(".kxen").join("backups").join(rel).with_extension("kxen-bak");
+    if backup.parent().is_some_and(|p| std::fs::create_dir_all(p).is_err()) {
+        return;
+    }
+    if std::fs::copy(path, &backup).is_ok() {
+        // 备份目录不进 .gitignore 就是另一种工作区污染
+        crate::tools::worktree::ensure_gitignore(root).ok();
+    }
 }
 
 /// 删除走回收站（macOS /usr/bin/trash）。

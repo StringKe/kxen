@@ -54,6 +54,7 @@ fn test_ctx(notify: Option<Arc<NotifyRouter>>) -> AgentContext {
         lsp: None,
         notify,
         on_event: Arc::new(|_| {}),
+        stream_override: None,
     }
 }
 

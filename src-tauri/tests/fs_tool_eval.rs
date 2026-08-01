@@ -1,6 +1,6 @@
 // fs_tool 公开 API 集成测试（从 fs_tool.rs 拆出，350 行门禁）：
 // read 分页 / 文件新鲜度（纳秒精度）/ edit 双模式。
-use kxen_app::tools::fs_tool::{AnchorEdit, EditSpec, FileTracker, FsToolError, edit, read};
+use kxen_app::tools::fs_tool::{AnchorEdit, EditSpec, FileTracker, FsToolError, edit, read, write};
 use kxen_app::tools::hashline::generate_anchors;
 use std::path::PathBuf;
 
@@ -178,4 +178,71 @@ fn unchanged_edit_no_false_positive() {
     let anchors = generate_anchors(&lines);
     let spec = EditSpec::Anchors { edits: vec![AnchorEdit { anchor: anchors[0].to_string(), new_text: "ALPHA".into() }] };
     assert_eq!(edit(&path, &spec, &tracker, "/tmp").unwrap().applied, 1);
+}
+
+// ---------------- write 覆盖备份（.kxen/backups/） ----------------
+
+fn temp_workspace(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kxen-fstool-{tag}-{}-{}", std::process::id(), rand()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // canonicalize：macOS temp_dir 是 /var/folders（/private 的软链），
+    // 非规范路径命中 safety F1 保护规则（/var），新建文件的 write 会被拒
+    std::fs::canonicalize(&dir).unwrap()
+}
+
+/// 外部变更后覆盖：备份落 .kxen/backups/，工作区根目录无 .kxen-bak，.gitignore 含 .kxen/。
+#[test]
+fn write_backup_lands_in_kxen_dir() {
+    let dir = temp_workspace("backup");
+    let cwd = dir.to_string_lossy().to_string();
+    let path = dir.join("test.txt");
+    std::fs::write(&path, "old\n").unwrap();
+
+    let tracker = FileTracker::default();
+    tracker.mark(&path);
+    std::thread::sleep(std::time::Duration::from_millis(5)); // 纳秒 mtime 前进，确保检出外部变更
+    std::fs::write(&path, "externally changed\n").unwrap();
+    write(&path, "new\n", &tracker, &cwd).unwrap();
+
+    let backup = dir.join(".kxen/backups/test.kxen-bak");
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), "externally changed\n", "备份须保留覆盖前内容");
+    assert!(!dir.join("test.kxen-bak").exists(), "工作区根目录不得出现 .kxen-bak");
+    let gitignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(gitignore.lines().any(|l| l.trim() == ".kxen/"), ".gitignore 须含 .kxen/: {gitignore}");
+}
+
+/// 同名文件分处不同子目录：按相对路径镜像后两份备份互不覆盖。
+#[test]
+fn write_backup_mirrors_relative_path() {
+    let dir = temp_workspace("backup-mirror");
+    let cwd = dir.to_string_lossy().to_string();
+    let tracker = FileTracker::default();
+
+    for sub in ["a", "b"] {
+        let path = dir.join(sub).join("same.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{sub}-old\n")).unwrap();
+        tracker.mark(&path);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&path, format!("{sub}-externally changed\n")).unwrap();
+        write(&path, "new\n", &tracker, &cwd).unwrap();
+    }
+
+    let a = std::fs::read_to_string(dir.join(".kxen/backups/a/same.kxen-bak")).unwrap();
+    let b = std::fs::read_to_string(dir.join(".kxen/backups/b/same.kxen-bak")).unwrap();
+    assert_eq!(a, "a-externally changed\n");
+    assert_eq!(b, "b-externally changed\n", "同名备份不得互相覆盖");
+}
+
+/// fresh 文件（本会话写过、无外部变更）覆盖不产生备份。
+#[test]
+fn write_fresh_file_no_backup() {
+    let dir = temp_workspace("backup-fresh");
+    let cwd = dir.to_string_lossy().to_string();
+    let path = dir.join("test.txt");
+
+    let tracker = FileTracker::default();
+    write(&path, "v1\n", &tracker, &cwd).unwrap();
+    write(&path, "v2\n", &tracker, &cwd).unwrap();
+    assert!(!dir.join(".kxen").exists(), "无外部变更不得产生备份目录");
 }

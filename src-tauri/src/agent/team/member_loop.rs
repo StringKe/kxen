@@ -2,7 +2,7 @@
 
 use crate::agent::agent_loop::{AgentContext, run_turn};
 use crate::agent::cancel::CancelToken;
-use crate::core::shared::lock;
+use crate::core::shared::{lock, read};
 use crate::llm::{Message, ModelRef};
 use serde_json::json;
 use std::sync::Arc;
@@ -158,7 +158,7 @@ fn build_ctx(
         // 每轮取实时凭证快照：探测/刷新晚于 deps 构造，冻结副本会让派发报假「无可用模型」
         store: lock(&state.deps.store).clone(),
         max_turns: 16,
-        mrm: Some(state.deps.mrm.read().expect("mrm").clone()),
+        mrm: Some(read(&state.deps.mrm).clone()),
         allowed_tools: allowed,
         // lead 与 teammates 同会话作用域：共享该 session 的 extras（todo/挂载工具互通）
         extras: Some(state.deps.extras.extras_for(&state.session_id)),
@@ -175,6 +175,7 @@ fn build_ctx(
         lsp: Some(runtime.lsp()),
         // teammate 不开通知通道：background 派发只从主会话发起（teammate 走 send_message 回 lead）
         notify: None,
+        stream_override: None,
         on_event: Arc::new(move |event| {
             let mut payload = match serde_json::to_value(&event) {
                 Ok(v) => v,

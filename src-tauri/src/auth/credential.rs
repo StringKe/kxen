@@ -104,12 +104,12 @@ pub fn read_auth_file(path: &Path) -> AuthStore {
 }
 
 pub fn write_auth_file(path: &Path, store: &AuthStore) -> crate::core::Result<()> {
-    let _guard = auth_io_lock().lock().expect("auth_io");
+    let _guard = crate::core::shared::lock(auth_io_lock());
     write_auth_file_unlocked(path, store)
 }
 
 pub fn write_auth_entry(path: &Path, key: &str, credential: Option<&CredentialKind>) -> crate::core::Result<()> {
-    let _guard = auth_io_lock().lock().expect("auth_io");
+    let _guard = crate::core::shared::lock(auth_io_lock());
     let mut store = read_auth_file(path);
     match credential {
         Some(credential) => {

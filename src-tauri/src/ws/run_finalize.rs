@@ -84,7 +84,7 @@ pub(super) async fn finalize_run(end: RunEnd<'_>) {
         kxen_app::core::schedule::record(&job_id, !outcome.aborted && !errored, error);
     }
 
-    let mut parts = transcript.lock().expect("transcript").clone();
+    let mut parts = kxen_app::core::shared::lock(&transcript).clone();
     if !outcome.final_text.is_empty() {
         parts.push(ses::Part::Text { text: outcome.final_text });
     }

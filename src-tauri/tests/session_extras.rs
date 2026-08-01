@@ -87,6 +87,7 @@ fn subagent_shares_parent_session_extras() {
         lsp: None,
         notify: None,
         on_event: Arc::new(|_| {}),
+        stream_override: None,
     };
     let deps = SubagentDeps::from_context(&ctx).expect("from_context");
     let child: Arc<SessionExtras> = deps.extras.expect("subagent 应继承父 session 的 extras");
