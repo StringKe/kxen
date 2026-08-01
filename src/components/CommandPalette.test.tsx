@@ -1,10 +1,22 @@
 // CommandPalette 实测：首次打开即初始化（命令/目录预载、输入框聚焦），
 // 关闭不做初始化（回归：旧实现初始化块按 setOpen 后的新值判定，实际落在关闭分支——首开空列表、关闭才预载）。
 import { render } from "solid-js/web";
+import { Show } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import CommandPalette from "./CommandPalette";
-import Popup from "./Popup";
+import { createExclusiveDisclosure } from "../lib/dismiss";
 import "../styles.css";
+
+// 互斥夹具：与真实弹层共用 createExclusiveDisclosure，验证 Cmd-K 打开时关掉其他弹层
+function OtherPopup() {
+  const { open, toggle } = createExclusiveDisclosure();
+  return (
+    <>
+      <button onClick={toggle}>打开 popup</button>
+      <Show when={open()}>旧 popup</Show>
+    </>
+  );
+}
 
 const mocks = vi.hoisted(() => ({ commandCalls: 0, catalogCalls: 0 }));
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -77,9 +89,7 @@ describe("CommandPalette", () => {
     const dispose = render(
       () => (
         <>
-          <Popup side="left" trigger={() => <button>打开 popup</button>}>
-            旧 popup
-          </Popup>
+          <OtherPopup />
           <CommandPalette />
         </>
       ),

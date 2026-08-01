@@ -91,11 +91,6 @@ export default function SessionRow(props: {
             action: () => void togglePin(),
           },
           { label: "删除会话...", danger: true, action: beginDeleteChoice },
-          {
-            label: "删除并沉淀个人知识...",
-            danger: true,
-            action: beginDeleteChoice,
-          },
         ]);
       }}
       onDblClick={() => {

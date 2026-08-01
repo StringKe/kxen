@@ -252,19 +252,6 @@ export const client = {
     });
   },
 
-  /** run 流直读（send_message 返回的 stream_id 的 chunk 流）。 */
-  runStream<T = unknown>(streamId: string): TopicStream<T> {
-    return new TopicStream<T>(async (handler) => {
-      const onChunk = (chunk: StreamChunk) => {
-        if (chunk.stream?.id === streamId) handler(chunk.result);
-      };
-      chunkHandlers.add(onChunk);
-      return () => {
-        chunkHandlers.delete(onChunk);
-      };
-    });
-  },
-
   /** bus lag 对账信号：服务端丢帧后下发 resync 控制帧，调用方应重拉会话快照（P1-14）。返回注销函数。 */
   onResync(cb: () => void): Unsub {
     resyncHandlers.add(cb);

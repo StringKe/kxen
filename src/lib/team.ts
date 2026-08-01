@@ -2,28 +2,6 @@ import { client } from "./client";
 
 // ---------------- 团队（teammate/subagent/workflow 统一注册） ----------------
 
-export interface TeamMember {
-  name: string;
-  role: string;
-  model: { provider: string; model: string };
-  status: "working" | "idle" | "awaiting_plan_approval" | "failed" | "shutdown";
-  plan_approval: boolean;
-}
-
-export interface TeamTask {
-  id: number;
-  title: string;
-  status: "pending" | "in_progress" | "completed" | "failed" | "canceled";
-  assignee?: string | null;
-  depends_on: number[];
-}
-
-export async function teamList(
-  sessionId: string,
-): Promise<{ members: TeamMember[]; tasks: TeamTask[] }> {
-  return client.rpc("team.list", { session_id: sessionId });
-}
-
 export async function teamMessage(sessionId: string, name: string, text: string): Promise<void> {
   return client.rpc("team.message", { session_id: sessionId, name, text });
 }

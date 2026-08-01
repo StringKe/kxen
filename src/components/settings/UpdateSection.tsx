@@ -1,35 +1,31 @@
 import { createSignal, onMount, Show } from "solid-js";
 import { formatError } from "../../lib/error-text";
-import {
-  checkForUpdate,
-  currentVersion,
-  installUpdate,
-  type AvailableUpdate,
-} from "../../lib/updater";
+import { availableUpdate, checkForUpdate, currentVersion, installUpdate } from "../../lib/updater";
 
 export default function UpdateSection() {
   const [version, setVersion] = createSignal("");
   const [status, setStatus] = createSignal("");
   const [busy, setBusy] = createSignal(false);
-  const [update, setUpdate] = createSignal<AvailableUpdate | null>(null);
+  // 与启动静默检查共用同一状态源：启动已发现的更新进页即见，不重复请求
+  const update = availableUpdate;
 
   onMount(() => {
     void currentVersion()
       .then(setVersion)
       .catch(() => setVersion("UNKNOWN"));
+    const found = availableUpdate();
+    if (found) setStatus(`发现版本 ${found.version}`);
   });
 
   const check = async () => {
     setBusy(true);
     setStatus("正在检查更新");
-    setUpdate(null);
     try {
       const available = await checkForUpdate();
       if (!available) {
         setStatus("当前已是最新版本");
         return;
       }
-      setUpdate(available);
       setStatus(`发现版本 ${available.version}`);
     } catch (error) {
       setStatus(`检查失败：${formatError(error instanceof Error ? error.message : String(error))}`);

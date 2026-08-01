@@ -22,6 +22,7 @@ import { startAgentsPolling } from "./lib/agents-poll";
 import { mountShortcuts } from "./lib/shortcuts";
 import { openMenu } from "./lib/context-menu";
 import { mountOsNotificationJump } from "./lib/os-notify";
+import { autoCheckOnStartup } from "./lib/updater";
 import {
   adjustDock,
   adjustSidebar,
@@ -94,6 +95,8 @@ function Layout(props: { children?: import("solid-js").JSX.Element }) {
       .then((u) => (unlistenOs = u))
       // 非 Tauri 环境（vitest / 纯浏览器 dev）无 event bridge：降级为无点击回跳
       .catch(() => {});
+    // 启动静默检查一次更新：失败静默，有更新只 toast + 填充 UpdateSection 共享状态
+    autoCheckOnStartup();
   });
   onCleanup(() => {
     unmount?.();
@@ -119,10 +122,64 @@ function Layout(props: { children?: import("solid-js").JSX.Element }) {
   );
 }
 
+const clipErr = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** input/textarea 编辑命令：clipboard + Selection/Range API（execCommand 已废弃）。 */
+function textFieldMenuItems(field: HTMLInputElement | HTMLTextAreaElement) {
+  // 菜单动作执行时焦点/选区已落到菜单上：目标与选区必须在打开时捕获
+  const start = field.selectionStart ?? 0;
+  const end = field.selectionEnd ?? 0;
+  const selected = field.value.slice(start, end);
+  const restore = () => {
+    field.focus();
+    field.setSelectionRange(start, end);
+  };
+  // 程序化改值后补发 input：onInput 链路（草稿/弹层/自动长高）与键盘输入同等待遇
+  const replaceSelection = (text: string) => {
+    restore();
+    field.setRangeText(text, start, end, "end");
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const writeClip = (text: string) =>
+    navigator.clipboard.writeText(text).catch((e) => flashErr(`写入剪贴板失败：${clipErr(e)}`));
+  return [
+    {
+      label: "剪切",
+      action: () => {
+        replaceSelection("");
+        void writeClip(selected);
+      },
+    },
+    { label: "复制", action: () => void writeClip(selected) },
+    {
+      label: "粘贴",
+      action: () =>
+        void navigator.clipboard
+          .readText()
+          .then(replaceSelection)
+          .catch((e) => flashErr(`读取剪贴板失败：${clipErr(e)}`)),
+    },
+    {
+      label: "全选",
+      action: () => {
+        restore();
+        field.setSelectionRange(0, field.value.length);
+      },
+    },
+  ];
+}
+
 /** 全局右键：输入控件给编辑命令，可选区给复制，其余屏蔽 webview 默认（reload/inspect）。 */
 function onGlobalContextMenu(e: MouseEvent) {
   const target = e.target as HTMLElement;
-  if (target.closest("input, textarea, [contenteditable='true']")) {
+  const editable = target.closest("input, textarea, [contenteditable='true']");
+  if (editable instanceof HTMLInputElement || editable instanceof HTMLTextAreaElement) {
+    openMenu(e, textFieldMenuItems(editable));
+    return;
+  }
+  if (editable) {
+    // contenteditable 是富文选区（含 HTML 结构），纯文本 clipboard API 会改语义：
+    // 保留 execCommand（WKWebView 仍支持，仅此路径）
     openMenu(e, [
       { label: "剪切", action: () => document.execCommand("cut") },
       { label: "复制", action: () => document.execCommand("copy") },
@@ -132,14 +189,28 @@ function onGlobalContextMenu(e: MouseEvent) {
           void navigator.clipboard
             .readText()
             .then((t) => document.execCommand("insertText", false, t))
-            .catch((e) => flashErr(`读取剪贴板失败：${e instanceof Error ? e.message : e}`)),
+            .catch((e) => flashErr(`读取剪贴板失败：${clipErr(e)}`)),
       },
       { label: "全选", action: () => document.execCommand("selectAll") },
     ]);
     return;
   }
-  if (target.closest(".selectable") && window.getSelection()?.toString()) {
-    openMenu(e, [{ label: "复制", action: () => document.execCommand("copy") }]);
+  if (target.closest(".selectable")) {
+    // 打开时捕获选中文本：点菜单项后 selection 已塌缩
+    const text = window.getSelection()?.toString() ?? "";
+    if (!text) {
+      e.preventDefault();
+      return;
+    }
+    openMenu(e, [
+      {
+        label: "复制",
+        action: () =>
+          void navigator.clipboard
+            .writeText(text)
+            .catch((e) => flashErr(`写入剪贴板失败：${clipErr(e)}`)),
+      },
+    ]);
     return;
   }
   e.preventDefault();

@@ -49,10 +49,6 @@ export async function currentModel(
   return client.rpc("current_model", sessionId ? { session_id: sessionId } : {});
 }
 
-export async function setModel(provider: string, model: string): Promise<void> {
-  return client.rpc("set_model", { provider, model });
-}
-
 export async function sendMessage(
   sessionId: string,
   text: string,

@@ -20,6 +20,7 @@ vi.mock("../lib/chat", async (importOriginal) => {
 
 import SessionRow from "./SessionRow";
 import { flash } from "../lib/flash";
+import { closeMenu, menu } from "../lib/context-menu";
 import { setActiveSessionId } from "../lib/state";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -51,6 +52,7 @@ const titleSpan = () =>
   [...document.body.querySelectorAll("span")].find((el) => el.textContent?.trim() === S.title);
 
 afterEach(() => {
+  closeMenu();
   document.body.innerHTML = "";
   for (const m of flash.msgs()) flash.dismiss(m.id);
   h.sessionUpdateMeta.mockReset();
@@ -98,6 +100,20 @@ describe("SessionRow 失败路径", () => {
     await flush();
     expect(document.body.querySelector("button[title='确认删除']")).toBeNull();
     expect(document.body.querySelector("button[title='删除会话（再点一次确认）']")).not.toBeNull();
+    dispose();
+  });
+
+  it("右键菜单只有一项删除入口：直删/沉淀选择在行内确认条做", async () => {
+    const dispose = renderRow();
+    document
+      .querySelector(".interactive")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    const dangerItems = (menu()?.items ?? []).filter((i) => i.danger);
+    expect(dangerItems.map((i) => i.label)).toEqual(["删除会话..."]);
+    dangerItems[0]!.action();
+    await flush();
+    expect(document.body.querySelector("button[title='确认删除']")).not.toBeNull();
+    expect(document.body.querySelector("button[title*='沉淀为个人知识后删除']")).not.toBeNull();
     dispose();
   });
 

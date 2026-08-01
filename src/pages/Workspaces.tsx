@@ -21,13 +21,23 @@ const TONE_CLASS: Record<GoalTone, string> = {
 
 export default function Workspaces() {
   const [cards, setCards] = createSignal<WorkspaceOverview[]>([]);
+  const [loadErr, setLoadErr] = createSignal("");
+  const [loaded, setLoaded] = createSignal(false);
   let unlisten: (() => void) | undefined;
   let offResync: (() => void) | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
 
   const reload = async () => {
-    const list = await workspacesOverview().catch(() => null);
-    if (list) setCards(list);
+    // 失败保留旧值但记错误态：首载失败（后端没连上）必须与真空（还没有工作区）区分
+    const list = await workspacesOverview().catch((e: unknown) => {
+      setLoadErr(formatError(e instanceof Error ? e.message : String(e)));
+      return null;
+    });
+    if (list) {
+      setCards(list);
+      setLoadErr("");
+    }
+    setLoaded(true);
   };
 
   onMount(async () => {
@@ -84,15 +94,31 @@ export default function Workspaces() {
           返回会话
         </A>
         <h1 class="text-lg font-medium text-[var(--text)] mb-4">工作看板</h1>
+        <Show when={!loaded()}>
+          <div class="text-xs text-[var(--text-faint)]">加载中…</div>
+        </Show>
+        <Show when={loaded() && loadErr() && cards().length === 0}>
+          <div class="max-w-md rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 p-8 flex items-center gap-3">
+            <span class="text-xs text-[var(--err)]">加载工作区失败：{loadErr()}</span>
+            <button
+              class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-xs text-[var(--text-dim)]"
+              onClick={() => void reload()}
+            >
+              重试
+            </button>
+          </div>
+        </Show>
         <Show
           when={cards().length > 0}
           fallback={
-            <div class="max-w-md rounded-lg border border-dashed border-[var(--border)] p-8 text-center">
-              <p class="text-sm text-[var(--text-dim)]">还没有工作区</p>
-              <p class="text-xs text-[var(--text-faint)] mt-1">
-                在会话页打开的项目会出现在这里：每个工作区一列，并行跑着什么一眼可见
-              </p>
-            </div>
+            <Show when={loaded() && !loadErr()}>
+              <div class="max-w-md rounded-lg border border-dashed border-[var(--border)] p-8 text-center">
+                <p class="text-sm text-[var(--text-dim)]">还没有工作区</p>
+                <p class="text-xs text-[var(--text-faint)] mt-1">
+                  在会话页打开的项目会出现在这里：每个工作区一列，并行跑着什么一眼可见
+                </p>
+              </div>
+            </Show>
           }
         >
           <div class="flex items-start gap-3 overflow-x-auto pb-4">

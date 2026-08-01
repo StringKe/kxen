@@ -106,11 +106,12 @@ describe("client transport", () => {
     expect(resync).toHaveBeenCalledOnce();
 
     const subscriptionValues: unknown[] = [];
-    const runValues: number[] = [];
 
-    const offSubscription = client.stream(["task.update", "llm.delta"]).on((value) => {
-      subscriptionValues.push(value);
-    });
+    const offSubscription = client
+      .stream<{ text?: string }>(["task.update", "llm.delta"])
+      .filter((value) => typeof value.text === "string")
+      .map((value) => value.text)
+      .on((value) => subscriptionValues.push(value));
     await vi.waitFor(() => expect(socket.send).toHaveBeenCalled());
     const subscribe = sentFrame(socket);
     expect(subscribe).toMatchObject({
@@ -120,12 +121,6 @@ describe("client transport", () => {
     emit(socket, { id: subscribe.id, result: { stream_id: "sub-1" } });
     await flush();
 
-    const offRun = client
-      .runStream<number>("run-1")
-      .filter((value) => value > 1)
-      .map((value) => value * 2)
-      .on((value) => runValues.push(value));
-    await flush();
     emit(socket, {
       stream: { id: "sub-new", seq: 1 },
       result: { topic: "llm.delta", payload: { text: "a" } },
@@ -134,17 +129,22 @@ describe("client transport", () => {
       stream: { id: "sub-new", seq: 2 },
       result: { topic: "other", payload: "ignored" },
     });
-    emit(socket, { stream: { id: "run-other", seq: 1 }, result: 5 });
-    emit(socket, { stream: { id: "run-1", seq: 2 }, result: 1 });
-    emit(socket, { stream: { id: "run-1", seq: 3 }, result: 3 });
-    expect(subscriptionValues).toEqual([{ text: "a" }]);
-    expect(runValues).toEqual([6]);
-
-    offRun();
-    emit(socket, { stream: { id: "run-1", seq: 4 }, result: 4 });
-    expect(runValues).toEqual([6]);
+    // filter 负路径：无 text 字段的 payload 被派生流滤掉
+    emit(socket, {
+      stream: { id: "sub-new", seq: 3 },
+      result: { topic: "llm.delta", payload: { n: 1 } },
+    });
+    // run 流原始帧（无 {topic, payload} 包装）不进 sub 处理器
+    emit(socket, { stream: { id: "run-1", seq: 4 }, result: 3 });
+    expect(subscriptionValues).toEqual(["a"]);
 
     offSubscription();
+    emit(socket, {
+      stream: { id: "sub-new", seq: 5 },
+      result: { topic: "llm.delta", payload: { text: "b" } },
+    });
+    expect(subscriptionValues).toEqual(["a"]);
+
     await vi.waitFor(() => expect(socket.send).toHaveBeenCalledTimes(4));
     const unsubscribe = sentFrame(socket);
     expect(unsubscribe).toMatchObject({

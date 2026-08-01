@@ -33,7 +33,6 @@ import {
   sessionRewind,
   sessionRunning,
   sessionUpdateMeta,
-  setModel,
   statusline,
 } from "./chat";
 
@@ -47,7 +46,6 @@ describe("chat RPC wrappers", () => {
     await doctor();
     await currentModel();
     await currentModel("s1");
-    await setModel("anthropic", "sonnet");
     await sendMessage(
       "s1",
       "hello",
@@ -69,7 +67,6 @@ describe("chat RPC wrappers", () => {
       ["doctor"],
       ["current_model", {}],
       ["current_model", { session_id: "s1" }],
-      ["set_model", { provider: "anthropic", model: "sonnet" }],
       [
         "send_message",
         {

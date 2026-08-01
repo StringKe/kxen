@@ -47,7 +47,9 @@ export default function TextComposer(props: {
   const [recording, setRecording] = createSignal(false),
     [activeVoice, setActiveVoice] = createSignal("");
   const [voiceError, setVoiceError] = createSignal(""),
-    [voiceEngine, setVoiceEngine] = createSignal("apple"),
+    // 空 = 不带 engine override：PTT 走后端 config.voice.engine（设置页主引擎）；
+    // 仅 MicMenu 显式点选后才有值，作为一次性 override（MicMenu 已同步落后端配置）
+    [voiceEngine, setVoiceEngine] = createSignal(""),
     [dragOver, setDragOver] = createSignal(false);
   let ta: HTMLTextAreaElement | undefined;
   let imeLockUntil = 0; // Safari compositionend 先于 commit keydown（WebKit #165231），50ms 锁窗吞尾随 Enter

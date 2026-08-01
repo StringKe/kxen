@@ -71,6 +71,20 @@ describe("startVoiceSession session 隔离", () => {
     expect(partials).toEqual(["世界"]);
   });
 
+  it("engine 为空不发送 override：后端按 config.voice.engine（设置页主引擎）起会话", async () => {
+    const s = await startVoiceSession(
+      "",
+      () => {},
+      () => {},
+      "sess-A",
+    );
+    expect(mocks.rpcCalls[0]).toEqual({
+      method: "voice.start",
+      params: { session_id: "sess-A" },
+    });
+    await s.stop();
+  });
+
   it("start 失败即退订：不再收任何 voice 事件", async () => {
     mocks.state.failStart = true;
     const partials: string[] = [];

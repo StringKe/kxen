@@ -5,9 +5,22 @@ const h = vi.hoisted(() => ({
   currentVersion: vi.fn(async () => "0.1.0"),
   checkForUpdate: vi.fn(),
   installUpdate: vi.fn(async () => {}),
+  setAvailable: ((_u: unknown) => {}) as (u: { version: string } | null) => void,
 }));
 
-vi.mock("../../lib/updater", () => h);
+// availableUpdate 必须是真信号：组件 JSX 靠它驱动「下载并安装」按钮的显隐
+vi.mock("../../lib/updater", async () => {
+  const { createSignal } = await import("solid-js");
+  const [availableUpdate, setAvailableUpdate] = createSignal<{ version: string } | null>(null);
+  h.setAvailable = setAvailableUpdate;
+  return {
+    availableUpdate,
+    autoCheckOnStartup: vi.fn(),
+    checkForUpdate: h.checkForUpdate,
+    currentVersion: h.currentVersion,
+    installUpdate: h.installUpdate,
+  };
+});
 
 import UpdateSection from "./UpdateSection";
 
@@ -23,7 +36,8 @@ beforeEach(() => {
   h.currentVersion.mockResolvedValue("0.1.0");
   h.checkForUpdate.mockReset();
   h.installUpdate.mockReset();
-  h.installUpdate.mockResolvedValue();
+  h.installUpdate.mockResolvedValue(undefined);
+  h.setAvailable(null);
 });
 
 afterEach(() => {
@@ -44,7 +58,10 @@ describe("UpdateSection", () => {
 
   it("发现更新后安装并防止重复操作", async () => {
     const update = { version: "0.1.1" };
-    h.checkForUpdate.mockResolvedValue(update);
+    h.checkForUpdate.mockImplementation(async () => {
+      h.setAvailable(update);
+      return update;
+    });
     const dispose = render(() => <UpdateSection />, document.body);
 
     button("检查更新").click();
@@ -64,6 +81,16 @@ describe("UpdateSection", () => {
 
     await vi.waitFor(() => expect(document.body.textContent).toContain("检查失败：offline"));
     expect(button("检查更新").disabled).toBe(false);
+    dispose();
+  });
+
+  it("启动静默检查已发现的更新：进页直接回填共享状态，不重复请求", async () => {
+    h.setAvailable({ version: "0.2.0" });
+    const dispose = render(() => <UpdateSection />, document.body);
+
+    await vi.waitFor(() => expect(document.body.textContent).toContain("发现版本 0.2.0"));
+    expect(document.body.textContent).toContain("下载并安装");
+    expect(h.checkForUpdate).not.toHaveBeenCalled();
     dispose();
   });
 });

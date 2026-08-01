@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JSX } from "solid-js";
 
 const h = vi.hoisted(() => ({
+  autoCheck: vi.fn(),
   flashErr: vi.fn(),
   mountOsNotificationJump: vi.fn(async () => vi.fn()),
   mountShortcuts: vi.fn(() => vi.fn()),
@@ -12,6 +13,7 @@ const h = vi.hoisted(() => ({
   refreshAgents: vi.fn(async () => {}),
   setNavigator: vi.fn(),
   startAgentsPolling: vi.fn(() => vi.fn()),
+  writeText: vi.fn(async () => {}),
 }));
 
 vi.mock("@solidjs/router", () => ({
@@ -60,6 +62,7 @@ vi.mock("../lib/agents-poll", () => ({ startAgentsPolling: h.startAgentsPolling 
 vi.mock("../lib/shortcuts", () => ({ mountShortcuts: h.mountShortcuts }));
 vi.mock("../lib/context-menu", () => ({ openMenu: h.openMenu }));
 vi.mock("../lib/os-notify", () => ({ mountOsNotificationJump: h.mountOsNotificationJump }));
+vi.mock("../lib/updater", () => ({ autoCheckOnStartup: h.autoCheck }));
 vi.mock("../lib/flash", () => ({ flashErr: h.flashErr }));
 vi.mock("../lib/panels", () => ({
   adjustDock: vi.fn(),
@@ -76,7 +79,7 @@ import App from "../App";
 beforeEach(() => {
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
-    value: { readText: h.readText },
+    value: { readText: h.readText, writeText: h.writeText },
   });
   Object.defineProperty(document, "execCommand", {
     configurable: true,
@@ -97,12 +100,15 @@ describe("App shell", () => {
     expect(h.setNavigator).toHaveBeenCalledWith(h.navigate);
     expect(h.mountShortcuts).toHaveBeenCalledTimes(1);
     expect(h.startAgentsPolling).toHaveBeenCalledTimes(1);
+    expect(h.autoCheck).toHaveBeenCalledTimes(1); // 启动静默检查一次
     expect(document.body.textContent).toContain("session page");
     expect(document.body.textContent).toContain("settings page");
     expect(document.body.textContent).toContain("workspaces page");
 
     const input = document.createElement("input");
+    input.value = "hello world";
     document.body.append(input);
+    input.setSelectionRange(0, 5);
     input.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     expect(h.openMenu).toHaveBeenCalled();
     const editItems = h.openMenu.mock.calls.at(-1)?.[1] as Array<{
@@ -110,9 +116,20 @@ describe("App shell", () => {
       action: () => void;
     }>;
     expect(editItems.map((item) => item.label)).toEqual(["剪切", "复制", "粘贴", "全选"]);
-    editItems.forEach((item) => item.action());
+
+    // input/textarea 路径走 clipboard + Selection/Range，不走 execCommand
+    editItems.find((item) => item.label === "复制")?.action();
+    await vi.waitFor(() => expect(h.writeText).toHaveBeenCalledWith("hello"));
+    editItems.find((item) => item.label === "剪切")?.action();
+    await vi.waitFor(() => expect(input.value).toBe(" world"));
+    expect(h.writeText).toHaveBeenCalledWith("hello");
+    editItems.find((item) => item.label === "粘贴")?.action();
     await vi.waitFor(() => expect(h.readText).toHaveBeenCalled());
-    expect(document.execCommand).toHaveBeenCalledWith("insertText", false, "clipboard text");
+    await vi.waitFor(() => expect(input.value).toContain("clipboard text"));
+    editItems.find((item) => item.label === "全选")?.action();
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(input.value.length);
+    expect(document.execCommand).not.toHaveBeenCalled();
 
     const selectable = document.createElement("div");
     selectable.className = "selectable";
@@ -121,8 +138,26 @@ describe("App shell", () => {
       toString: () => "selected",
     } as Selection);
     selectable.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
-    const selectionItems = h.openMenu.mock.calls.at(-1)?.[1] as Array<{ label: string }>;
+    const selectionItems = h.openMenu.mock.calls.at(-1)?.[1] as Array<{
+      label: string;
+      action: () => void;
+    }>;
     expect(selectionItems.map((item) => item.label)).toEqual(["复制"]);
+    selectionItems[0]?.action();
+    await vi.waitFor(() => expect(h.writeText).toHaveBeenCalledWith("selected"));
+
+    // contenteditable 富文选区无纯文本替代：保留 execCommand 路径
+    const rich = document.createElement("div");
+    rich.contentEditable = "true";
+    document.body.append(rich);
+    rich.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    const richItems = h.openMenu.mock.calls.at(-1)?.[1] as Array<{
+      label: string;
+      action: () => void;
+    }>;
+    expect(richItems.map((item) => item.label)).toEqual(["剪切", "复制", "粘贴", "全选"]);
+    richItems.find((item) => item.label === "复制")?.action();
+    expect(document.execCommand).toHaveBeenCalledWith("copy");
 
     const plain = document.createElement("div");
     document.body.append(plain);

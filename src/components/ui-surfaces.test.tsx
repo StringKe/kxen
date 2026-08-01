@@ -54,7 +54,6 @@ import ApprovalCard from "./ApprovalCard";
 import ContextMenu from "./ContextMenu";
 import FlashHost from "./FlashHost";
 import Markdown from "./Markdown";
-import Popup from "./Popup";
 import ResizeHandle from "./ResizeHandle";
 import RewindConfirm from "./RewindConfirm";
 import Sidebar from "./Sidebar";
@@ -141,35 +140,6 @@ describe("基础交互组件", () => {
     handle.dispatchEvent(new PointerEvent("pointercancel", { bubbles: true, pointerId: 1 }));
     handle.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     expect(reset).toHaveBeenCalledTimes(1);
-    dispose();
-  });
-
-  it("Popup 支持左右锚点、互斥、Escape 和缺省宽度", async () => {
-    const dispose = render(
-      () => (
-        <>
-          <Popup
-            side="right"
-            class="extra"
-            trigger={(open) => <button>{open() ? "收起 A" : "展开 A"}</button>}
-          >
-            popup A
-          </Popup>
-          <Popup side="left" trigger={(open) => <button>{open() ? "收起 B" : "展开 B"}</button>}>
-            popup B
-          </Popup>
-        </>
-      ),
-      document.body,
-    );
-    clickButton("展开 A");
-    await vi.waitFor(() => expect(document.body.textContent).toContain("popup A"));
-    expect(document.body.querySelector(".right-0.w-52.extra")).toBeTruthy();
-    clickButton("展开 B");
-    await vi.waitFor(() => expect(document.body.textContent).not.toContain("popup A"));
-    expect(document.body.textContent).toContain("popup B");
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-    await vi.waitFor(() => expect(document.body.textContent).not.toContain("popup B"));
     dispose();
   });
 

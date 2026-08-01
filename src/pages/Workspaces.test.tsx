@@ -114,6 +114,38 @@ describe("Workspaces resync 自愈", () => {
   });
 });
 
+describe("Workspaces 首载三态", () => {
+  it("首载未完成显示加载态，不显示空态", async () => {
+    let resolveOverview: (v: WorkspaceOverview[]) => void = () => {};
+    h.workspacesOverview.mockReturnValueOnce(
+      new Promise<WorkspaceOverview[]>((res) => (resolveOverview = res)),
+    );
+    const dispose = render(() => <Workspaces />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("加载中…");
+    expect(document.body.textContent).not.toContain("还没有工作区");
+    resolveOverview([]);
+    await flush();
+    expect(document.body.textContent).not.toContain("加载中…");
+    // 后端连上但真空：空态而非错误态
+    expect(document.body.textContent).toContain("还没有工作区");
+    dispose();
+  });
+
+  it("首载失败显示错误态与重试（与真空区分），重试成功恢复列表", async () => {
+    h.workspacesOverview.mockRejectedValueOnce(new Error("connection lost"));
+    const dispose = render(() => <Workspaces />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("加载工作区失败");
+    expect(document.body.textContent).not.toContain("还没有工作区");
+    btnByText("重试")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush();
+    expect(document.body.textContent).not.toContain("加载工作区失败");
+    expect(document.body.textContent).toContain("/a");
+    dispose();
+  });
+});
+
 describe("Workspaces 看板落点", () => {
   it("点列头：切到该 workspace 最近会话（updated_at 最大）", async () => {
     const dispose = render(() => <Workspaces />, document.body);

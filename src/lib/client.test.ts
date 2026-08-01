@@ -72,7 +72,7 @@ describe("createSubChunkHandler（P0-1 断线重连假恢复回归）", () => {
     const got: unknown[] = [];
     const onChunk = createSubChunkHandler(["llm.delta"], (p) => got.push(p));
     onChunk({ stream: { id: "sub-1", seq: 1 }, result: { topic: "task.update", payload: 1 } });
-    // run 流原始帧（无 {topic, payload} 包装）走 runStream 的 streamId 通道，不进 sub 处理器
+    // run 流原始帧（无 {topic, payload} 包装）不进 sub 处理器
     onChunk({ stream: { id: "run-1", seq: 2 }, result: { kind: "delta", text: "x" } });
     expect(got).toEqual([]);
   });
