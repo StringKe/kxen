@@ -10,8 +10,9 @@ const nimbusConfig = defineNimbusConfig({
   description: "面向复杂软件工程任务的 macOS 原生 Coding Agent Harness。",
   locale: "zh-CN",
   homeLabel: "首页",
-  github: null,
-  editPattern: null,
+  github: "https://github.com/StringKe/kxen",
+  // 文档源在 website 子目录，{path} 相对于 website package 根。
+  editPattern: "https://github.com/StringKe/kxen/edit/main/website/{path}",
   socialImage: "/og.png",
   socialImageAlt: "kxen 产品官网与文档",
 });
@@ -61,6 +62,9 @@ export default defineConfig({
     nimbus(nimbusConfig, {
       rules: {
         "nimbus/frontmatter-shape": "error",
+        // 内容页内部链接刻意使用 https://kxen.ai/... 绝对 URL: 这些页面同时以
+        // .md/llms.txt 形式供 AI agent 抓取，绝对链接是 agent 消费的需要。
+        // internal-link 只校验站内路径型链接，绝对 URL 不在其检查范围。
         "nimbus/internal-link": "error",
         "nimbus/description-required": "error",
         "nimbus/single-h1": "error",

@@ -6,11 +6,25 @@ sidebar:
   order: 8
 ---
 
-Approval 处理存在合法用途、但不应由模型自行决定的高风险操作。它发生在工具真正执行之前。
+Approval 处理存在合法用途、但不应由模型自行决定的操作。它发生在工具真正执行之前。
+
+## Shell 命令逐次审批
+
+Shell 和 exec 类工具对每条命令强制 Approval，包括 Safety 判定为 Allow 的无害命令。没有 auto-approve，也没有记住选择的放行开关，审批是命令放行的唯一入口。
+
+这是刻意的 fail-closed 设计: 审批通道超时、中断或不可用时命令不执行。静态规则判定再宽松，也不替代人对当次具体命令的确认。
+
+每执行一条 Shell 命令，用户都会看到一张审批卡，包含具体命令、请求原因和当前 Session，逐条允许或拒绝。
+
+与 Safety 判定结果的关系:
+
+- Deny 不进入 Approval，用户确认也不能放行。
+- Ask、Allow 和 Recoverable 的 Shell 命令都进入 Approval，由用户逐次决定。
+- 非 Shell 工具按 Safety 判定分流: Allow 直接执行，Ask 进入 Approval。
 
 ## 触发条件
 
-典型 Ask 操作包括:
+非 Shell 工具的典型 Ask 操作包括:
 
 - `git push --force`
 - 裸 `git reset --hard`

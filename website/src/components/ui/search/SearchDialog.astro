@@ -3,7 +3,7 @@ import { Icon } from "astro-icon/components";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 ---
 
-<Dialog aria-label="Search documentation" data-search-dialog>
+<Dialog aria-label="搜索文档" data-search-dialog>
   <DialogContent class="max-w-xl bg-muted shadow-xl ring-border">
     <div class="overflow-hidden rounded-t-lg bg-card border-b border-border">
       <div class="flex items-center gap-3 border-b border-border px-4 py-3">
@@ -16,7 +16,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
           aria-autocomplete="list"
           aria-controls="search-listbox"
           type="text"
-          placeholder="Search documentation…"
+          placeholder="搜索文档…"
           class="min-w-0 flex-1 border-0 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
           autocomplete="off"
           spellcheck="false"
@@ -36,15 +36,15 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
         class="min-h-40 overflow-y-auto p-2"
       >
         <p data-search-empty class="py-8 text-center text-sm text-muted-foreground">
-          Type to search…
+          输入关键词以搜索…
         </p>
       </div>
     </div>
 
     <div class="flex items-center gap-4 px-4 py-2.5 text-xs text-muted-foreground/80">
-      <span>↑↓ navigate</span>
-      <span>↵ select</span>
-      <span>Esc close</span>
+      <span>↑↓ 移动</span>
+      <span>↵ 打开</span>
+      <span>Esc 关闭</span>
     </div>
   </DialogContent>
 </Dialog>

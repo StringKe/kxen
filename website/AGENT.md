@@ -23,6 +23,7 @@
 
 页面 H1 由 frontmatter `title` 生成，正文不重复 H1。每页必须有 `description` 和 `status`。
 一级栏目只负责分类和导航。一个能力只能由一个权威页面完整解释，禁止把多个能力合并成一个标题或一篇正文。
+内容页内部链接使用 `https://kxen.ai/` 绝对 URL 是有意决策: 页面同时以 `.md`/`llms.txt` 形式供 AI agent 抓取，agent 消费需要绝对链接。
 
 ## 修改流程
 

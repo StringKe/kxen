@@ -169,8 +169,8 @@ const hasPagination = Astro.slots.has("pagination");
                   variant="caution"
                   content={
                     currentSiblingUrl
-                      ? `This is the <strong>${versionStatus.version}</strong> version of the docs and is no longer maintained. The latest version of this page is at <a href="${currentSiblingUrl}">${currentSiblingUrl}</a>.`
-                      : `This is the <strong>${versionStatus.version}</strong> version of the docs and is no longer maintained. See the <a href="/">current docs</a> for up-to-date content.`
+                      ? `这是 <strong>${versionStatus.version}</strong> 版本的文档，已不再维护。本页最新版本见 <a href="${currentSiblingUrl}">${currentSiblingUrl}</a>。`
+                      : `这是 <strong>${versionStatus.version}</strong> 版本的文档，已不再维护。最新内容请见<a href="/">当前文档</a>。`
                   }
                 />
               )}
@@ -183,7 +183,7 @@ const hasPagination = Astro.slots.has("pagination");
                   <Fragment>
                     <div class="flex items-center gap-3 flex-wrap mt-6">
                       <h1 class="text-foreground mb-0 leading-tight [text-wrap:balance]" style={`font-size:var(--nb-h1-size);font-weight:var(--nb-h1-weight);letter-spacing:var(--nb-h1-tracking)`}>{title}</h1>
-                      {draft && <Badge text="Draft" variant="warning" size="medium" />}
+                      {draft && <Badge text="草稿" variant="warning" size="medium" />}
                     </div>
                     {description && (
                       <p class="text-[0.9375rem] sm:text-[1.0625rem] text-muted-foreground leading-relaxed mt-2 mb-2 [text-wrap:pretty]">{description}</p>
@@ -198,7 +198,7 @@ const hasPagination = Astro.slots.has("pagination");
                       audience === "human" ? (
                         <div class="mt-3 mb-6 flex items-center gap-3" role="none">
                           <div class="h-px flex-1 bg-border"></div>
-                          <Badge text="For humans" variant="success" size="small" class="font-mono uppercase border border-success/15" />
+                          <Badge text="面向人类" variant="success" size="small" class="font-mono uppercase border border-success/15" />
                           <div class="h-px flex-1 bg-border"></div>
                         </div>
                       ) : (
@@ -217,7 +217,7 @@ const hasPagination = Astro.slots.has("pagination");
                   <div class="mt-8 mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                     <a href={editUrl} class="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground transition-colors no-underline" target="_blank" rel="noopener">
                       <Icon name="ph:pencil-simple" class="w-3.5 h-3.5" />
-                      Edit this page
+                      编辑此页
                     </a>
                   </div>
                 )}
@@ -245,12 +245,12 @@ const hasPagination = Astro.slots.has("pagination");
       data-mobile-sidebar
       data-state="closed"
       class="group fixed inset-0 m-0 h-full w-full max-h-full max-w-full border-0 bg-transparent p-0 [&::backdrop]:bg-transparent"
-      aria-label="Site navigation"
+      aria-label="站点导航"
     >
       <div data-mobile-sidebar-panel class="h-full w-(--nb-sidebar-width) max-w-[85vw] -translate-x-full overflow-y-auto overscroll-contain border-r border-border bg-card transition-transform duration-250 ease-out group-data-[state=open]:translate-x-0 motion-reduce:transition-none">
         <div class="sticky top-0 z-[1] flex items-center justify-between border-b border-border bg-card px-4 py-3">
-          <span class="font-semibold text-sm text-foreground">Navigation</span>
-          <button data-close-sidebar class="flex items-center justify-center w-8 h-8 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors" aria-label="Close sidebar">
+          <span class="font-semibold text-sm text-foreground">导航</span>
+          <button data-close-sidebar class="flex items-center justify-center w-8 h-8 rounded-md text-muted-foreground hover:bg-accent hover:text-foreground transition-colors" aria-label="关闭导航">
             <Icon name="ph:x" class="w-5 h-5" />
           </button>
         </div>
