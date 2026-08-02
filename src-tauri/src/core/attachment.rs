@@ -68,3 +68,29 @@ pub fn read_attachment(canon: &Path) -> Result<Value, String> {
         })),
     }
 }
+
+pub fn read_attachment_resolved(resolved: &crate::tools::path_policy::ResolvedPath) -> Result<Value, String> {
+    use std::io::Read;
+
+    let mut file = resolved.open().map_err(|error| format!("read {}: {error}", resolved.as_path().display()))?;
+    let size = file.metadata().map_err(|error| format!("stat {}: {error}", resolved.as_path().display()))?.len() as usize;
+    if size > ATTACH_CAP {
+        return Err(format!("file too large: {size} bytes > 2MB cap"));
+    }
+    let mut bytes = Vec::with_capacity(size);
+    file.by_ref()
+        .take((ATTACH_CAP + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", resolved.as_path().display()))?;
+    if bytes.len() > ATTACH_CAP {
+        return Err(format!("file too large: {} bytes > 2MB cap", bytes.len()));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(json!({ "kind": "text", "text": text })),
+        Err(error) => Ok(json!({
+            "kind": "base64",
+            "media_type": media_type_for(resolved.as_path()),
+            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, error.into_bytes()),
+        })),
+    }
+}

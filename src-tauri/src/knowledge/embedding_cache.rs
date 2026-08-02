@@ -4,6 +4,7 @@
 use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 条目上限：记忆量级几十到几百条 + query 向量，4096 留足余量又不让 JSON 无界增长。
@@ -23,10 +24,14 @@ pub struct EmbeddingCache {
 }
 
 impl EmbeddingCache {
-    /// 读盘失败（不存在/坏 JSON）按空缓存起步：缓存永远可以重建，不因此报错。
-    pub fn load(path: &Path) -> Self {
-        let map = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
-        Self { path: path.to_path_buf(), map }
+    /// 文件不存在时从空缓存起步；损坏或不可读时保留原文件并上抛，防止随后保存覆盖诊断证据。
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let map = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|error| format!("parse embedding cache {}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(format!("read embedding cache {}: {error}", path.display())),
+        };
+        Ok(Self { path: path.to_path_buf(), map })
     }
 
     pub fn len(&self) -> usize {
@@ -70,7 +75,26 @@ impl EmbeddingCache {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string(&self.map).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+        let bytes = serde_json::to_vec(&self.map).map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|error| format!("open embedding cache {}: {error}", tmp.display()))?;
+        file.write_all(&bytes).map_err(|error| format!("write embedding cache {}: {error}", tmp.display()))?;
+        file.sync_all().map_err(|error| format!("sync embedding cache {}: {error}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, &self.path).map_err(|error| {
+            std::fs::remove_file(&tmp).ok();
+            format!("replace embedding cache {}: {error}", self.path.display())
+        })?;
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync embedding cache parent {}: {error}", parent.display()))?;
+        }
+        Ok(())
     }
 }

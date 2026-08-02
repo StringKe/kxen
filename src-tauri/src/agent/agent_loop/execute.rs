@@ -1,13 +1,13 @@
 //! 工具执行入口与路由（goal 工具单独在 goal_tool.rs，task 工具在 task_tool.rs）。
 
 use crate::tools::exec::{ExecOutcome, ExecParams, exec};
-use crate::tools::fs_tool::{EditSpec, delete, edit, read, write};
+use crate::tools::fs_tool::{EditSpec, delete_resolved, edit_resolved, read_resolved, write_resolved};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 use super::context::AgentContext;
 use super::goal_tool::execute_goal_tool;
-use super::helpers::{parse_shell, resolve_path};
+use super::helpers::{parse_shell, resolve_authorized_path, resolve_path};
 use super::knowledge_tool::execute_knowledge_tool;
 use super::task_tool::execute_task_tool;
 
@@ -49,6 +49,8 @@ pub async fn execute_tool(name: &str, arguments: &str, ctx: &AgentContext) -> Re
 pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx: &'a AgentContext) -> Result<String, String> {
     match name {
         "exec" => {
+            let session_id = ctx.session_id.as_deref().ok_or("exec requires a session context")?;
+            let owner = crate::tools::task::TaskOwner::new(session_id, &ctx.workdir)?;
             let params = ExecParams {
                 shell_type: parse_shell(args.get("type").and_then(Value::as_str).unwrap_or("zsh"))?,
                 path: resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), ctx)?.to_string_lossy().into_owned(),
@@ -57,7 +59,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 background: args.get("background").and_then(Value::as_bool).unwrap_or(false),
             };
             let approval = approval_ctx(ctx);
-            match exec(params, &ctx.registry, cwd, approval.as_ref()).await {
+            match exec(params, &ctx.registry, cwd, &owner, approval.as_ref()).await {
                 Ok(ExecOutcome::Foreground { output, exit_code, truncated }) => {
                     Ok(format!("exit {exit_code}{}\n{output}", if truncated { " (truncated)" } else { "" }))
                 }
@@ -66,17 +68,17 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                         // 子代理上下文无通知路由：回执不得承诺通知（与工具描述对齐主会话口径）
                         return Ok(format!("backgrounded: {task_id} (poll task.output for completion; no notification in this context)"));
                     };
-                    crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &task_id, router);
+                    crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &owner, &task_id, router);
                     Ok(format!("backgrounded: {task_id} (notified on completion)"))
                 }
                 Err(e) => Err(e.to_string()),
             }
         }
         "read" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
+            let path = resolve_authorized_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
             let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
-            read(&path, &ctx.tracker, cwd, offset, limit)
+            read_resolved(&path, &ctx.tracker, cwd, offset, limit)
                 .map(|r| {
                     if r.total_lines == 0 || (r.start_line == 1 && !r.truncated) {
                         r.content
@@ -98,7 +100,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 .map_err(|e| e.to_string())
         }
         "edit" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
+            let path = resolve_authorized_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let spec = match args.get("mode").and_then(Value::as_str) {
                 Some("anchors") => EditSpec::Anchors {
                     edits: serde_json::from_value(args.get("edits").cloned().unwrap_or(json!([]))).map_err(|e| e.to_string())?,
@@ -109,22 +111,22 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                     expected_replacements: args.get("expected_replacements").and_then(Value::as_u64).map(|n| n as usize),
                 },
             };
-            edit(&path, &spec, &ctx.tracker, cwd)
+            edit_resolved(&path, &spec, &ctx.tracker, cwd)
                 .map(|r| format!("{}\n{}", r.diff_summary, r.diff))
                 .map_err(|e| e.to_string())
-                .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), &path))
+                .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), path.as_path()))
         }
         "write" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
+            let path = resolve_authorized_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
             let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-            write(&path, content, &ctx.tracker, cwd)
+            write_resolved(&path, content, &ctx.tracker, cwd)
                 .map(|_| format!("wrote {} bytes", content.len()))
                 .map_err(|e| e.to_string())
-                .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), &path))
+                .inspect(|_| crate::lsp::notify_change(ctx.lsp.as_ref(), path.as_path()))
         }
         "delete" => {
-            let path = resolve_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
-            delete(&path, &ctx.tracker, cwd).map(|_| "moved to Trash".to_string()).map_err(|e| e.to_string())
+            let path = resolve_authorized_path(args.get("path").and_then(Value::as_str).ok_or("missing path")?, ctx)?;
+            delete_resolved(&path, &ctx.tracker, cwd).map(|_| "moved to Trash".to_string()).map_err(|e| e.to_string())
         }
         "lsp" => {
             let mut safe_args = args.clone();
@@ -143,25 +145,31 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 let job = crate::core::schedule::add(cron, prompt, &session_id, once)?;
                 Ok(format!("scheduled {} (next fire at {})", job.id, job.next_fire))
             }
-            "list" => Ok(serde_json::to_string_pretty(&crate::core::schedule::list()).unwrap_or_default()),
+            "list" => serde_json::to_string_pretty(&crate::core::schedule::list()?).map_err(|error| error.to_string()),
             "remove" => {
                 let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
-                Ok(if crate::core::schedule::remove(id) { format!("removed {id}") } else { format!("not found: {id}") })
+                Ok(if crate::core::schedule::remove(id)? { format!("removed {id}") } else { format!("not found: {id}") })
             }
             other => Err(format!("unknown schedule action: {other}")),
         },
         "task" => execute_task_tool(args, ctx).await,
         "goal" => {
-            // complete 的逐条验证评审模型：优先 review 角色绑定（独立视角），未配置回落当前会话模型
-            let judge_model = match &ctx.mrm {
-                Some(mrm) => match mrm.resolve("review", &ctx.store).await {
-                    Some(r) => crate::llm::ModelRef { provider: r.provider, model: r.model, account: r.account },
-                    None => ctx.model.clone(),
-                },
-                None => ctx.model.clone(),
+            // complete 只使用通过 MRM 解析的 review 模型，admission 失败不得回落绕过治理。
+            let judge = match (args.get("action").and_then(Value::as_str), &ctx.mrm) {
+                (Some("complete"), Some(mrm)) => {
+                    let resolved =
+                        mrm.resolve("review", &ctx.store).await.ok_or("no MRM-admitted model available for completion verification")?;
+                    Some(super::goal_tool::GoalJudge {
+                        mrm,
+                        model: crate::llm::ModelRef { provider: resolved.provider, model: resolved.model, account: resolved.account },
+                        store: &ctx.store,
+                        cancel: ctx.cancel.as_ref(),
+                        auxiliary_usage: &ctx.auxiliary_usage,
+                    })
+                }
+                _ => None,
             };
-            let judge = super::goal_tool::GoalJudge { model: judge_model, store: &ctx.store };
-            execute_goal_tool(args, ctx.session_id.as_deref(), ctx.bus.as_ref(), Some(&judge)).await
+            execute_goal_tool(args, ctx.session_id.as_deref(), ctx.bus.as_ref(), judge.as_ref(), ctx.cancel.as_ref()).await
         }
         "glob" => {
             let base = resolve_path(args.get("path").and_then(Value::as_str).unwrap_or(cwd), ctx)?;
@@ -258,7 +266,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
         }
         "websearch" => {
             let query = args.get("query").and_then(Value::as_str).ok_or("missing query")?;
-            Ok(crate::tools::websearch::format_hits(&crate::tools::websearch::search(query, &ctx.store).await?))
+            super::websearch_tool::execute(query, ctx).await
         }
         "team" => {
             // team 全部动作 lead-only：teammate 调用一律权限错误（防自我复制与审批绕过）
@@ -313,10 +321,10 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 note = format!("\n[worktree: {} (branch {})]", info.path.display(), info.branch);
                 deps.workdir = Arc::from(info.path.as_path());
             }
-            let (_name, degraded, result) =
+            let result =
                 Box::pin(crate::agent::subagent::dispatch(&role, prompt, &deps, crate::agent::activity::AgentKind::Subagent)).await?;
-            let degraded_line = degraded.map(|d| format!("\n[{d}]")).unwrap_or_default();
-            Ok(format!("{result}{note}{degraded_line}"))
+            let degraded_line = result.degraded_note.map(|detail| format!("\n[{detail}]")).unwrap_or_default();
+            Ok(format!("{}{note}{degraded_line}", result.answer))
         }
         "worktree" => crate::tools::worktree::tool_dispatch(&ctx.workdir, args, approval_ctx(ctx).as_ref()).await,
         "workflow" => {

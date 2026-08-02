@@ -15,6 +15,10 @@ pub fn resolve_path(input: &str, ctx: &super::context::AgentContext) -> Result<s
     crate::tools::path_policy::resolve(input, &ctx.workdir, &ctx.path_grants).map(crate::tools::path_policy::ResolvedPath::into_path_buf)
 }
 
+pub fn resolve_authorized_path(input: &str, ctx: &super::context::AgentContext) -> Result<crate::tools::path_policy::ResolvedPath, String> {
+    crate::tools::path_policy::resolve(input, &ctx.workdir, &ctx.path_grants)
+}
+
 /// 工具调用一行摘要：按工具提取关键参数（exec=command、fs=path、glob/grep=pattern），
 /// 不落原始 JSON——UI 执行行只展示这一条（Claude Code `⏺ Bash(ls -la)` 同款形态）。
 pub fn summarize_args(name: &str, arguments: &str) -> String {

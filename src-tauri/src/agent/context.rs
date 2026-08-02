@@ -59,10 +59,13 @@ pub async fn build_context(items: &[ContextItem], workdir: &Path, allowed: Optio
 /// @ 引用的 workspace 边界守卫：canonicalize 后必须仍在 workdir 内（symlink 跳出拦截），
 /// 例外是 picked 授权清单内的绝对路径（原生对话框选择即授权），
 /// 两者都走与工具调用相同的统一路径策略，授权不豁免凭证和应用数据保护。
-fn guard_context_path(full: &Path, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> Result<PathBuf, String> {
+fn guard_context_path(
+    full: &Path,
+    workdir: &Path,
+    allowed: Option<&HashSet<PathBuf>>,
+) -> Result<crate::tools::path_policy::ResolvedPath, String> {
     let empty = HashSet::new();
     crate::tools::path_policy::resolve(&full.to_string_lossy(), workdir, allowed.unwrap_or(&empty))
-        .map(crate::tools::path_policy::ResolvedPath::into_path_buf)
 }
 
 fn file_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> (String, Option<String>) {
@@ -73,32 +76,48 @@ fn file_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) ->
         Ok(p) => p,
         Err(e) => return (format!("\n<file_content path=\"{rel}\">(blocked: {e})</file_content>\n"), Some(format!("{rel}（{e}）"))),
     };
-    match std::fs::read(&full) {
-        Err(e) => (format!("\n<file_content path=\"{rel}\">(read failed: {e})</file_content>\n"), Some(format!("{rel}（{e}）"))),
-        Ok(bytes) if bytes.len() > FILE_CAP => (
+    let mut file = match full.open() {
+        Ok(file) => file,
+        Err(e) => {
+            return (format!("\n<file_content path=\"{rel}\">(read failed: {e})</file_content>\n"), Some(format!("{rel}（{e}）")));
+        }
+    };
+    let size = match file.metadata() {
+        Ok(metadata) => metadata.len() as usize,
+        Err(e) => {
+            return (format!("\n<file_content path=\"{rel}\">(read failed: {e})</file_content>\n"), Some(format!("{rel}（{e}）")));
+        }
+    };
+    if size > FILE_CAP {
+        return (
             format!(
                 "\n<file_content path=\"{rel}\">(file too large: {} bytes > 64KB cap; use the read tool with anchors for specific sections)</file_content>\n",
+                size
+            ),
+            None,
+        );
+    }
+    let mut bytes = Vec::with_capacity(size);
+    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
+        return (format!("\n<file_content path=\"{rel}\">(read failed: {e})</file_content>\n"), Some(format!("{rel}（{e}）")));
+    }
+    if bytes.len() > FILE_CAP {
+        return (format!("\n<file_content path=\"{rel}\">(file grew beyond 64KB cap)</file_content>\n"), None);
+    }
+    if bytes.len() > OUTLINE_THRESHOLD {
+        let head = String::from_utf8_lossy(&bytes[..1024.min(bytes.len())]).into_owned();
+        return (
+            format!(
+                "\n<file_content path=\"{rel}\"># First 1KB of {rel} ({} bytes total; use the read tool with anchors for the rest)\n{head}</file_content>\n",
                 bytes.len()
             ),
             None,
-        ),
-        Ok(bytes) if bytes.len() > OUTLINE_THRESHOLD => {
-            let head = String::from_utf8_lossy(&bytes[..1024.min(bytes.len())]).into_owned();
-            (
-                format!(
-                    "\n<file_content path=\"{rel}\"># First 1KB of {rel} ({} bytes total; use the read tool with anchors for the rest)\n{head}</file_content>\n",
-                    bytes.len()
-                ),
-                None,
-            )
-        }
-        Ok(bytes) => {
-            if bytes.contains(&0) {
-                return (format!("\n<file_content path=\"{rel}\">(binary file, not shown)</file_content>\n"), None);
-            }
-            (format!("\n<file_content path=\"{rel}\">\n{}\n</file_content>\n", String::from_utf8_lossy(&bytes)), None)
-        }
+        );
     }
+    if bytes.contains(&0) {
+        return (format!("\n<file_content path=\"{rel}\">(binary file, not shown)</file_content>\n"), None);
+    }
+    (format!("\n<file_content path=\"{rel}\">\n{}\n</file_content>\n", String::from_utf8_lossy(&bytes)), None)
 }
 
 fn dir_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> (String, Option<String>) {
@@ -109,7 +128,7 @@ fn dir_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) -> 
         Ok(p) => p,
         Err(e) => return (format!("\n<dir_listing path=\"{rel}\">(blocked: {e})</dir_listing>\n"), Some(format!("{rel}（{e}）"))),
     };
-    let Ok(entries) = std::fs::read_dir(&full) else {
+    let Ok(entries) = full.read_dir() else {
         return (format!("\n<dir_listing path=\"{rel}\">(not a directory)</dir_listing>\n"), Some(format!("{rel}（不是目录或不存在）")));
     };
     let mut lines: Vec<String> = entries
@@ -201,7 +220,7 @@ mod tests {
         assert!(denied.unwrap_err().contains("escapes workspace"));
         // 清单内：放行（授权只越过边界检查，不豁免 safety 规则）
         let allowed: HashSet<PathBuf> = [canon.clone()].into_iter().collect();
-        assert_eq!(guard_context_path(&file, &work, Some(&allowed)).unwrap(), canon);
+        assert_eq!(guard_context_path(&file, &work, Some(&allowed)).unwrap().as_path(), canon);
 
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_dir_all(&outside).ok();

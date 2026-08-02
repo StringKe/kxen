@@ -8,6 +8,14 @@ const NOTE_BODY_CAP: usize = 500;
 const SKILL_DESC_CAP: usize = 250;
 
 pub fn render(workdir: &Path, involved: &[PathBuf]) -> Option<String> {
+    render_with_runtime(workdir, involved, None)
+}
+
+pub(crate) fn render_with_runtime(
+    workdir: &Path,
+    involved: &[PathBuf],
+    runtime: Option<&super::embedding::EmbeddingRuntime>,
+) -> Option<String> {
     let trusted = crate::core::trust::is_trusted(workdir);
     let mut entries: Vec<Entry> = scan(workdir).into_iter().filter(|e| e.enabled).collect();
     entries.extend(nearby_agents_md(workdir, involved));
@@ -62,7 +70,7 @@ pub fn render(workdir: &Path, involved: &[PathBuf]) -> Option<String> {
 
     // 动态检索：BM25 + 可选语义融合（retrieval 内做冲突降权、同 slug 去重与截断）；
     // involved 为空回落日期序 top 3（新沉淀仍可见）
-    let scored = super::retrieval::select_notes(&notes_entries, &involved_rel);
+    let scored = super::retrieval::select_notes_with_runtime(&notes_entries, &involved_rel, runtime);
     let mut notes = String::new();
     for e in &scored {
         let body: String = e.content.chars().take(NOTE_BODY_CAP).collect();
@@ -107,6 +115,10 @@ fn globs_hit(patterns: &[String], involved_rel: &[String]) -> bool {
 /// 多层就近：involved 文件向上目录链（到 workdir 止）里的 AGENTS.md，越近越优先。
 fn nearby_agents_md(workdir: &Path, involved: &[PathBuf]) -> Vec<Entry> {
     let mut out = Vec::new();
+    let Some(canonical_root) = workdir.canonicalize().ok() else {
+        return out;
+    };
+    let mut remaining = super::scan::MAX_TOTAL_BYTES;
     let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for file in involved {
         let Ok(rel) = file.strip_prefix(workdir) else { continue };
@@ -117,7 +129,7 @@ fn nearby_agents_md(workdir: &Path, involved: &[PathBuf]) -> Vec<Entry> {
             }
             if visited.insert(d.to_path_buf()) {
                 let candidate = workdir.join(d).join("AGENTS.md");
-                if let Ok(text) = std::fs::read_to_string(&candidate) {
+                if let Some(text) = super::scan::read_regular_utf8_within(&candidate, &canonical_root, &mut remaining) {
                     let mut e = super::parse::parse_entry(super::Scope::Project, Kind::Rule, &candidate, &text);
                     e.always_apply = true;
                     e.is_agents_md = true;
@@ -150,7 +162,7 @@ mod tests {
     fn rules_full_reference_index_globs_activation() {
         setup();
         let dir = std::env::temp_dir().join(format!("kxen-kn-render-{}", std::process::id()));
-        crate::core::trust::trust(&dir); // 测试夹具显式信任（生产默认未信任只索引）
+        crate::core::trust::trust(&dir).unwrap(); // 测试夹具显式信任（生产默认未信任只索引）
         let rules = dir.join(".agents/rules");
         std::fs::create_dir_all(&rules).unwrap();
         std::fs::write(rules.join("style.md"), "---\nalwaysApply: true\ndescription: 风格\n---\n用 trash。\n").unwrap();
@@ -176,7 +188,7 @@ mod tests {
     fn index_md_rendered_as_curated_entry() {
         setup();
         let dir = std::env::temp_dir().join(format!("kxen-kn-index-md-{}", std::process::id()));
-        crate::core::trust::trust(&dir);
+        crate::core::trust::trust(&dir).unwrap();
         std::fs::create_dir_all(dir.join(".agents/rules")).unwrap();
         std::fs::write(dir.join(".agents/index.md"), "---\ndescription: 总入口\n---\n先看 rules/index.md。\n").unwrap();
         std::fs::write(dir.join(".agents/rules/index.md"), "---\ndescription: rules 层入口\n---\n规则地图：style.md 讲风格。\n").unwrap();
@@ -224,7 +236,7 @@ mod tests {
     fn nearby_agents_md_injected() {
         setup();
         let dir = std::env::temp_dir().join(format!("kxen-kn-near-{}", std::process::id()));
-        crate::core::trust::trust(&dir);
+        crate::core::trust::trust(&dir).unwrap();
         let nested = dir.join("crates/web");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("AGENTS.md"), "web 层专属规范").unwrap();
@@ -232,6 +244,27 @@ mod tests {
         let rendered = render(&dir, &involved).unwrap();
         assert!(rendered.contains("web 层专属规范"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nearby_agents_md_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        setup();
+        let dir = std::env::temp_dir().join(format!("kxen-kn-near-link-{}", std::process::id()));
+        crate::core::trust::trust(&dir).unwrap();
+        let nested = dir.join("crates/web");
+        std::fs::create_dir_all(&nested).unwrap();
+        let outside = dir.parent().unwrap().join(format!("kxen-kn-secret-{}.txt", std::process::id()));
+        std::fs::write(&outside, "AWS_SECRET_ACCESS_KEY=secret").unwrap();
+        symlink(&outside, nested.join("AGENTS.md")).unwrap();
+
+        let involved = vec![dir.join("crates/web/src/app.ts")];
+        let rendered = render(&dir, &involved).unwrap_or_default();
+        assert!(!rendered.contains("AWS_SECRET_ACCESS_KEY"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&outside).ok();
     }
 
     #[test]

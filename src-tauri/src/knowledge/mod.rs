@@ -13,6 +13,7 @@ mod scan;
 mod store;
 
 pub use render::render;
+pub(crate) use render::render_with_runtime;
 pub use scan::scan;
 pub use store::{add, list, move_entry, remove, set_enabled};
 
@@ -135,7 +136,7 @@ fn default_true() -> bool {
 pub fn scope_root(scope: Scope, workdir: &Path) -> PathBuf {
     match scope {
         Scope::Project => workdir.join(".agents"),
-        Scope::Personal => dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".agents"),
+        Scope::Personal => dirs::home_dir().unwrap_or_else(|| PathBuf::from("/var/empty")).join(".agents"),
     }
 }
 
@@ -184,7 +185,7 @@ pub fn today() -> String {
 
 /// needs 解析：跨双 scope 按 slug 找条目并渲染成注入块（project 优先，与 scan 去重同序）。
 pub fn resolve_needs(workdir: &Path, needs: &[String]) -> String {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/var/empty"));
     resolve_needs_inner(workdir, &home, needs)
 }
 
@@ -236,7 +237,7 @@ mod tests {
     fn needs_resolve_injects_dep_bodies() {
         setup();
         let (dir, home) = needs_fixture("basic");
-        crate::core::trust::trust(&dir); // 生产语义：未信任项目 scope 的依赖跳过，夹具显式信任
+        crate::core::trust::trust(&dir).unwrap(); // 生产语义：未信任项目 scope 的依赖跳过，夹具显式信任
         let block = resolve_needs_inner(&dir, &home, &["style-guide".into(), "missing".into()]);
         assert!(block.contains("<knowledge-deps>"));
         assert!(block.contains("用 trash 不用 rm。"));

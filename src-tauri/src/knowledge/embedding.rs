@@ -7,7 +7,9 @@
 use super::embedding_cache::EmbeddingCache;
 use crate::auth::credential::{AuthStore, CredentialKind, credential_for};
 use crate::core::config::EmbeddingConfig;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+mod warm;
+pub use warm::EmbeddingRuntime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -17,6 +19,8 @@ pub enum Protocol {
 
 #[derive(Debug, Clone)]
 pub struct Endpoint {
+    pub provider: &'static str,
+    pub account: Option<String>,
     pub url: String,
     pub key: Option<String>,
     pub model: String,
@@ -34,6 +38,8 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
         "openai" => {
             let base = if custom_base.is_empty() { "https://api.openai.com/v1" } else { custom_base };
             Some(Endpoint {
+                provider: "openai",
+                account: crate::auth::credential::effective_account_name(store, "openai", None),
                 url: format!("{base}/embeddings"),
                 key: Some(api_key_of(store, "openai")?),
                 model: model_or(cfg, "text-embedding-3-small"),
@@ -44,6 +50,8 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
         "openrouter" => {
             let base = if custom_base.is_empty() { "https://openrouter.ai/api/v1" } else { custom_base };
             Some(Endpoint {
+                provider: "openrouter",
+                account: crate::auth::credential::effective_account_name(store, "openrouter", None),
                 url: format!("{base}/embeddings"),
                 key: Some(api_key_of(store, "openrouter")?),
                 // OpenRouter 的模型 id 带 provider 前缀
@@ -55,6 +63,8 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
         "ollama" => {
             let base = if custom_base.is_empty() { "http://localhost:11434" } else { custom_base };
             Some(Endpoint {
+                provider: "ollama",
+                account: None,
                 url: format!("{base}/api/embed"),
                 key: None,
                 model: model_or(cfg, "nomic-embed-text"),
@@ -70,11 +80,24 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
 /// 读盘装配：config 只读用户级（~/.config/kxen/config.toml）——与 llm client 读
 /// custom_providers 同路径；召回偏好跟人走，项目级 config 入 git 不放这个。
 pub fn resolve_endpoint() -> Option<Endpoint> {
-    let cfg = crate::core::config::Config::load(&crate::core::paths::config_dir().join("config.toml"), None).ok()?.embedding;
+    let config_path = crate::core::paths::config_dir().join("config.toml");
+    let cfg = match crate::core::config::Config::load(&config_path, None) {
+        Ok(config) => config.embedding,
+        Err(error) => {
+            tracing::error!(%error, path = %config_path.display(), "embedding config unavailable");
+            return None;
+        }
+    };
     if cfg.provider.is_empty() {
         return None;
     }
-    let store = crate::auth::credential::read_auth_file(&crate::core::paths::auth_file());
+    let store = match crate::auth::credential::read_auth_file(&crate::core::paths::auth_file()) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, "embedding credential store unavailable");
+            return None;
+        }
+    };
     resolve_endpoint_with(&cfg, &store)
 }
 
@@ -141,8 +164,19 @@ fn f32_array(v: &serde_json::Value) -> Option<Vec<f32>> {
 /// 检索侧语义分（同步、零网络）：只读磁盘缓存。返回 None = 本轮无语义（未配置或 query
 /// 向量未缓存）；Vec 内逐条 Option = 该条目是否有缓存向量。未命中的文本触发后台预热。
 pub fn recall(query: &str, docs: &[String]) -> Option<Vec<Option<f64>>> {
+    recall_with_runtime(query, docs, None)
+}
+
+pub(crate) fn recall_with_runtime(query: &str, docs: &[String], runtime: Option<&EmbeddingRuntime>) -> Option<Vec<Option<f64>>> {
     let ep = resolve_endpoint()?;
-    let mut cache = EmbeddingCache::load(&cache_path());
+    let cache_path = cache_path();
+    let mut cache = match EmbeddingCache::load(&cache_path) {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::error!(%error, "embedding cache unavailable; using BM25 only");
+            return None;
+        }
+    };
     let qvec = cache.get(&content_hash(query)).cloned();
     let mut missing: Vec<String> = Vec::new();
     if qvec.is_none() {
@@ -158,78 +192,14 @@ pub fn recall(query: &str, docs: &[String]) -> Option<Vec<Option<f64>>> {
             }
         }
     }
-    if !missing.is_empty() {
+    if !missing.is_empty()
+        && let Some(runtime) = runtime
+    {
         // 同文重复（同 slug 变体、query 与条目同文）只预热一次
         let mut seen = std::collections::HashSet::new();
         missing.retain(|t| seen.insert(t.clone()));
-        spawn_warm(ep, missing);
+        warm::spawn(ep, missing, runtime.clone());
     }
     qvec?;
     Some(out)
-}
-
-/// 后台预热：静态门防并发 stampede（一次最多一个预热任务）；无 tokio runtime
-/// （测试/同步上下文）直接跳过——预热是优化不是功能。
-fn spawn_warm(ep: Endpoint, texts: Vec<String>) {
-    static WARMING: AtomicBool = AtomicBool::new(false);
-    let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
-    if WARMING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    handle.spawn(async move {
-        if let Err(e) = warm(&ep, &texts).await {
-            log_failure_once(&e);
-        }
-        WARMING.store(false, Ordering::SeqCst);
-    });
-}
-
-/// 失败只记一次日志：render 每轮都跑，逐轮 warn 会刷屏；静默回落 BM25 是设计行为。
-fn log_failure_once(msg: &str) {
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if !LOGGED.swap(true, Ordering::SeqCst) {
-        tracing::warn!("embedding recall unavailable, fallback to BM25: {msg}");
-    }
-}
-
-async fn warm(ep: &Endpoint, texts: &[String]) -> Result<(), String> {
-    let mut cache = EmbeddingCache::load(&cache_path());
-    // 批量上限：记忆条目几十到几百通常一批就完，chunk 只防极端量级的单请求过大
-    for chunk in texts.chunks(96) {
-        let vecs = fetch_embeddings(ep, chunk).await?;
-        for (t, v) in chunk.iter().zip(vecs) {
-            cache.insert(content_hash(t), v);
-        }
-    }
-    cache.save()
-}
-
-async fn fetch_embeddings(ep: &Endpoint, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-    if ep.allow_loopback {
-        crate::tools::net_guard::check_url_allow_loopback(&ep.url).await?;
-    } else {
-        crate::tools::net_guard::check_url(&ep.url).await?;
-    }
-    let body = match ep.protocol {
-        Protocol::OpenAi => build_openai_request(&ep.model, texts),
-        Protocol::Ollama => build_ollama_request(&ep.model, texts),
-    };
-    let mut req = crate::llm::client::shared_http().post(&ep.url).json(&body).timeout(std::time::Duration::from_secs(30));
-    if let Some(k) = &ep.key {
-        req = req.bearer_auth(k);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("embedding http {}", resp.status()));
-    }
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    let vecs = match ep.protocol {
-        Protocol::OpenAi => parse_openai_response(&text),
-        Protocol::Ollama => parse_ollama_response(&text),
-    }
-    .ok_or_else(|| "embedding response parse failed".to_string())?;
-    if vecs.len() != texts.len() {
-        return Err(format!("embedding count mismatch: {} for {} texts", vecs.len(), texts.len()));
-    }
-    Ok(vecs)
 }

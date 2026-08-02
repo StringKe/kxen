@@ -56,6 +56,7 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"
 trash = "5"
+cap-std = "4.0.2"
 # browser 工具的 CDP 驱动（系统 Chrome headless）；default-features 只含 bytes（screencast 用），关掉求最小依赖树；
 # fetcher 特性不启用：只驱动本机已装 Chrome，不下载 Chromium
 chromiumoxide = { version = "0.9", default-features = false }

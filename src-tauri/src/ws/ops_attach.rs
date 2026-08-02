@@ -24,5 +24,5 @@ pub(super) fn fs_read_attachment(params: &Value, state: &crate::AppState) -> Res
     let runtime = state.runtime_for_session(session_id)?;
     let grants = state.picked_files.snapshot(session_id).unwrap_or_default();
     let resolved = kxen_app::tools::path_policy::resolve(path, runtime.root(), &grants)?;
-    kxen_app::core::attachment::read_attachment(resolved.as_path())
+    kxen_app::core::attachment::read_attachment_resolved(&resolved)
 }

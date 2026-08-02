@@ -194,6 +194,14 @@ pub fn conflict_losers(token_sets: &[HashSet<String>], dates: &[String], content
 /// notes/memory 的选择主入口：返回排序+去重+截断后的条目（render 直接渲染）。
 /// involved 为空：日期序 top 3（新沉淀仍可见）。
 pub fn select_notes<'a>(notes: &[&'a Entry], involved_rel: &[String]) -> Vec<&'a Entry> {
+    select_notes_with_runtime(notes, involved_rel, None)
+}
+
+pub(crate) fn select_notes_with_runtime<'a>(
+    notes: &[&'a Entry],
+    involved_rel: &[String],
+    runtime: Option<&super::embedding::EmbeddingRuntime>,
+) -> Vec<&'a Entry> {
     if involved_rel.is_empty() {
         let mut by_date: Vec<&Entry> = notes.to_vec();
         by_date.sort_by(|a, b| b.date.cmp(&a.date));
@@ -205,7 +213,7 @@ pub fn select_notes<'a>(notes: &[&'a Entry], involved_rel: &[String]) -> Vec<&'a
     let bm25_docs: Vec<Vec<String>> = notes.iter().map(|e| tokenize(&format!("{} {}", e.description, e.content))).collect();
     let bm25 = normalize(&bm25_scores(&query_terms, &bm25_docs));
     let sem_docs: Vec<String> = notes.iter().map(|e| super::embedding::doc_text(&e.description, &e.content)).collect();
-    let semantic = super::embedding::recall(&query, &sem_docs).map(|v| {
+    let semantic = super::embedding::recall_with_runtime(&query, &sem_docs, runtime).map(|v| {
         let present: Vec<f64> = v.iter().flatten().copied().collect();
         let norm = normalize(&present);
         let mut it = norm.into_iter();
