@@ -1,5 +1,5 @@
 //! goal 工具：目标生命周期管理（list/create/get/activate/pause/resume/cancel/complete）。
-//! 状态迁移成功后 publish GoalUpdate（此前只落盘不发布，Dock 面板对 /write-goal 主流程零刷新）。
+//! 状态迁移成功后 publish GoalUpdate。
 
 use serde_json::Value;
 

@@ -1,11 +1,12 @@
 // 仓库改动分段：git status 口径（含用户自己的未提交改动），与「会话改动」（本会话 agent 快照口径）并列。
-// 数据源 diff.status/diff.file RPC（src-tauri worktree.rs status/diff_file）——此前封装无消费方，本组件是唯一入口。
+// 数据源 diff.status/diff.file RPC（src-tauri worktree.rs status/diff_file），本组件是唯一消费入口。
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { GitBranch } from "lucide-solid";
 import { diffFile, diffStatus, type DiffStatusEntry } from "../lib/chat-ops";
 import { activeSessionId } from "../lib/state";
 import DockSection from "./DockSection";
 import Markdown from "./Markdown";
+import { errText } from "./err-text";
 
 const STATUS_STYLE: Record<string, { text: string; cls: string }> = {
   M: { text: "修改", cls: "text-[var(--warn)]" },
@@ -45,7 +46,7 @@ export default function DockRepoDiff() {
       return;
     }
     const text = await diffFile(activeSessionId(), path).catch(
-      (e: unknown) => `(加载失败：${e instanceof Error ? e.message : String(e)})`,
+      (e: unknown) => `(加载失败：${errText(e)})`,
     );
     setOpen({ path, text });
   };

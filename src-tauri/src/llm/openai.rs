@@ -1,6 +1,6 @@
 //! OpenAI/Codex provider（ChatGPT Plus/Pro 订阅：backend-api 端点 + account 头）。
 
-use crate::llm::sse::{SseFrame, SseParser};
+use crate::llm::sse::SseFrame;
 use crate::llm::tool::{ChunkFunction, ChunkToolCall};
 use crate::llm::types::{Delta, Message, Role};
 use futures::StreamExt;
@@ -182,16 +182,7 @@ impl OpenAiProvider {
 }
 
 fn stream_sse(resp: reqwest::Response) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
-    let mut parser = SseParser::new();
-    let stream = resp.bytes_stream();
-    let stream = stream.flat_map(move |chunk| {
-        let deltas: Vec<Delta> = match chunk {
-            Ok(bytes) => parser.feed(&bytes).into_iter().filter_map(delta_of).collect(),
-            Err(e) => vec![Delta::Error(format!("sse read: {e}"))],
-        };
-        futures::stream::iter(deltas)
-    });
-    Box::pin(stream.chain(futures::stream::once(async { Delta::Done })))
+    crate::llm::sse::stream_deltas(resp, delta_of)
 }
 
 fn delta_of(frame: SseFrame) -> Option<Delta> {

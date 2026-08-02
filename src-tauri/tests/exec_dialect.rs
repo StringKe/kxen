@@ -1,4 +1,4 @@
-//! validate_dialect 方言陷阱规则测试（350 行门禁：exec.rs 内放不下，同 agent_gates.rs 拆出模式）。
+//! validate_dialect 方言陷阱规则测试。
 //! 每条规则覆盖命中（拒绝 + 纠正文案）与误报（正确写法放行）。
 
 use kxen_app::tools::exec::validate_dialect;

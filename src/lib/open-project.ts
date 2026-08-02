@@ -20,7 +20,7 @@ export async function openProjectDir(): Promise<boolean> {
     await refreshSessions();
     return true;
   } catch (e) {
-    flashErr(`添加目录失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+    flashErr(`添加目录失败：${formatError(e)}`);
     return false;
   }
 }

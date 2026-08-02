@@ -1,4 +1,4 @@
-// safety 命令评估与路径守卫测试（从 eval.rs 拆出，350 行门禁）。
+// safety 命令评估与路径守卫测试。
 use kxen_app::tools::safety::{Verdict, evaluate_shell_command, guard_path};
 
 const CWD: &str = "/Users/test/project";

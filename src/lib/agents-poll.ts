@@ -1,4 +1,4 @@
-// agents 名单轮询（从 App.tsx 拆出：可见性降频逻辑独立可测）。
+// agents 名单轮询（可见性降频逻辑独立可测）。
 import { refreshAgents } from "./state";
 
 /** 3s 轮询 agents 名单：窗口隐藏时停表（后台白跑 RPC 无收益），回前台立即补一次。

@@ -2,6 +2,7 @@
 //! picker / 路由配置 / 状态栏的单一数据源：内存 -> 磁盘 -> 静态表；24h TTL 惰性后台刷新，
 //! 静默失败留旧缓存（models.dev 不可达不阻塞任何功能）。
 
+use crate::core::session::now_ms;
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 
@@ -38,10 +39,6 @@ pub struct ProviderCatalog {
 }
 
 static CACHE: OnceLock<Mutex<Option<Vec<ProviderCatalog>>>> = OnceLock::new();
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
 
 fn cache_file() -> std::path::PathBuf {
     crate::core::paths::data_dir().join("models-catalog.json")

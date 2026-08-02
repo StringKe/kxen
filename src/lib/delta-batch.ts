@@ -1,4 +1,4 @@
-// delta 批量上屏：50ms 窗口合并文本增量（Session.tsx 拆出，350 门禁）。
+// delta 批量上屏：50ms 窗口合并文本增量。
 // 每 delta 全量 setItems = 全量 markdown 重解析 + DOM 重建 = 滚动闪烁的根因之一。
 
 export function createDeltaBatcher(

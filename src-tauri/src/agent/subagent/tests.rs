@@ -96,7 +96,7 @@ fn role_exists_gate() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// P2-5 熔断豁免回归：连续手动 abort（含父级级联取消）不计入 provider 熔断统计；
+/// 熔断豁免回归：连续手动 abort（含父级级联取消）不计入 provider 熔断统计；
 /// 真实失败仍按阈值触发（豁免不松熔断口径）。
 #[tokio::test]
 async fn consecutive_aborts_do_not_trip_circuit() {

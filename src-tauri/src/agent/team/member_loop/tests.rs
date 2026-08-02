@@ -1,18 +1,10 @@
 use super::*;
 use crate::core::event::EventBus;
-use std::path::{Path, PathBuf};
+use crate::core::session::now_ms;
+use std::path::PathBuf;
 
 fn deps() -> super::super::types::SpawnDeps {
-    super::super::types::SpawnDeps {
-        registry: Arc::new(crate::tools::task::TaskRegistry::new()),
-        fallback_workdir: Arc::from(Path::new("/tmp")),
-        store: Arc::new(std::sync::Mutex::new(crate::auth::credential::AuthStore::default())),
-        mrm: Arc::new(std::sync::RwLock::new(Arc::new(crate::llm::mrm::ModelResourceManager::new(crate::core::config::Config::default())))),
-        runtimes: Arc::new(crate::workspace_runtime::WorkspaceRuntimeRegistry::default()),
-        extras: Arc::new(crate::agent::agent_loop::SessionExtrasRegistry::default()),
-        agents: Arc::new(crate::agent::activity::AgentRegistry::default()),
-        approvals: None,
-    }
+    super::super::types::test_deps()
 }
 
 fn state(tag: &str) -> (Arc<TeamState>, PathBuf) {

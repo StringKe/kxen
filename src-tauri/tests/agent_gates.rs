@@ -1,4 +1,4 @@
-// execute.rs 安全边界测试（350 行门禁放不下，同 safety_eval.rs 的拆出模式）。
+// execute.rs 安全边界测试。
 // 覆盖：team 工具 lead-only 门控（teammate 拒止）+ task start 复用 shell safety/approval 闸门。
 
 use kxen_app::agent::agent_loop::{AgentContext, dispatch_tool, execute_task_tool};
@@ -85,7 +85,7 @@ async fn project_knowledge_add_and_remove_need_approval_channel() {
     assert!(remove.contains("preview and approval"), "got: {remove}");
 }
 
-/// 只读分类（P2-04 并行执行白名单）：read/glob/grep/search 类可并行，写工具保持串行。
+/// 只读分类（并行执行白名单）：read/glob/grep/search 类可并行，写工具保持串行。
 #[test]
 fn read_only_classification() {
     use kxen_app::agent::agent_loop::is_read_only_builtin;

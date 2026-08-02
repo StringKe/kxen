@@ -2,6 +2,7 @@
 //! 每规则：读官方 CLI 凭证存储 -> 与现有 auth.json 条目比新鲜度（expires 大者优先）。
 
 use crate::auth::credential::{AuthStore, CredentialKind};
+use crate::core::shared::now_ms;
 
 mod sources;
 use sources::{parse_claude, probe_claude, probe_claude_file_only, probe_codex, probe_grok, probe_kimi};
@@ -65,10 +66,6 @@ fn probe_with_timeout(rule: &ProbeRule) -> Option<CredentialKind> {
 }
 
 const TEN_YEARS_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
 
 /// 荒诞远期 expires（单位 bug 产物）按已过期处理，让 store 在下轮探测自修复。
 fn poisoned(c: &CredentialKind) -> bool {

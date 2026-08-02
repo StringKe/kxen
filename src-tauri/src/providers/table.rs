@@ -1,4 +1,4 @@
-//! REGISTRY 前段条目（行数门禁从 mod.rs 拆出；拼接顺序即设置页展示顺序，mod.rs 后段续接）。
+//! REGISTRY 前段条目（拼接顺序即设置页展示顺序，mod.rs 后段续接）。
 
 use super::GL;
 use super::seeds;

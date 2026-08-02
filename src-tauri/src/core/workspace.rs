@@ -1,5 +1,6 @@
 //! workspace：多项目目录管理（最近列表持久化 + 当前切换）。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,10 +36,6 @@ pub fn touch(dir: &Path, path: &str) -> std::io::Result<()> {
 
 fn file(dir: &Path) -> PathBuf {
     dir.join("workspaces.json")
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 // ---------------- 工作看板（/workspaces 卡片数据源） ----------------

@@ -1,6 +1,6 @@
 //! 后台任务注册表（任务三件套的后端 + dev_server 健康检查）。
 
-use crate::core::shared::{SharedStr, lock};
+use crate::core::shared::{SharedStr, lock, now_ms};
 use crate::tools::shell::ShellKind;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -178,10 +178,6 @@ pub fn append_capped(output: &Arc<Mutex<String>>, truncated: &Arc<Mutex<bool>>, 
 
 fn serialize_shared<S: serde::Serializer>(value: &SharedStr, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(value)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 pub fn task_id() -> String {

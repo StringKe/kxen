@@ -4,7 +4,7 @@ import { ChevronDown } from "lucide-solid";
 import { setVoiceEngine, voiceEngines, type VoiceOverview } from "../../lib/voice";
 import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import { statusDot } from "../../lib/variants";
 
 const TONE: Record<string, "ok" | "warn" | "err" | "faint"> = {
@@ -34,7 +34,7 @@ export default function MicMenu(props: { onEngine: (id: string) => void }) {
       await setVoiceEngine(id, overview()?.fallback ?? []);
     } catch (e) {
       // 失败不调 onEngine：前端引擎态必须跟后端实际生效的一致；菜单留着让用户看清状态点
-      flashErr(`切换语音引擎失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`切换语音引擎失败：${errText(e)}`);
       return;
     }
     await reload();

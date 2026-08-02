@@ -2,6 +2,9 @@
 // 覆盖握手 + tools/list（SSE 响应形态）+ tools/call + resources/prompts 全链路，及 SSRF 拦截。
 // 守卫可测性设计：生产 connect 强制 net_guard；connect_bypassing_guard_for_test 专供本文件
 // 这类 127.0.0.1 mock 使用，守卫本身由 net_guard 单测与下面的 ssrf 用例覆盖。
+mod common;
+
+use common::json_rpc::{http_response, json_frame};
 use kxen_app::mcp::McpManager;
 use kxen_app::mcp::client::McpClient;
 use kxen_app::mcp::config::{RemoteConfig, RemoteKind, ServerConfig};
@@ -21,15 +24,6 @@ struct Seen {
 struct MockHttp {
     url: String,
     seen: Arc<Mutex<Seen>>,
-}
-
-fn http_response(status: &str, content_type: Option<&str>, extra: &str, body: &str) -> String {
-    let ct = content_type.map(|c| format!("content-type: {c}\r\n")).unwrap_or_default();
-    format!("HTTP/1.1 {status}\r\n{ct}content-length: {}\r\nconnection: close\r\n{extra}\r\n{}", body.len(), body)
-}
-
-fn json_frame(id: &Value, result: Value) -> String {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
 /// 按 JSON-RPC method 路由；initialize 走纯 JSON 并下发 session id，tools/list 故意走

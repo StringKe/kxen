@@ -9,7 +9,7 @@ import { createAction, createSeqGuard } from "../lib/async-guard";
 import { activeSessionId, agents, setActiveAgentFocus } from "../lib/state";
 
 /** 选中 agent 时的 PrimaryContent：状态头 + 全量转录 +（teammate 可对话输入）。
- *  由 RightColumn 的窄栏 FocusView 迁出 —— 转录是主内容，不再塞进右栏。 */
+ *  转录是主内容，独占主区呈现，不塞进右栏窄栏。 */
 export default function AgentFocusView(props: { name: string }) {
   const [entries, setEntries] = createSignal<TranscriptEntry[]>([]);
   const [loadFailed, setLoadFailed] = createSignal(false);

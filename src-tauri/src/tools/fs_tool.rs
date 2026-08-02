@@ -265,7 +265,7 @@ pub fn write(path: &Path, content: &str, tracker: &FileTracker, cwd: &str) -> Re
 }
 
 /// 覆盖备份：落到 <cwd>/.kxen/backups/ 并按 workspace 相对路径镜像（同名文件互不覆盖），
-/// 旧实现 <name>.kxen-bak 散在工作区根目录，无清理也未 gitignore。best-effort：失败不阻断写。
+/// 散放的 <name>.kxen-bak 会污染工作区根目录且无清理。best-effort：失败不阻断写。
 fn backup(path: &Path, cwd: &str) {
     let root = Path::new(cwd);
     let fallback = Path::new(path.file_name().unwrap_or_default());

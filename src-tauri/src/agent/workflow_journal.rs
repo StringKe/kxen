@@ -71,7 +71,7 @@ impl Journal {
         Some(Self { ns, done, file })
     }
 
-    /// 宿主命名空间版 open（P2：workflow run_id 完全由模型参数决定的修复）：模型传入的
+    /// 宿主命名空间版 open：模型传入的
     /// run_id 只作当前会话内的 resume 令牌，真实 journal id = sha256(session, run_id)——
     /// 跨会话/历史同 run_id 不再命中旧 journal 跳过真实派发；同会话同脚本重跑仍可断点续跑。
     pub fn open_scoped(session_id: Option<&str>, run_id: &str, script: &str) -> Option<Self> {

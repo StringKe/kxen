@@ -45,7 +45,5 @@ async function closeCurrent(): Promise<void> {
   // 失败只提示不动状态：会话其实还在，activeSessionId 保持原样是对的
   await deleteSession(id)
     .then(() => flashOk(`已删除「${current?.title ?? id}」，可在系统废纸篓恢复`))
-    .catch((e: unknown) =>
-      flashErr(`删除会话失败：${formatError(e instanceof Error ? e.message : String(e))}`),
-    );
+    .catch((e: unknown) => flashErr(`删除会话失败：${formatError(e)}`));
 }

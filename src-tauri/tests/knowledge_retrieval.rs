@@ -1,4 +1,4 @@
-//! 记忆检索（P2-09）集成测试：BM25 排序 / CJK bigram / 融合排序 / cosine /
+//! 记忆检索集成测试：BM25 排序 / CJK bigram / 融合排序 / cosine /
 //! 向量缓存往返与 LRU / 冲突降权 / 无配置零网络 / 请求构造与响应解析纯函数。
 
 use kxen_app::auth::credential::{AuthStore, CredentialKind};

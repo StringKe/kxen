@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::member_loop::now_ms;
+use crate::core::session::now_ms;
 
 #[derive(Debug, Deserialize)]
 struct InboxEntry {

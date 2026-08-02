@@ -1,4 +1,4 @@
-// 会话级模型（P1-02）：切换写 session metadata；全局默认走设置页 config.set_role，保持原路径。
+// 会话级模型：切换写 session metadata；全局默认走设置页 config.set_role，保持原路径。
 import { createEffect, createSignal } from "solid-js";
 import { client } from "./client";
 import { currentModel } from "./chat";

@@ -15,6 +15,7 @@ import { newSession } from "../lib/state";
 import { createAction } from "../lib/async-guard";
 import { flashErr, flashOk } from "../lib/flash";
 import EmptyLine from "./EmptyLine";
+import { errText } from "./err-text";
 
 interface Row extends WorktreeInfo {
   dirty: number;
@@ -77,7 +78,7 @@ export default function DockWorktree() {
     try {
       r = await worktreeCreate(n);
     } catch (e) {
-      flashErr(`创建失败：${e instanceof Error ? e.message : String(e)}`);
+      flashErr(`创建失败：${errText(e)}`);
       return;
     }
     if (enter) {
@@ -85,7 +86,7 @@ export default function DockWorktree() {
       try {
         await workspaceSwitch(r.path);
       } catch (e) {
-        flashErr(`已创建 ${r.branch}，但切换失败：${e instanceof Error ? e.message : String(e)}`);
+        flashErr(`已创建 ${r.branch}，但切换失败：${errText(e)}`);
         await reload();
         return;
       }

@@ -162,7 +162,7 @@ export function rewindPendingInfo(): RewindPendingInfo | null {
   return pendingInfo();
 }
 
-/** Session 页接线（350 门禁拆出）：信号 + 确认流 + 错误尾注一次给齐。 */
+/** Session 页接线：信号 + 确认流 + 错误尾注一次给齐。 */
 export function createSessionRewind(deps: {
   sessionId: () => string;
   onDone: () => void;

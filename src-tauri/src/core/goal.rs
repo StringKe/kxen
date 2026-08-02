@@ -1,5 +1,6 @@
 //! Goal 生命周期：状态机 + 预算 + 阻塞三次规则 + 持久化。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +278,7 @@ impl Goal {
     }
 
     /// session 粒度焦点：同 session 的活态 goal 优先，其次无归属的全局 goal。
-    /// 修复全局单例误伤：多会话并发时各推各的计数器（goal.rs:205 旧实现全局唯一）。
+    /// 多会话并发时各推各的计数器，全局单例会互相误伤。
     pub fn focus_for(dir: &std::path::Path, session_id: Option<&str>) -> Option<Self> {
         let live = |g: &Self| matches!(g.status, GoalStatus::Active | GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::BudgetLimited);
         let goals = Self::list(dir);
@@ -333,11 +334,7 @@ pub fn evidence_sufficient(evidence: &str) -> bool {
     !core.is_empty() && !PLACEHOLDERS.contains(&core.as_str())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
-/// 全局 goal 跨会话并发记账（P1-1）与 goal RPC/工具写路径（P2-2）共用的 per-id 进程内锁：
+/// 全局 goal 跨会话并发记账与 goal RPC/工具写路径共用的 per-id 进程内锁：
 /// 「重读 + 修改 + save」串行化（map 常驻不清理：goal 数量级有限，清理引入新竞态）。
 pub fn write_lock(id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
     static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =

@@ -19,7 +19,7 @@ export function appendRawItem(prev: Item[], field: "content" | "reasoning", text
   return [...prev, msg];
 }
 
-// tool/approval/phase 事件统一上屏；从 Session.tsx 拆出（350 行门禁收口），行为与原闭包一致
+// tool/approval/phase 事件统一上屏（Session 页与测试共用）
 export function applyStreamEvent(
   event: ToolEvent,
   deps: { setItems: Setter<Item[]>; setOrbPhase: Setter<OrbState>; scroll: () => void },
@@ -52,7 +52,7 @@ export function applyStreamEvent(
     if (event.approvalId)
       applyApprovalResolved(deps.setItems, event.approvalId, event.outcome ?? "cancelled");
   } else if (event.kind === "compacted") {
-    // auto-compact 现场卡：让用户看见上下文被压缩（此前静默发生，只有 ctx 条间接反映）
+    // auto-compact 现场卡：让用户看见上下文被压缩
     deps.setItems((prev) => [...prev, { kind: "compacted", summary: event.summary ?? "" }]);
   } else {
     // workflow phase：带 index/total 的渲染结构化进度条；同 workflow 连续 phase 就地更新（推进不刷屏）。

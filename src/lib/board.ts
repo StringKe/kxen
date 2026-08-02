@@ -1,4 +1,4 @@
-// 工作看板纯逻辑（Workspaces.tsx 拆出，可单测）：卡片排序 + goal 状态展示元数据。
+// 工作看板纯逻辑（可单测）：卡片排序 + goal 状态展示元数据。
 import type { WorkspaceOverview } from "./chat-ops";
 
 /** 活跃优先：运行中 > 有排队 > 其余按最近活动倒序（看板让人先看到有活的列）。 */

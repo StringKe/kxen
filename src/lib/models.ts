@@ -29,12 +29,6 @@ export async function modelsCatalog(force = false): Promise<ProviderCatalog[]> {
   return cache;
 }
 
-export async function refreshCatalog(): Promise<ProviderCatalog[]> {
-  await client.rpc("models.refresh").catch(() => {}); // 后台刷新失败无碍：下一行 catalog 仍会返回（可能稍旧）
-  cache = null;
-  return modelsCatalog(true);
-}
-
 export function modelOf(
   cat: ProviderCatalog[],
   provider: string,

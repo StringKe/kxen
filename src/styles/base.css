@@ -1,0 +1,334 @@
+/* macOS 橡皮筋滚动（overscroll 拖整页）全局关闭 */
+html,
+body {
+  overscroll-behavior: none;
+}
+
+/* 桌面应用选择规则：全局禁选，仅内容区（.selectable）与输入控件显式可选（webkit 需 -webkit- 前缀） */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+[contenteditable="true"],
+[contenteditable="true"] *,
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* 内容区内的控件（代码块复制按钮等）仍禁选 */
+.selectable button {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ============ 主题 tokens：暗色为默认，[data-theme="light"] 覆盖 ============ */
+:root,
+[data-theme="dark"] {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur-press: 160ms;
+  --dur-fade: 150ms;
+
+  --bg: #15171c;
+  --bg-raised: #1b1e25;
+  --bg-overlay: #232732;
+  --border: #2d323d;
+  --text: #e4e7ed;
+  --text-dim: #9aa3b2;
+  --text-faint: #646d7c;
+  --accent: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-contrast: #ffffff;
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --err: #fb7185;
+  --code-bg: #0d1117;
+  --radius: 8px;
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --bg: #f6f7f9;
+  --bg-raised: #ffffff;
+  --bg-overlay: #eceef2;
+  --border: #dde1e7;
+  --text: #1c2330;
+  --text-dim: #5a6472;
+  --text-faint: #98a1ad;
+  --accent: #5850ec;
+  --accent-hover: #4f46e5;
+  --accent-contrast: #ffffff;
+  --ok: #059669;
+  --warn: #d97706;
+  --err: #e11d48;
+  --code-bg: #f6f8fa;
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font:
+    14px/1.6 system-ui,
+    -apple-system,
+    sans-serif;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 主题切换：:where 零优先级（不压 .pressable 的 transform transition），全局颜色丝滑过渡 */
+:where(body, body *) {
+  transition-property: background-color, border-color, color;
+  transition-duration: var(--dur-fade);
+  transition-timing-function: var(--ease-out);
+}
+
+/* composer 弹窗：从触发器长出的 origin-aware 入场（150ms 强 ease-out）。
+   阴影单点定义：克制（VS Code/Cursor 挂件量级），重阴影只留给模态层（CommandPalette）。 */
+.composer-popup {
+  transform-origin: bottom center;
+  animation: popup-in 150ms var(--ease-out);
+  box-shadow:
+    0 6px 20px rgb(0 0 0 / 0.16),
+    0 1px 4px rgb(0 0 0 / 0.1);
+}
+@keyframes popup-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .composer-popup {
+    animation: none;
+  }
+}
+
+/* 弹窗分区标题（命令 / skills 分组） */
+.popup-section {
+  padding: 0.3em 0.75em 0.2em;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+/* 空态入场：首访层级允许 stagger（40ms 间隔，ease-out，GPU 属性） */
+.empty-hero {
+  animation: empty-in 300ms var(--ease-out) backwards;
+}
+.empty-card {
+  animation: empty-in 260ms var(--ease-out) backwards;
+}
+@keyframes empty-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .empty-hero,
+  .empty-card {
+    animation: none;
+  }
+}
+
+/* ============ 右 dock 抽屉（负 margin 出流 + 位移深度 + 透明度，280ms ease-out） ============ */
+/* 宽度走 --dock-w（内联写入，支持拖拽调宽）；relative 给左缘拖拽把手定位 */
+.dock-wrap {
+  position: relative;
+  width: var(--dock-w, 16rem);
+  flex-shrink: 0;
+  margin-right: 0;
+  opacity: 1;
+  transition:
+    margin-right 280ms var(--ease-out),
+    opacity 200ms var(--ease-out);
+}
+.dock-wrap > aside {
+  transform: translateX(0);
+  transition: transform 280ms var(--ease-out);
+}
+.dock-wrap.dock-hidden {
+  margin-right: calc(-1 * var(--dock-w, 16rem));
+  opacity: 0;
+  pointer-events: none;
+}
+.dock-wrap.dock-hidden > aside {
+  transform: translateX(24px);
+}
+
+/* ============ 沉浸式顶部栏（macOS Overlay 标题栏：内容延伸，红绿灯悬浮） ============ */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+[data-tauri-drag-region] button,
+[data-tauri-drag-region] select,
+[data-tauri-drag-region] a,
+[data-tauri-drag-region] input,
+[data-tauri-drag-region] textarea {
+  -webkit-app-region: no-drag;
+}
+/* 红绿灯占位（左侧约 78px 宽区） */
+.traffic-pad {
+  height: 38px;
+  flex-shrink: 0;
+}
+
+/* ============ 主题切换 View Transition（圆形展开；不支持 VT 的 WKWebView 回退瞬时） ============ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+  z-index: 1;
+}
+::view-transition-new(root) {
+  z-index: 2147483646;
+}
+/* reduced-motion：去掉展开位移，保留瞬时切换 */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    display: none;
+  }
+}
+
+/* ============ 按压反馈（pointer-down 即时；subtle 0.97/160ms） ============ */
+.pressable {
+  transition: transform var(--dur-press) var(--ease-out);
+}
+.pressable:active {
+  transform: scale(0.97);
+}
+
+/* ============ 半透明浮动层 ============ */
+.material {
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+}
+
+/* ============ 滚动条 ============ */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+}
+
+/* ============ 链接/代码等基础排版 ============ */
+a {
+  color: var(--accent-hover);
+}
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.92em;
+}
+
+/* ============ reduced motion：保留透明度反馈，去掉位移 ============ */
+@media (prefers-reduced-motion: reduce) {
+  .pressable {
+    transition: none;
+  }
+  .pressable:active {
+    transform: none;
+  }
+  /* dock 抽屉降级：保留透明度，去掉位移 */
+  .dock-wrap,
+  .dock-wrap > aside {
+    transition: opacity 200ms ease;
+    transform: none !important;
+  }
+}
+
+/* ctx 占用进度条（状态栏，阈值变色） */
+.ctx-bar {
+  display: inline-block;
+  width: 44px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-overlay);
+  overflow: hidden;
+}
+.ctx-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition:
+    width var(--dur-fade) var(--ease-out),
+    background-color var(--dur-fade) var(--ease-out);
+}
+.ctx-bar-fill.ctx-warn {
+  background: var(--warn);
+}
+.ctx-bar-fill.ctx-err {
+  background: var(--err);
+}
+
+/* 尺寸 tokens（禁用任意值：全库统一引用这些工具类） */
+.text-2xs {
+  font-size: 0.625rem;
+  line-height: 1.4;
+}
+.popup-detail {
+  max-width: 40%;
+}
+
+/* 设置页表单控件与列表卡片（语义化样式，不用任意值） */
+.form-select {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.375rem;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.form-mono {
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.list-card {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+.list-card > * + * {
+  border-top: 1px solid var(--border);
+}
+.overline {
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: 0.375rem;
+}

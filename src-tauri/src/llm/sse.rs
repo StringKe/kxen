@@ -46,6 +46,24 @@ impl SseParser {
     }
 }
 
+/// 各 provider 共用的流式管线：字节流 -> SSE 帧 -> 逐帧映射为 Delta，末尾补 Done。
+/// `map` 是 provider 自己的帧投影（可有状态，如 Anthropic 的 usage 合并）。
+pub fn stream_deltas(
+    resp: reqwest::Response,
+    mut map: impl FnMut(SseFrame) -> Option<crate::llm::types::Delta> + Send + 'static,
+) -> std::pin::Pin<Box<dyn futures::Stream<Item = crate::llm::types::Delta> + Send>> {
+    use futures::StreamExt;
+    let mut parser = SseParser::new();
+    let stream = resp.bytes_stream().flat_map(move |chunk| {
+        let deltas: Vec<crate::llm::types::Delta> = match chunk {
+            Ok(bytes) => parser.feed(&bytes).into_iter().filter_map(&mut map).collect(),
+            Err(e) => vec![crate::llm::types::Delta::Error(format!("sse read: {e}"))],
+        };
+        futures::stream::iter(deltas)
+    });
+    Box::pin(stream.chain(futures::stream::once(async { crate::llm::types::Delta::Done })))
+}
+
 fn parse_line(line: &str) -> Option<SseFrame> {
     if line.is_empty() || line.starts_with(':') {
         return None; // 空行分隔 / 心跳注释

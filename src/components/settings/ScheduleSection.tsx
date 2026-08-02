@@ -3,7 +3,7 @@ import { createSignal, For, onMount, Show } from "solid-js";
 import { Pause, Play, Plus, Trash2 } from "lucide-solid";
 import { relTime } from "../../lib/time";
 import { flashErr, flashOk } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import {
   scheduleList,
   scheduleAdd,
@@ -12,8 +12,6 @@ import {
   type ScheduleJob,
 } from "../../lib/schedule";
 import { activeSessionId } from "../../lib/state";
-
-const errText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
 
 export default function ScheduleSection() {
   const [jobs, setJobs] = createSignal<ScheduleJob[]>([]);

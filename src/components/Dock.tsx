@@ -16,7 +16,7 @@ import { client } from "../lib/client";
 import { createAction } from "../lib/async-guard";
 import { activeSessionId } from "../lib/state";
 import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 import Markdown from "./Markdown";
 import DockWorktree from "./DockWorktree";
 import DockGoal from "./DockGoal";
@@ -63,15 +63,11 @@ function DockSections(props: {
   const restartTask = (id: string) =>
     void taskRestart(id)
       .then(reloadTasks)
-      .catch((e: unknown) =>
-        flashErr(`重启任务失败：${formatError(e instanceof Error ? e.message : String(e))}`),
-      );
+      .catch((e: unknown) => flashErr(`重启任务失败：${errText(e)}`));
   const killTask = (id: string) =>
     void taskKill(id)
       .then(reloadTasks)
-      .catch((e: unknown) =>
-        flashErr(`终止任务失败：${formatError(e instanceof Error ? e.message : String(e))}`),
-      );
+      .catch((e: unknown) => flashErr(`终止任务失败：${errText(e)}`));
   return (
     <>
       <DockGoal goal={props.goal} act={props.act} acting={props.acting} />

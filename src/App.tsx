@@ -6,6 +6,8 @@ import CommandPalette from "./components/CommandPalette";
 import ContextMenu from "./components/ContextMenu";
 import FlashHost from "./components/FlashHost";
 import { flashErr } from "./lib/flash";
+import { writeClipboard } from "./lib/clipboard";
+import { errText } from "./components/err-text";
 import AgentFocusView from "./components/AgentFocusView";
 import Session from "./pages/Session";
 import Settings from "./pages/Settings";
@@ -37,7 +39,7 @@ import { useLocation, useNavigate } from "@solidjs/router";
 import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 
 function Home() {
-  // agents 名单同时驱动 AgentRunCards 与 RightColumn，轮询上提到共同父级（原先 RightColumn 独占）
+  // agents 名单同时驱动 AgentRunCards 与 RightColumn，轮询放共同父级
   onMount(async () => {
     await refreshAgents();
   });
@@ -122,8 +124,6 @@ function Layout(props: { children?: import("solid-js").JSX.Element }) {
   );
 }
 
-const clipErr = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
 /** input/textarea 编辑命令：clipboard + Selection/Range API（execCommand 已废弃）。 */
 function textFieldMenuItems(field: HTMLInputElement | HTMLTextAreaElement) {
   // 菜单动作执行时焦点/选区已落到菜单上：目标与选区必须在打开时捕获
@@ -140,24 +140,22 @@ function textFieldMenuItems(field: HTMLInputElement | HTMLTextAreaElement) {
     field.setRangeText(text, start, end, "end");
     field.dispatchEvent(new Event("input", { bubbles: true }));
   };
-  const writeClip = (text: string) =>
-    navigator.clipboard.writeText(text).catch((e) => flashErr(`写入剪贴板失败：${clipErr(e)}`));
   return [
     {
       label: "剪切",
       action: () => {
         replaceSelection("");
-        void writeClip(selected);
+        writeClipboard(selected);
       },
     },
-    { label: "复制", action: () => void writeClip(selected) },
+    { label: "复制", action: () => writeClipboard(selected) },
     {
       label: "粘贴",
       action: () =>
         void navigator.clipboard
           .readText()
           .then(replaceSelection)
-          .catch((e) => flashErr(`读取剪贴板失败：${clipErr(e)}`)),
+          .catch((e) => flashErr(`读取剪贴板失败：${errText(e)}`)),
     },
     {
       label: "全选",
@@ -189,7 +187,7 @@ function onGlobalContextMenu(e: MouseEvent) {
           void navigator.clipboard
             .readText()
             .then((t) => document.execCommand("insertText", false, t))
-            .catch((e) => flashErr(`读取剪贴板失败：${clipErr(e)}`)),
+            .catch((e) => flashErr(`读取剪贴板失败：${errText(e)}`)),
       },
       { label: "全选", action: () => document.execCommand("selectAll") },
     ]);
@@ -205,10 +203,7 @@ function onGlobalContextMenu(e: MouseEvent) {
     openMenu(e, [
       {
         label: "复制",
-        action: () =>
-          void navigator.clipboard
-            .writeText(text)
-            .catch((e) => flashErr(`写入剪贴板失败：${clipErr(e)}`)),
+        action: () => writeClipboard(text),
       },
     ]);
     return;

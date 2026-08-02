@@ -3,7 +3,7 @@ import { createSignal, onMount, Show } from "solid-js";
 import { ChevronDown, ChevronRight } from "lucide-solid";
 import { codingRulesGet, codingRulesSet, type CodingRulesInfo } from "../../lib/knowledge";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 
 export default function CodingRulesBlock() {
   const [codingRules, setCodingRules] = createSignal<CodingRulesInfo | null>(null);
@@ -20,7 +20,7 @@ export default function CodingRulesBlock() {
     try {
       await codingRulesSet(!cur.enabled);
     } catch (e) {
-      flashErr(`内置规则启停失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`内置规则启停失败：${errText(e)}`);
       return;
     }
     setCodingRules({ ...cur, enabled: !cur.enabled });

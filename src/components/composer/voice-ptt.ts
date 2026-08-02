@@ -2,6 +2,7 @@
 // 松开提交；startSession 可注入（测试替身），默认走 RPC 引擎。
 import { COMPOSER_INTERRUPT_EVENT } from "../../lib/composer-bus";
 import { startVoiceSession, type VoiceSession } from "../../lib/voice";
+import { errText } from "../err-text";
 
 export interface VoiceController {
   toggle: () => void;
@@ -110,14 +111,14 @@ export function createVoicePtt(opts: {
       if (cancelled) {
         // 启动落定前已被取消（启动中 toggle/send/切会话）：自停；
         // 停失败必须上报——引擎停不掉会一直占麦
-        s.stop().catch((e) => reportError(e instanceof Error ? e.message : String(e)));
+        s.stop().catch((e) => reportError(errText(e)));
         return;
       }
       session = s;
       opts.setRecording(true);
       opts.onStarted?.(s.engine);
     } catch (e) {
-      reportError(e instanceof Error ? e.message : String(e));
+      reportError(errText(e));
       // 失败复位：PTT 不留激活态（继续按住只剩普通空格键，keyup 自然结束）；
       // 激活计时一并清——repeat 分支靠 pttTimer 判激活期，留着会把继续按住的 repeat 空格全吞掉
       pttActive = false;
@@ -147,7 +148,7 @@ export function createVoicePtt(opts: {
     partialLen = 0;
     if (!s) return;
     const finalText = await s.stop().catch((e) => {
-      reportError(e instanceof Error ? e.message : String(e));
+      reportError(errText(e));
       return null;
     });
     // discard（切会话）：终稿属旧会话，落进当前输入框就是串台
@@ -179,7 +180,7 @@ export function createVoicePtt(opts: {
   return {
     toggle: () => {
       // starting 也算「已触发」：启动中再按 = 取消
-      // （旧实现只查 session，取消被 start 守卫吞掉，权限弹窗最长 60s 不可取消）
+      // （只查 session 会把取消吞掉，权限弹窗期间不可取消）
       if (session || starting) void stop();
       else launch();
     },

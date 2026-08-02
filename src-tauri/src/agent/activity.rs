@@ -1,5 +1,6 @@
 //! 代理活动注册表：teammate / subagent / workflow 三类子代理的统一视图。
 
+use crate::core::session::now_ms;
 use crate::llm::ModelRef;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -215,10 +216,6 @@ impl AgentRegistry {
             }
         }
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

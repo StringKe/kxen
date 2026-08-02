@@ -107,7 +107,6 @@ pub(super) async fn teammate_loop(
             IdleWake::Cancel => break,
             IdleWake::Nudge => history.push(Message::user(CLAIM_NUDGE)),
             IdleWake::Inbox(inbox) => {
-                // 审批结果修改 approved 状态
                 if inbox_has_plan_approval(&inbox) {
                     approved = true;
                 }
@@ -260,10 +259,6 @@ fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) {
         MemberStatus::Shutdown => "shutdown",
     };
     state.bus.publish(crate::core::event::Event::TaskUpdate { id: format!("team/{name}"), status: label });
-}
-
-pub(super) fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -74,6 +74,21 @@ pub struct SpawnDeps {
     pub approvals: Option<Arc<crate::agent::approval::ApprovalBroker>>,
 }
 
+/// 各测试模块共用的 SpawnDeps fixture（4 处调用点：mod/tasks/member_wake/member_loop tests）。
+#[cfg(test)]
+pub(crate) fn test_deps() -> SpawnDeps {
+    SpawnDeps {
+        registry: Arc::new(crate::tools::task::TaskRegistry::new()),
+        fallback_workdir: Arc::from(Path::new("/tmp")),
+        store: Arc::new(std::sync::Mutex::new(crate::auth::credential::AuthStore::default())),
+        mrm: Arc::new(std::sync::RwLock::new(Arc::new(ModelResourceManager::new(crate::core::config::Config::default())))),
+        runtimes: Arc::new(crate::workspace_runtime::WorkspaceRuntimeRegistry::default()),
+        extras: Arc::new(crate::agent::agent_loop::SessionExtrasRegistry::default()),
+        agents: Arc::new(crate::agent::activity::AgentRegistry::default()),
+        approvals: None,
+    }
+}
+
 pub(crate) struct TeamState {
     pub(crate) session_id: String,
     pub(crate) dir: PathBuf,

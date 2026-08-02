@@ -1,5 +1,5 @@
 // user 时间线条目：右对齐 accent 气泡（可选中）+ 图片附件 + 悬浮操作（fork / 编辑重发）。
-// 编辑框在本组件：MessageActions 铅笔与右键「编辑并重发」同一入口（旧右键跳过编辑框直接原文重发，两处行为分叉）。
+// 编辑框在本组件：MessageActions 铅笔与右键「编辑并重发」同一入口，两处行为一致。
 import { createSignal, For, Show } from "solid-js";
 import MessageActions from "./MessageActions";
 import { openMenu } from "../lib/context-menu";

@@ -11,7 +11,7 @@ import {
 } from "../lib/state";
 import { agentsDismiss, agentsStop } from "../lib/team";
 import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 
 /** running 态（可停止）：working/idle。awaiting_plan_approval 在等人动作，不算可停。 */
 export function isAgentRunning(status: string): boolean {
@@ -50,7 +50,7 @@ export function useAgentRunActions() {
       // 停的是当前选中卡才切回 main：停后台 run 不得抢走用户正在看的窗格
       if (activeAgentFocus() === name) setActiveAgentFocus("main");
     } catch (e) {
-      flashErr(`停止 ${name} 失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`停止 ${name} 失败：${errText(e)}`);
       setStopping("");
     }
   };
@@ -69,7 +69,7 @@ export function useAgentRunActions() {
       // 立即收敛名单，不等 3s 轮询
       await refreshAgents();
     } catch (e) {
-      flashErr(`关闭 ${name} 失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`关闭 ${name} 失败：${errText(e)}`);
     }
   };
 

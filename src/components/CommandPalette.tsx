@@ -7,7 +7,7 @@ import { activeSessionId, navigate, newSession, sessions, switchSession } from "
 import { sessionSetModel } from "../lib/session-model";
 import { insertComposerText, interruptComposer } from "../lib/composer-bus";
 import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 import { createExclusiveDisclosure } from "../lib/dismiss";
 
 interface Row {
@@ -23,8 +23,6 @@ const ACTIONS: Array<{ label: string; detail: string; run: () => void }> = [
   { label: "打开工作看板", detail: "", run: () => navigate("/workspaces") },
   { label: "打开设置", detail: "Cmd+,", run: () => navigate("/settings") },
 ];
-
-const errText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
 
 export default function CommandPalette() {
   const { open, setOpen } = createExclusiveDisclosure();
@@ -100,7 +98,7 @@ export default function CommandPalette() {
           detail: s.directory,
           apply: () => {
             void switchSession(s.id).catch((e) => {
-              flashErr(`切换会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+              flashErr(`切换会话失败：${errText(e)}`);
             });
           },
         });

@@ -80,7 +80,7 @@ pub struct MicSession {
     engine: Retained<AnyObject>,
     request: Retained<AnyObject>,
     /// tap block 与 tap 回调持有的 request retain：stop/cancel 先 removeTap 再随结构体回收
-    /// （旧实现 mem::forget 每次 PTT 各泄漏一份）。
+    /// （mem::forget 会每次 PTT 各泄漏一份）。
     tap: objc::TapHandler,
     req_kept: Retained<AnyObject>,
     rx: std::sync::mpsc::Receiver<SessionEvent>,
@@ -137,7 +137,7 @@ impl MicSession {
     /// 返回 (本地终稿, 云转写用 WAV 路径)。
     pub fn stop(self) -> (Option<String>, Option<String>) {
         objc::stop_mic_engine(&self.engine);
-        // removeTap 之后回收 tap block 与 request retain（旧实现 mem::forget 每次 PTT 各泄漏一份）
+        // removeTap 之后回收 tap block 与 request retain（mem::forget 会每次 PTT 各泄漏一份）
         drop(self.tap);
         drop(self.req_kept);
         objc::end_audio(&self.request);

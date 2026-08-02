@@ -16,7 +16,7 @@ export type AgentDiffStatus =
 export type AgentDiffFileResult = { state: "err"; message: string } | { state: "ok"; text: string };
 
 function errText(e: unknown): string {
-  return formatError(e instanceof Error ? e.message : String(e));
+  return formatError(e);
 }
 
 /** 拉单会话 agent 改动清单：失败带原因返回（不吞成 []）。 */

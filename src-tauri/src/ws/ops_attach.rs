@@ -1,4 +1,4 @@
-//! 附件 RPC：fs.allow_path / fs.read_attachment（rpc.rs 拆出，350 门禁；可测逻辑在 core::attachment）。
+//! 附件 RPC：fs.allow_path / fs.read_attachment（可测逻辑在 core::attachment）。
 
 use serde_json::{Value, json};
 use std::collections::HashSet;

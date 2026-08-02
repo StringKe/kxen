@@ -18,6 +18,7 @@ import { sortGroup } from "../lib/order";
 import { groupName, promotedName } from "../lib/group-name";
 import SessionRow from "./SessionRow";
 import EmptyLine from "./EmptyLine";
+import { errText } from "./err-text";
 
 const MAX_PER_GROUP = 5;
 
@@ -107,7 +108,7 @@ export default function SessionTree() {
     try {
       await switchSession(id);
     } catch (e) {
-      flashErr(`切换会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`切换会话失败：${errText(e)}`);
       return;
     }
   };
@@ -116,7 +117,7 @@ export default function SessionTree() {
     try {
       await workspaceSwitch(path);
     } catch (e) {
-      flashErr(`切换目录失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`切换目录失败：${errText(e)}`);
       return;
     }
     await newSession();
@@ -128,7 +129,7 @@ export default function SessionTree() {
       // in-flight 去重：确认按钮/右键菜单双触发只删一次；善后切换收口在 state.deleteSession
       await dedupeDelete(`session.delete:${id}`, () => deleteSession(id, distill));
     } catch (e) {
-      flashErr(`删除会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`删除会话失败：${errText(e)}`);
     } finally {
       setDeleting((prev) => {
         const next = new Set(prev);
@@ -159,7 +160,7 @@ export default function SessionTree() {
       await dedupeAdd(`workspace.add:${path}`, () => addAndSwitch(path));
     } catch (e) {
       // 失败不收起输入框：用户修正路径后直接重试
-      flashErr(`添加目录失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`添加目录失败：${errText(e)}`);
       return;
     }
     setAdding(false);
@@ -219,7 +220,7 @@ export default function SessionTree() {
                 <span class="flex-1 text-left truncate font-medium" title={group.path}>
                   {group.name}
                 </span>
-                {/* 真 button（旧 span 假按钮键盘不可达）；button 不许嵌 button，外层故为 div[role=button] */}
+                {/* 真 button 键盘可达；button 不许嵌 button，外层故为 div[role=button] */}
                 <button
                   class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 px-0.5 rounded hover:text-[var(--text)]"
                   title="在此项目下新建会话"

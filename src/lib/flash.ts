@@ -1,4 +1,4 @@
-// 统一操作反馈（flash/toast）：全库唯一实现，替代各处手写 setTimeout note/尾注。
+// 统一操作反馈（flash/toast）：全库唯一实现。
 // 成功绿/失败红；失败必须带原因（调用方责任，lint 无法强制，评审纪律）。
 // 计时器句柄管理：连续消息不抢清（每条独立计时），可手动关闭。
 import { createSignal } from "solid-js";

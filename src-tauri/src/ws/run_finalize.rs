@@ -1,4 +1,4 @@
-//! run 收尾段（自 llm_task.rs 平移，行为不变）：notify 路由关闭、relay 摘除、cancel/approval 清理、
+//! run 收尾段：notify 路由关闭、relay 摘除、cancel/approval 清理、
 //! stop hook、用量累计、cron 回写、转录落盘与 pending queue 续跑。
 
 use std::sync::Arc;

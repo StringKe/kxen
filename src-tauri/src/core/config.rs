@@ -258,14 +258,13 @@ pub fn coding_rules_enabled() -> bool {
 }
 
 /// 实验能力只读取个人配置，项目配置不能替用户扩大数据外发或宿主机能力面。
-/// gated MCP/browser 工具每次调用都查（P2 修复）：走 mtime 缓存，不再逐调用全量读盘解析。
+/// gated MCP/browser 工具每次调用都查：走 mtime 缓存，不再逐调用全量读盘解析。
 pub fn experimental_config() -> ExperimentalConfig {
     super::config_cache::cached_user_config().map(|c| c.experimental).unwrap_or_default()
 }
 
-/// voice.set_engine 的局部更新：覆盖 engine/fallback（空数组 = 清空降级链；
-/// 前端两个调用点都显式传当前链，旧的「空 = 不动」语义已无人依赖），
-/// locale 仅 Some 时覆盖；transcribe_model 等其他键保留。
+/// voice.set_engine 的局部更新：覆盖 engine/fallback（空数组 = 清空降级链，
+/// 前端两个调用点都显式传当前链）；locale 仅 Some 时覆盖；transcribe_model 等其他键保留。
 pub fn merge_voice_engine(doc: &mut toml::Table, engine: &str, fallback: &[String], locale: Option<&str>) {
     let entry = doc.entry("voice").or_insert_with(|| toml::Value::Table(toml::Table::new()));
     if !entry.is_table() {
@@ -298,7 +297,7 @@ mod tests {
                 assert!(spec.static_models.iter().any(|m| m.id == b.model), "角色 {role} 模型 {} 不在 {} 静态模型集", b.model, b.provider);
             }
         }
-        // B3 回归：planning 曾绑 "kimi"（API key provider），探测导入的是 kimi-for-coding
+        // planning 必须绑 kimi-for-coding：探测导入的凭证键是 kimi-for-coding，绑 "kimi"（API key provider）会失配
         assert_eq!(config.roles["planning"].provider, "kimi-for-coding");
     }
 

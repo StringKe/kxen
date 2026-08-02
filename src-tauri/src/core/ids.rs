@@ -6,7 +6,7 @@
 pub const MAX_ID_LEN: usize = 128;
 
 /// 生成 opaque id：`<prefix>_<uuid v4 无连字符>`。
-/// 旧版用 毫秒+进程号，同毫秒高频创建（message/approval/schedule）下会碰撞。
+/// 毫秒+进程号方案在同毫秒高频创建（message/approval/schedule）下会碰撞，故用 uuid v4。
 pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }

@@ -1,6 +1,6 @@
 // 空态：logo + 「打开项目目录」引导卡 + 四快捷卡。
 // 入场动画只在 app 首次挂载播放；之后点新会话直接静态到位
-//（旧时间线清空与空态呈现同帧完成，不再经历 300ms 空白 + 闪入的割裂感）。
+//（清空与空态同帧完成，避免空白 + 闪入的割裂感）。
 import { onMount } from "solid-js";
 import { CalendarClock, FolderOpen, Target, Users, Workflow } from "lucide-solid";
 import { insertComposerText } from "../lib/composer-bus";

@@ -4,7 +4,7 @@ use crate::auth::credential::CredentialKind;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// expires 单位归一（ms）。kimi 官方文件是秒级；历史代码无差别 *1000 会产生荒诞远期值。
+/// expires 单位归一（ms）。kimi 官方文件是秒级；无差别 *1000 会产生荒诞远期值。
 fn sane_expires(v: u64) -> u64 {
     if v > 1_000_000_000_000 { v } else { v * 1000 }
 }

@@ -1,5 +1,5 @@
 import { createSignal, onMount, Show } from "solid-js";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import { availableUpdate, checkForUpdate, currentVersion, installUpdate } from "../../lib/updater";
 
 export default function UpdateSection() {
@@ -28,7 +28,7 @@ export default function UpdateSection() {
       }
       setStatus(`发现版本 ${available.version}`);
     } catch (error) {
-      setStatus(`检查失败：${formatError(error instanceof Error ? error.message : String(error))}`);
+      setStatus(`检查失败：${errText(error)}`);
     } finally {
       setBusy(false);
     }
@@ -42,7 +42,7 @@ export default function UpdateSection() {
     try {
       await installUpdate(available);
     } catch (error) {
-      setStatus(`安装失败：${formatError(error instanceof Error ? error.message : String(error))}`);
+      setStatus(`安装失败：${errText(error)}`);
       setBusy(false);
     }
   };

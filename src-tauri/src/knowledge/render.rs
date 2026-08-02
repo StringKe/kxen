@@ -185,7 +185,7 @@ mod tests {
         std::fs::write(refs.join("arch.md"), "---\ndescription: 架构\n---\n细节全文不进注入。\n").unwrap();
 
         let rendered = render(&dir, &[]).unwrap();
-        // 两层 index.md 全文进索引段（人工策展入口），不再是一行索引
+        // 两层 index.md 全文进索引段（人工策展入口）
         assert!(rendered.contains("先看 rules/index.md。"), "{rendered}");
         assert!(rendered.contains("规则地图：style.md 讲风格。"), "{rendered}");
         // 普通 reference 仍只出一行索引

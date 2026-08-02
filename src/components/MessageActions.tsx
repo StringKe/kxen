@@ -2,8 +2,7 @@
 // user 的编辑框由 UserItem 持有（右键菜单与铅笔同一入口），本组件只发 onStartEdit 信号。
 import { createSignal, Show } from "solid-js";
 import { Check, Copy, GitFork, Pencil, RotateCcw } from "lucide-solid";
-import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { copyWithFeedback } from "./copy-feedback";
 
 export default function MessageActions(props: {
   role: "user" | "assistant";
@@ -15,15 +14,10 @@ export default function MessageActions(props: {
   const [copied, setCopied] = createSignal(false);
 
   const copy = () => {
-    void navigator.clipboard
-      .writeText(props.content)
-      .then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1200);
-      })
-      .catch((e: unknown) =>
-        flashErr(`写入剪贴板失败：${formatError(e instanceof Error ? e.message : String(e))}`),
-      );
+    copyWithFeedback(props.content, () => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
   };
 
   const btn =

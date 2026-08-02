@@ -1,5 +1,6 @@
 //! 凭证类型与 auth.json 读写（0600）。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -135,7 +136,7 @@ fn write_auth_file_unlocked(path: &Path, store: &AuthStore) -> crate::core::Resu
     let text = serde_json::to_string_pretty(store)?;
     #[cfg(unix)]
     {
-        // 带 0600 创建：先 write 再 chmod 的旧写法留了一个 0644 可读窗口
+        // 带 0600 创建：先 write 再 chmod 会留一个 0644 可读窗口
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
@@ -148,8 +149,4 @@ fn write_auth_file_unlocked(path: &Path, store: &AuthStore) -> crate::core::Resu
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

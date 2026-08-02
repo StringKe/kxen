@@ -1,6 +1,5 @@
-//! P0-14 解冻回归：team 依赖按 team session 所属 workspace 解析，不随 workspace switch 漂移。
+//! 解冻回归：team 依赖按 team session 所属 workspace 解析，不随 workspace switch 漂移。
 //! 两 workspace 场景：team 在 A 启动，switch 到 B 后 A 的 session 仍绑 A、新 session 的 team 用 B。
-//! 放 tests/ 遵循 350 行门禁（tests/ 不计入，src/ 内文件超限见 file_gates.rs）。
 
 use kxen_app::agent::team::{SpawnDeps, TeamManager};
 use kxen_app::auth::credential::{AuthStore, CredentialKind};

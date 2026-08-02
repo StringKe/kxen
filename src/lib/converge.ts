@@ -1,4 +1,4 @@
-// Done 对账（Cline 收敛副本）：run 结束以存储快照为最终权威，排队消息从后端队列取真源。
+// Done 对账：run 结束以存储快照为最终权威，排队消息从后端队列取真源。
 // stats/error 这类不进库的数据由调用方尾注重挂。
 import {
   approvalPending,
@@ -57,7 +57,7 @@ export function createConverge(deps: {
       })
       .catch((e) => {
         // 快照/队列 RPC 失败：时间线保持现状（不清空不闪屏），挂错误反馈防 unhandled rejection
-        flashErr(`对账失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+        flashErr(`对账失败：${formatError(e)}`);
       });
   };
 
@@ -74,7 +74,7 @@ export function createConverge(deps: {
     try {
       await sessionPendingClear(sid);
     } catch (e) {
-      flashErr(`清空队列失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`清空队列失败：${formatError(e)}`);
       return;
     }
     converge(sid); // 真源重载（乐观上屏的排队消息随快照撤下）

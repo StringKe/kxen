@@ -11,6 +11,7 @@ import {
 } from "../../lib/provider";
 import { flashErr } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import {
   ACCOUNT_NAME_BAD,
   baseUrl,
@@ -66,9 +67,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
 
   onMount(async () => {
     const list = await providerList().catch((e: unknown) => {
-      flashErr(
-        `加载 provider 清单失败：${formatError(e instanceof Error ? e.message : String(e))}`,
-      );
+      flashErr(`加载 provider 清单失败：${errText(e)}`);
       return [] as ProviderInfo[];
     });
     setProviders(list);
@@ -121,7 +120,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
         text: r.ok ? `连接正常 ${(r.latency_ms / 1000).toFixed(1)}s` : formatError(r.detail),
       });
     } catch (e) {
-      setTestMsg({ ok: false, text: formatError(e instanceof Error ? e.message : String(e)) });
+      setTestMsg({ ok: false, text: errText(e) });
     } finally {
       setTesting(false);
     }
@@ -172,7 +171,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
       resetAccountForm();
       props.onDone(`账号 ${doneProvider}:${doneName} 已添加`);
     } catch (e) {
-      setError(formatError(e instanceof Error ? e.message : String(e)));
+      setError(errText(e));
     } finally {
       setBusy(false);
     }
@@ -210,7 +209,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
       <Show when={kind() !== "custom"}>
         <div class="flex gap-2">
           <select
-            class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+            class="form-select"
             value={provider()}
             onChange={(e) => {
               setProvider(e.currentTarget.value);
@@ -221,7 +220,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
           </select>
           <Show when={regions().length > 1}>
             <select
-              class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+              class="form-select"
               title="运营区域（账号凭证只对该区域端点有效）"
               value={region() || regions()[0]?.key}
               onChange={(e) => setRegion(e.currentTarget.value)}
@@ -240,7 +239,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
         </div>
         <input
           type="password"
-          class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs font-mono"
+          class="form-mono"
           placeholder={
             kind() === "oauth"
               ? "OAuth JSON（access_token/refresh_token/expires_at）或裸 access token"
@@ -260,7 +259,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
             onInput={(e) => setName(e.currentTarget.value)}
           />
           <select
-            class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+            class="form-select"
             value={protocol()}
             onChange={(e) => setProtocol(e.currentTarget.value as "openai" | "anthropic")}
           >
@@ -269,20 +268,20 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
           </select>
         </div>
         <input
-          class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs font-mono"
+          class="form-mono"
           placeholder="base_url（API 根，如 https://relay.example.com/v1）"
           value={baseUrl()}
           onInput={(e) => setBaseUrl(e.currentTarget.value)}
         />
         <input
-          class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs font-mono"
+          class="form-mono"
           placeholder="模型清单（逗号分隔，如 gpt-4o, claude-sonnet-4-5）"
           value={models()}
           onInput={(e) => setModels(e.currentTarget.value)}
         />
         <input
           type="password"
-          class="w-full bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs font-mono"
+          class="form-mono"
           placeholder="api key（存本机 auth.json，0600）"
           value={token()}
           onInput={(e) => setToken(e.currentTarget.value)}

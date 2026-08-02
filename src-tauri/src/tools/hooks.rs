@@ -186,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn hook_runs_in_workspace_dir() {
-        // 含相对路径的 hook 必须在项目目录执行（旧实现 cwd="/" 时 test -f 必败、产物落到 /）
+        // 含相对路径的 hook 必须在项目目录执行（cwd="/" 时 test -f 必败、产物落到 /）
         let dir = std::env::temp_dir().join(format!("kxen-hook-cwd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("marker.txt"), "x").unwrap();

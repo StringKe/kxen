@@ -1,6 +1,9 @@
 // MCP remote（streamable http）standalone GET 流端到端：握手起流、server 推送 roots/list 收到
 // 应答、405 安静停用不重试、close 取消 GET 任务。mock 用 std TcpListener + 每连接一线程
 // （GET 长连接与 POST 并发，模式参照 mcp_sse.rs），全程不触网。
+mod common;
+
+use common::json_rpc::{http_response, json_frame};
 use kxen_app::mcp::client::McpClient;
 use kxen_app::mcp::config::{RemoteConfig, RemoteKind, ServerConfig};
 use serde_json::{Value, json};
@@ -61,15 +64,6 @@ fn header_value<'h>(headers: &'h str, name: &str) -> Option<&'h str> {
         let (k, v) = l.split_once(':')?;
         k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
     })
-}
-
-fn http_response(status: &str, content_type: Option<&str>, extra: &str, body: &str) -> String {
-    let ct = content_type.map(|c| format!("content-type: {c}\r\n")).unwrap_or_default();
-    format!("HTTP/1.1 {status}\r\n{ct}content-length: {}\r\nconnection: close\r\n{extra}\r\n{}", body.len(), body)
-}
-
-fn json_frame(id: &Value, result: Value) -> String {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
 /// POST 路由：initialize 下发 session；无 method 的帧是 GET 流推送的应答，进 channel 供断言。

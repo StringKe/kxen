@@ -23,7 +23,7 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
             Ok(serde_json::to_value(report).map_err(|e| e.to_string())?)
         }
         "current_model" => {
-            // 带 session_id 返回该会话生效模型（覆盖 > 全局默认）；不传同旧行为
+            // 带 session_id 返回该会话生效模型（覆盖 > 全局默认）；不传返回全局默认
             let state = app.state::<Arc<AppState>>();
             let sid = params.get("session_id").and_then(Value::as_str);
             let model = super::session_ops::effective_session_model(sid, &state).await;
@@ -181,7 +181,7 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
                     token.cancel();
                 }
             }
-            // stream_id 仅作增量帧身份注入 llm.delta 双写通道（独立 run 流通道已删，前端按 topic 消费）
+            // stream_id 仅作增量帧身份注入 llm.delta 双写通道（前端按 topic 消费）
             let stream_id = super::protocol::stream_id("run");
             tokio::spawn(run_llm(stream_id, p.session_id, p.text, p.context, p.images, None, app.clone()));
             Ok(json!({}))

@@ -1,4 +1,4 @@
-//! 会话存储测试（从 core/session.rs 拆出，350 行门禁）：生命周期 / 图片 / reasoning / tool 精确转录。
+//! 会话存储测试：生命周期 / 图片 / reasoning / tool 精确转录。
 
 use kxen_app::core::session as ses;
 use kxen_app::core::session::{Part, Role};

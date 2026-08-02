@@ -1,4 +1,4 @@
-//! P1-13 pending queue 落盘回归：入队写盘、消费重写、崩溃重启恢复、非法 id 拒绝。
+//! pending queue 落盘回归：入队写盘、消费重写、崩溃重启恢复、非法 id 拒绝。
 
 use kxen_app::core::pending_queue::{PendingQueues, file_path};
 

@@ -1,4 +1,4 @@
-//! P1-12 usage 跨 request 累加 + 通知循环 Lagged 存活回归。
+//! usage 跨 request 累加 + 通知循环 Lagged 存活回归。
 
 use kxen_app::agent::agent_loop::UsageAcc;
 use kxen_app::core::event::{Event, EventBus, RecvVerdict, recv_verdict};
@@ -8,7 +8,7 @@ fn usage_accumulates_across_requests() {
     let mut acc = UsageAcc::default();
     assert_eq!(acc.total(), (0, 0));
     assert_eq!(acc.last_input(), 0);
-    // 多轮 tool loop：每轮各一次 Usage，覆盖式只记末轮是 P1-12 的漏算根因
+    // 多轮 tool loop：每轮各一次 Usage，覆盖式只记末轮是漏算根因
     acc.push(100, 20);
     acc.push(180, 40);
     acc.push(260, 30);

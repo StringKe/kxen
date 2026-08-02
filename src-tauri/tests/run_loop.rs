@@ -1,5 +1,4 @@
-// run 主循环直接单测：stream_override 注入假流，覆盖终态/重试/预算分支
-// （旧覆盖靠「空凭证下 LLM 错误被吞成返回文本」的间接路径）。
+// run 主循环直接单测：stream_override 注入假流，覆盖终态/重试/预算分支。
 
 use kxen_app::agent::agent_loop::{AgentContext, AgentEvent, run_turn};
 use kxen_app::llm::types::Delta;
@@ -94,8 +93,8 @@ async fn retryable_error_recovers_on_next_attempt() {
     assert_eq!(calls.load(Ordering::SeqCst), 2, "429 应触发一次重试");
 }
 
-/// abort 在重试退避期立即生效（P2 回归：旧实现退避是裸 sleep，abort 最长延迟 3.2s+jitter）。
-/// 判定信号：退避期取消后不得发起第二次 LLM 请求（旧实现睡满退避才在下一轮 stream select 响应取消）。
+/// abort 在重试退避期立即生效。
+/// 判定信号：退避期取消后不得发起第二次 LLM 请求。
 #[tokio::test]
 async fn abort_during_retry_backoff_interrupts_immediately() {
     goals_dir_isolation();
@@ -152,7 +151,7 @@ async fn token_budget_limited_terminates_run() {
     let _ = std::fs::remove_file(dir.join("run-budget-goal.json"));
 }
 
-/// P2-6 部分产出保留：流中途不可重试错误，已流出文本进终态文本与历史（附错误标记），不得整段丢弃。
+/// 部分产出保留：流中途不可重试错误，已流出文本进终态文本与历史（附错误标记），不得整段丢弃。
 #[tokio::test]
 async fn stream_error_keeps_partial_output() {
     goals_dir_isolation();
@@ -171,7 +170,7 @@ async fn stream_error_keeps_partial_output() {
     assert_eq!(calls.load(Ordering::SeqCst), 1, "部分产出后不得重试");
 }
 
-/// P2-1 暂停分支：run 在飞期间 goal 被暂停（流闭包内落盘模拟 RPC/工具暂停），
+/// 暂停分支：run 在飞期间 goal 被暂停（流闭包内落盘模拟 RPC/工具暂停），
 /// 轮末记账发现非 Active 必须落终态停出，不得继续下一轮 LLM 请求。
 #[tokio::test]
 async fn paused_goal_terminates_in_flight_run() {

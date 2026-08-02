@@ -1,5 +1,4 @@
-//! SessionExtras 按 session 隔离的回归测试（P0-14：进程级单例跨 session 泄露）。
-//! 放 tests/ 遵循 350 行门禁（tests/ 不计入，src/ 内文件超限见 file_gates.rs）。
+//! SessionExtras 按 session 隔离的回归测试（进程级单例跨 session 泄露）。
 
 use kxen_app::agent::agent_loop::{AgentContext, SessionExtras, SessionExtrasRegistry};
 use kxen_app::agent::subagent::SubagentDeps;

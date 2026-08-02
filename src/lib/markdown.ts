@@ -23,7 +23,7 @@ function wrapCodeBlock(body: string, lang: string): string {
   return `<div class="code-block" data-lang="${lang}"><div class="code-header"><span>${lang || "text"}</span><button class="code-copy" type="button">复制</button></div>${body}</div>`;
 }
 
-// 模型输出最终写 innerHTML，marked 原样保留 raw HTML，必须过 sanitizer（报告 P1-16）。
+// 模型输出最终写 innerHTML，marked 原样保留 raw HTML，必须过 sanitizer。
 // shiki 高亮的颜色靠 pre/span 内联 style（值由本地高亮器生成，非模型可控），
 // 全局禁 style 会打掉高亮，因此只放行 .code-block 内部的 style，其余一律剥除。
 DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {

@@ -1,5 +1,5 @@
-// dev server 生命周期测试（P1-33）：readiness timeout 杀进程组、解析 port 写回 task 状态。
-// 走 kxen_app 公共 API，与 tests/safety_eval.rs 同一拆分先例（350 行门禁）。
+// dev server 生命周期测试：readiness timeout 杀进程组、解析 port 写回 task 状态。
+// 走 kxen_app 公共 API。
 use kxen_app::core::shared::lock;
 use kxen_app::tools::dev_server::{DevServerParams, ReadySpec, dev_server, restart_task};
 use kxen_app::tools::task::TaskRegistry;

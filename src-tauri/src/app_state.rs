@@ -1,4 +1,4 @@
-//! AppState：全局服务与运行时共享状态（从 main.rs 拆出，350 行门禁收口）。
+//! AppState：全局服务与运行时共享状态。
 
 use std::sync::{Arc, Mutex};
 
@@ -183,7 +183,7 @@ mod tests {
     fn initial_workdir_root_falls_back_to_home() {
         let home = std::path::PathBuf::from("/home/fallback");
         assert_eq!(initial_workdir(std::path::Path::new("/"), Some(home.clone())), home);
-        // home 不可得时保留 cwd（与修复前行为一致的最差兜底）
+        // home 不可得时保留 cwd（最差兜底）
         assert_eq!(initial_workdir(std::path::Path::new("/"), None), std::path::PathBuf::from("/"));
     }
 

@@ -133,7 +133,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct RecordSession {
     engine: Retained<AnyObject>,
-    /// tap block：stop/cancel 先 removeTap 再随结构体回收（旧实现 mem::forget 每次 PTT 泄漏一份）
+    /// tap block：stop/cancel 先 removeTap 再随结构体回收（mem::forget 会每次 PTT 泄漏一份）
     tap: super::objc::TapHandler,
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
@@ -177,7 +177,7 @@ impl RecordSession {
 }
 
 /// 云转写临时 WAV 路径：pid + 原子序号 + 纳秒时间戳。
-/// 旧名只按 pid：多会话并发 stop 写同一路径，互相覆盖、还互相误删。
+/// 只按 pid 命名会让多会话并发 stop 写同一路径，互相覆盖、还互相误删。
 pub(crate) fn temp_wav_path() -> std::path::PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);

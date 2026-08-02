@@ -93,8 +93,8 @@ pub(super) fn set_role(
 }
 
 /// 合并新旧 binding（P0-4 数据不丢的主防线，双保险以后端为准：RPC 面向所有调用方，
-/// 前端全量带字段只是其中之一）。旧实现整表重建，缺省参数直接抹掉旧值——切 provider 丢
-/// fallback+account、改 model 丢降级链。约定：None = 未提及沿用旧值；Some("") = 显式清除
+/// 前端全量带字段只是其中之一）。整表重建会把缺省参数的旧值抹掉（切 provider 丢
+/// fallback+account、改 model 丢降级链）。约定：None = 未提及沿用旧值；Some("") = 显式清除
 /// （前端选「无降级/账号轮转」、provider 变更清 account 走这里）；Some(v) = 覆盖。
 fn merge_binding(
     old: Option<&toml::map::Map<String, toml::Value>>,
@@ -228,7 +228,7 @@ const PROVIDER_SCOPED_KEYS: [&str; 5] =
     ["input_usd_per_million", "output_usd_per_million", "daily_cost_budget_usd", "circuit_failure_threshold", "circuit_cooldown_seconds"];
 
 /// provider 缺席时会被静默丢弃的 provider 级字段（只认非 null 值：null = 清除，无可写目标时本就不动）。
-/// 此前这类调用假报 saved:true，熔断配置看似保存实际没落盘。
+/// 这类调用必须显式报错，不能假报 saved:true（看似保存实际没落盘）。
 fn dropped_provider_scoped_field(params: &Value) -> Option<&'static str> {
     if params.get("provider").and_then(Value::as_str).is_some() {
         return None;
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn omitted_fields_fall_back_to_old_binding() {
-        // P0-4 回归：切 provider / 改 model 缺省调用不再丢 fallback+account
+        // 缺省调用（None 字段）必须继承旧 binding 的 fallback+account
         let old = old_binding();
         let b = merge_binding(Some(&old), "openai", "gpt-5.2", None, None);
         assert_eq!(get(&b, "provider"), Some("openai"));
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn provider_scoped_fields_without_provider_are_rejected_not_dropped() {
-        // 零 provider 场景回归：熔断字段带值但无 provider 时必须显式报错（旧实现静默丢弃仍回 saved:true）
+        // 零 provider 场景：熔断字段带值但无 provider 时必须显式报错（不能静默丢弃仍回 saved:true）
         let params = serde_json::json!({ "circuit_failure_threshold": 3, "circuit_cooldown_seconds": 60 });
         assert_eq!(dropped_provider_scoped_field(&params), Some("circuit_failure_threshold"));
         // null = 清除语义：无可写目标时不拦（只设全局 daily_token_budget 的调用不受影响）

@@ -82,7 +82,7 @@ export default function RoutingSection() {
 
   const accountOptions = (provider: string) => accounts().filter((a) => a.provider === provider);
 
-  // P0-4：update 永远以当前 binding 全量合并后下发（后端缺省会沿用旧值，见 settings.rs merge_binding）。
+  // update 永远以当前 binding 全量合并后下发（后端缺省会沿用旧值，见 settings.rs merge_binding）。
   // provider 变更时仅清 account（账号归属 provider，留旧账号会绑错）；fallback 是角色间降级关系，
   // 与 provider 无关，必须保留。想清除的字段显式传 ""（None/缺省在后端是「沿用旧值」语义）。
   const update = async (role: string, patch: Partial<RoleBindingView>) => {
@@ -195,7 +195,7 @@ export default function RoutingSection() {
         </div>
       </div>
 
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+      <div class="list-card">
         <For each={Object.keys(ROLE_LABELS)}>
           {(role) => {
             const binding = () => roles()[role] ?? { provider: "anthropic", model: "" };
@@ -208,7 +208,7 @@ export default function RoutingSection() {
                     <div class="text-2xs text-[var(--text-faint)]">{role}</div>
                   </div>
                   <select
-                    class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+                    class="form-select"
                     value={binding().provider}
                     onChange={(e) => {
                       const provider = e.currentTarget.value;
@@ -223,7 +223,7 @@ export default function RoutingSection() {
                     </For>
                   </select>
                   <select
-                    class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+                    class="form-select"
                     title="账号：轮转 = 槽满自动换下一个账号"
                     value={binding().account ?? ""}
                     onChange={(e) => void update(role, { account: e.currentTarget.value || null })}
@@ -251,7 +251,7 @@ export default function RoutingSection() {
                     </For>
                   </datalist>
                   <select
-                    class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+                    class="form-select"
                     title="降级目标角色：本角色槽位满时降级到该角色"
                     value={binding().fallback ?? ""}
                     onChange={(e) => void update(role, { fallback: e.currentTarget.value || null })}

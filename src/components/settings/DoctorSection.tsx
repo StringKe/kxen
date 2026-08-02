@@ -46,9 +46,7 @@ export default function DoctorSection() {
             </div>
 
             <section>
-              <div class="text-2xs uppercase tracking-wider text-[var(--text-faint)] mb-1.5">
-                账号凭证
-              </div>
+              <div class="overline">账号凭证</div>
               <div class="space-y-1">
                 <For each={r().entries}>
                   {(e) => (
@@ -70,9 +68,7 @@ export default function DoctorSection() {
               {(s) => (
                 <>
                   <section>
-                    <div class="text-2xs uppercase tracking-wider text-[var(--text-faint)] mb-1.5">
-                      MCP Servers
-                    </div>
+                    <div class="overline">MCP Servers</div>
                     <Show
                       when={s().mcp.length > 0}
                       fallback={<div class="text-xs text-[var(--text-faint)]">未配置</div>}
@@ -96,9 +92,7 @@ export default function DoctorSection() {
                   </section>
 
                   <section>
-                    <div class="text-2xs uppercase tracking-wider text-[var(--text-faint)] mb-1.5">
-                      LSP（root：{s().lsp_root}）
-                    </div>
+                    <div class="overline">LSP（root：{s().lsp_root}）</div>
                     <Show
                       when={s().lsp.length > 0}
                       fallback={
@@ -123,18 +117,14 @@ export default function DoctorSection() {
                   </section>
 
                   <section>
-                    <div class="text-2xs uppercase tracking-wider text-[var(--text-faint)] mb-1.5">
-                      MRM 模型调度（累计派发 {s().mrm_dispatches}）
-                    </div>
+                    <div class="overline">MRM 模型调度（累计派发 {s().mrm_dispatches}）</div>
                     <pre class="text-2xs font-mono whitespace-pre-wrap text-[var(--text-dim)] bg-[var(--bg-overlay)]/40 rounded p-2">
                       {s().mrm_describe}
                     </pre>
                   </section>
 
                   <section>
-                    <div class="text-2xs uppercase tracking-wider text-[var(--text-faint)] mb-1.5">
-                      Event Bus
-                    </div>
+                    <div class="overline">Event Bus</div>
                     <div class="text-xs">
                       容量 {s().bus_capacity} · 活跃订阅 {s().bus_receivers}
                       <Show when={s().bus_receivers === 0}>

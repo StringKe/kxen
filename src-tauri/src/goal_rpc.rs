@@ -1,5 +1,5 @@
 //! goal RPC 方法（goal.{list,focus,create,activate,pause,resume,cancel,adjust}）。
-//! 状态迁移成功后 publish GoalUpdate（Dock goal 面板实时刷新，此前变体只有定义无发布点）。
+//! 状态迁移成功后 publish GoalUpdate（Dock goal 面板实时刷新）。
 //! complete/record_turn 只走 agent loop 内部 Rust 方法直连（goal_tool / usage），不暴露 RPC。
 
 use kxen_app::core::event::Event;
@@ -114,8 +114,8 @@ mod tests {
         .expect("create")
     }
 
-    /// 状态串唯一口径 = GoalStatus::as_str()（snake_case）：旧 Debug lowercase 会产出
-    /// budgetlimited，与 GoalUpdate 事件的 budget_limited 并存，前端配色板对不上。
+    /// 状态串唯一口径 = GoalStatus::as_str()（snake_case）：Debug lowercase 会产出
+    /// budgetlimited，与 GoalUpdate 事件的 budget_limited 不一致，前端配色板对不上。
     #[test]
     fn to_json_status_matches_as_str() {
         let mut g = bare_goal();

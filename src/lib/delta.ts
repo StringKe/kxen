@@ -1,4 +1,4 @@
-// llm.delta 事件流订阅与分发（从 chat.ts 拆出，时间线增量唯一入口）。
+// llm.delta 事件流订阅与分发：时间线增量唯一入口。
 import { createEffect, onCleanup } from "solid-js";
 import { client } from "./client";
 
@@ -39,8 +39,8 @@ export function onLlmDelta(
   let off: (() => void) | undefined;
   let current: string | undefined;
   // bus lag 丢帧 / 断线重连后下发 resync：本地时间线可能有缺口（done 丢失会卡死 streaming 态）。
-  // 只对账不清 streaming：run 仍在跑时后续 delta 自然续上（旧实现直接 onDone 清 streamingSid =
-  // mid-run resync 丢停止按钮的根因）；done 真丢失由调用方按运行真源收回
+  // 只对账不清 streaming：run 仍在跑时后续 delta 自然续上，直接 onDone 清 streamingSid
+  // 会让 mid-run resync 丢掉停止按钮；done 真丢失由调用方按运行真源收回
   const offResync = client.onResync(() => onReconcile?.());
   // 后端 stream ACL：带 session_id 的帧只发给订阅了 session:<id> topic 的连接，
   // 订阅必须跟随活跃会话（旧订阅退掉，否则切走后仍占着别会话的帧通道）

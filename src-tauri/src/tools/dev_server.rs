@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(parse_port("ready at 127.0.0.1:4096"), Some(4096));
         assert_eq!(parse_port("server port 3000 ready"), Some(3000));
         assert_eq!(parse_port("no port here"), None);
-        // 2-3 位端口同样解析（旧正则 \d{4,5} 漏掉）
+        // 2-3 位端口同样解析
         assert_eq!(parse_port("listening on http://localhost:80/"), Some(80));
         assert_eq!(parse_port("ready at 127.0.0.1:300"), Some(300));
         assert_eq!(parse_port("server port 99 ready"), Some(99));

@@ -31,7 +31,7 @@ unsafe impl<T> Sync for SendWrap<T> {}
 
 enum Active {
     /// token 是泵线程身份：槽位被替换/移除后旧泵 ptr_eq 不过立即退出
-    /// （旧实现单槽无守卫：旧泵永不退出，会吸新会话事件造成串流）
+    /// （无守卫的旧泵永不退出，会吸新会话事件造成串流）
     Apple {
         session: SendWrap<apple::MicSession>,
         token: std::sync::Arc<()>,

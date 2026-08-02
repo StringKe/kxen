@@ -106,7 +106,7 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
         }
         "knowledge.injection_preview" => {
             let state = app.state::<Arc<AppState>>();
-            // 真实 involved：最近一轮 run 的文件集（原来固定 [] = glob 动态命中永远看不到）
+            // 真实 involved：最近一轮 run 的文件集（空集会漏掉 glob 动态命中的文件）
             let session_id = params.get("session_id").and_then(Value::as_str);
             let dir = match session_id {
                 Some(sid) => state.runtime_for_session(sid)?.root().to_path_buf(),

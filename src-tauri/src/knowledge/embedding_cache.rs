@@ -1,6 +1,7 @@
 //! 向量缓存：content sha256 -> Vec<f32>，JSON 单文件落 data_dir，tmp+rename 原子写。
 //! 条目上限 + LRU 淘汰（按 last_used 删最旧的），防缓存随 query 文本无限膨胀。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,8 +73,4 @@ impl EmbeddingCache {
         std::fs::write(&tmp, serde_json::to_string(&self.map).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }

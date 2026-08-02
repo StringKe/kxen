@@ -54,7 +54,7 @@ async fn rpm_window_and_history_survive_rebuild() {
     assert_eq!(rebuilt.history().await.len(), 1, "派发历史跨重建保留");
 }
 
-/// 调低并发限额热更即生效（P1-6）：实际闸门 = 新限额，describe 显示与真实容量一致。
+/// 调低并发限额热更即生效：实际闸门 = 新限额，describe 显示与真实容量一致。
 #[tokio::test]
 async fn lowered_concurrency_limit_takes_effect_on_rebuild() {
     let mrm = ModelResourceManager::new(config(ProviderLimit { concurrent: Some(2), ..Default::default() }));
@@ -73,7 +73,7 @@ async fn lowered_concurrency_limit_takes_effect_on_rebuild() {
     assert!(desc.contains("p: 1/1 available"), "describe 必须按新限额显示：{desc}");
 }
 
-/// 调高并发限额热更即生效（P1-6 对称面）：旧容量焊死时新增量永不可达。
+/// 调高并发限额热更即生效：容量若焊死在建池时刻，新增量永不可达。
 #[tokio::test]
 async fn raised_concurrency_limit_takes_effect_on_rebuild() {
     let mrm = ModelResourceManager::new(config(ProviderLimit { concurrent: Some(1), ..Default::default() }));

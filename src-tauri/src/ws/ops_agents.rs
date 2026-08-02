@@ -1,4 +1,4 @@
-//! agents.stop / agents.dismiss：按名停止/移除子代理（rpc.rs 单行委托，实现独立成文件守 350 行门禁）。
+//! agents.stop / agents.dismiss：按名停止/移除子代理。
 
 use serde_json::{Value, json};
 use std::sync::Arc;

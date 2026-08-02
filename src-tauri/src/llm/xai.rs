@@ -1,7 +1,7 @@
 //! xAI provider（OpenAI 兼容薄实现：registry 全部 OpenAI 兼容厂商共用的 wire 层）。
 
 use crate::core::shared::SharedStr;
-use crate::llm::sse::{SseFrame, SseParser};
+use crate::llm::sse::SseFrame;
 use crate::llm::tool::ToolDefinition;
 use crate::llm::types::{Delta, Message};
 use futures::StreamExt;
@@ -100,10 +100,6 @@ impl XaiProvider {
     }
 
     /// 流式调用：返回 Delta 的异步流（'static，不借 provider）。
-    pub fn stream_chat(&self, model: &str, messages: &[Message]) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
-        self.stream_chat_with_tools(model, messages, &[])
-    }
-
     pub fn stream_chat_with_tools(
         &self,
         model: &str,
@@ -149,16 +145,7 @@ impl XaiProvider {
 }
 
 fn stream_sse(resp: reqwest::Response) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
-    let mut parser = SseParser::new();
-    let stream = resp.bytes_stream();
-    let stream = stream.flat_map(move |chunk| {
-        let deltas: Vec<Delta> = match chunk {
-            Ok(bytes) => parser.feed(&bytes).into_iter().filter_map(delta_of).collect(),
-            Err(e) => vec![Delta::Error(format!("sse read: {e}"))],
-        };
-        futures::stream::iter(deltas)
-    });
-    Box::pin(stream.chain(futures::stream::once(async { Delta::Done })))
+    crate::llm::sse::stream_deltas(resp, delta_of)
 }
 
 fn delta_of(frame: SseFrame) -> Option<Delta> {

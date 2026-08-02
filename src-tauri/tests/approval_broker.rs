@@ -1,4 +1,4 @@
-//! 审批 broker 集成测试（从 agent/approval.rs 拆出，350 行门禁）：
+//! 审批 broker 集成测试：
 //! 超时/中断/清场语义 + resolved 事件 + 决定落盘（Part::Approval）+ pending 快照。
 
 use kxen_app::agent::approval::{ApprovalBroker, ApprovalOutcome, request_approval};

@@ -1,9 +1,8 @@
 //! Anthropic SSE 流解析：text/thinking/tool_use 分片 -> 统一 Delta（tool_use 走 ChunkToolCall 累积）。
 
-use crate::llm::sse::{SseFrame, SseParser};
+use crate::llm::sse::SseFrame;
 use crate::llm::tool::{ChunkFunction, ChunkToolCall};
 use crate::llm::types::Delta;
-use futures::StreamExt;
 use serde::Deserialize;
 use std::pin::Pin;
 
@@ -106,17 +105,8 @@ impl DeltaParser {
 }
 
 pub fn stream_sse(resp: reqwest::Response) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
-    let mut parser = SseParser::new();
     let mut projector = DeltaParser::default();
-    let stream = resp.bytes_stream();
-    let stream = stream.flat_map(move |chunk| {
-        let deltas: Vec<Delta> = match chunk {
-            Ok(bytes) => parser.feed(&bytes).into_iter().filter_map(|f| projector.delta_of(f)).collect(),
-            Err(e) => vec![Delta::Error(format!("sse read: {e}"))],
-        };
-        futures::stream::iter(deltas)
-    });
-    Box::pin(stream.chain(futures::stream::once(async { Delta::Done })))
+    crate::llm::sse::stream_deltas(resp, move |f| projector.delta_of(f))
 }
 
 #[cfg(test)]

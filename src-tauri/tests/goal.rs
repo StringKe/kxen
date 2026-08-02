@@ -1,4 +1,4 @@
-// goal 生命周期 / 预算 / 证据校验测试（goal.rs 内联测试拆出，350 行门禁，同 safety_eval.rs 模式）。
+// goal 生命周期 / 预算 / 证据校验测试。
 use kxen_app::core::goal::{Goal, GoalBudget, GoalContract, GoalStatus, evidence_sufficient};
 
 fn contract() -> GoalContract {
@@ -138,14 +138,14 @@ fn focus_prefers_session_goal_over_global() {
     g2.session_id = Some("s1".into());
     g2.updated_at = 100;
     g2.save(&dir).unwrap();
-    // session 视角：拿到自己的 goal 而不是全局的（多会话并发误伤修复）
+    // session 视角：拿到自己的 goal 而不是全局的
     assert_eq!(Goal::focus_for(&dir, Some("s1")).unwrap().id, "g_s1");
     // 无归属/其它 session：回落全局
     assert_eq!(Goal::focus_for(&dir, Some("s2")).unwrap().id, "g_global");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// --- P2-05：complete 证据最小校验 ---
+// --- complete 证据最小校验 ---
 
 #[test]
 fn evidence_sufficient_cases() {
@@ -172,7 +172,7 @@ fn complete_rejects_weak_evidence() {
     assert_eq!(g.status, GoalStatus::Complete);
 }
 
-// --- P2-06：Paused 区间不计入 wall 预算 ---
+// --- Paused 区间不计入 wall 预算 ---
 
 #[test]
 fn paused_interval_excluded_from_wall() {
@@ -219,7 +219,7 @@ fn record_turn_wall_uses_active_time() {
     assert_eq!(paused.status, GoalStatus::Active);
 }
 
-// --- P0-4：agent 侧 goal 工具迁移后 publish GoalUpdate（Dock 面板不再断链） ---
+// --- agent 侧 goal 工具 publish GoalUpdate（Dock 面板不断链） ---
 
 /// 进程级隔离 goals 目录：Once 写序同值无竞态（与 KXEN_AUTH_FILE 规约一致）。
 fn goals_dir_isolation() -> std::path::PathBuf {

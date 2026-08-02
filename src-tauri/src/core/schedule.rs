@@ -1,6 +1,7 @@
 //! cron 定时任务存储（data_dir/schedule.json 持久化，重启恢复；一次性/周期）。tick 由宿主循环驱动。
 //! 每个 job 随文件携带最近 HISTORY_CAP 条执行记录（时间+成败+错误），暂停的 job 到期不出列。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,10 +89,6 @@ fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// 解析 cron 并算下一次触发（本地时区）。cron crate 需秒位：5 字段标准 crontab 自动补 0 秒。

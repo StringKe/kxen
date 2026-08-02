@@ -3,7 +3,7 @@
 import { createSignal, For, onMount, Show } from "solid-js";
 import { configGet } from "../../lib/chat";
 import { client } from "../../lib/client";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import { providerList, type ProviderInfo } from "../../lib/provider";
 
 interface Overview {
@@ -33,7 +33,7 @@ export default function UsageSection() {
 
   const load = async () => {
     const r = await client.rpc<Overview>("usage.overview").catch((e: unknown) => {
-      setLoadErr(formatError(e instanceof Error ? e.message : String(e)));
+      setLoadErr(errText(e));
       return null;
     });
     if (r) {
@@ -94,12 +94,12 @@ export default function UsageSection() {
       setSaved("已保存并热生效");
       setTimeout(() => setSaved(""), 2000);
     } catch (error) {
-      setSaveErr(formatError(error instanceof Error ? error.message : String(error)));
+      setSaveErr(errText(error));
     }
   };
 
   return (
-    <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+    <div class="list-card">
       <Show when={loadErr()}>
         <div class="px-4 py-3 text-xs flex items-center gap-3">
           <span class="text-[var(--err)]">加载用量统计失败：{loadErr()}</span>

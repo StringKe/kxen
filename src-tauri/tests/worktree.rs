@@ -1,4 +1,4 @@
-// worktree 生命周期与审批门测试（从 tools/worktree.rs 拆出，350 行门禁）。
+// worktree 生命周期与审批门测试。
 use kxen_app::agent::approval::ApprovalBroker;
 use kxen_app::core::event::{Event, EventBus};
 use kxen_app::tools::exec::ApprovalCtx;

@@ -1,5 +1,5 @@
 //! task 工具：后台任务统一管理（dev server 是带 ready 门的 start）。
-//! 从 execute.rs 拆出（350 行门禁）；task start 与 exec 同过 safety 闸门。
+//! task start 与 exec 同过 safety 闸门。
 
 use crate::tools::dev_server::{DevServerParams, ReadySpec, dev_server, restart_task};
 use serde_json::Value;

@@ -39,22 +39,11 @@ mod tests {
     use super::*;
     use crate::core::event::EventBus;
     use crate::core::shared::lock;
-    use crate::llm::mrm::ModelResourceManager;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn deps() -> SpawnDeps {
-        let config = crate::core::config::Config::default();
-        SpawnDeps {
-            registry: Arc::new(crate::tools::task::TaskRegistry::new()),
-            fallback_workdir: Arc::from(Path::new("/tmp")),
-            store: Arc::new(std::sync::Mutex::new(crate::auth::credential::AuthStore::default())),
-            mrm: Arc::new(std::sync::RwLock::new(Arc::new(ModelResourceManager::new(config)))),
-            runtimes: Arc::new(crate::workspace_runtime::WorkspaceRuntimeRegistry::default()),
-            extras: Arc::new(crate::agent::agent_loop::SessionExtrasRegistry::default()),
-            agents: Arc::new(crate::agent::activity::AgentRegistry::default()),
-            approvals: None,
-        }
+        super::types::test_deps()
     }
 
     fn manager(tag: &str) -> (Arc<TeamManager>, PathBuf) {

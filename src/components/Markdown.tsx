@@ -1,8 +1,7 @@
 import { createEffect } from "solid-js";
 import { renderMarkdown, renderMermaid } from "../lib/markdown";
 import { theme } from "../lib/theme";
-import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { copyWithFeedback } from "./copy-feedback";
 
 /** Markdown 渲染组件：shiki 高亮 + mermaid 图表 + 代码块复制（事件委托）。 */
 export default function Markdown(props: { text: string }) {
@@ -13,17 +12,10 @@ export default function Markdown(props: { text: string }) {
     if (!btn || !el) return;
     const block = btn.closest(".code-block");
     const code = block?.querySelector("pre code")?.textContent ?? "";
-    void navigator.clipboard
-      .writeText(code)
-      .then(() => {
-        btn.textContent = "已复制";
-        setTimeout(() => (btn.textContent = "复制"), 1200);
-      })
-      .catch((err: unknown) =>
-        flashErr(
-          `写入剪贴板失败：${formatError(err instanceof Error ? err.message : String(err))}`,
-        ),
-      );
+    copyWithFeedback(code, () => {
+      btn.textContent = "已复制";
+      setTimeout(() => (btn.textContent = "复制"), 1200);
+    });
   };
 
   createEffect(() => {

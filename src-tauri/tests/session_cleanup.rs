@@ -1,4 +1,4 @@
-//! P1-09 session.delete 清理原语 + P1-10 fork id 回归：
+//! session.delete 清理原语 + fork id 回归：
 //! cron 按 session 移除、goal 标记 Canceled、team 目录清理、append 对已删会话拒绝、fork 消息 id 重生成。
 
 use kxen_app::agent::team::{SpawnDeps, TeamManager};

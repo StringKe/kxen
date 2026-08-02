@@ -2,7 +2,7 @@
 //! - 请求-响应：{jsonrpc:"3.0", id, method, params} -> {id, resId, result|error}
 //! - 服务端流：stream:{id, seq, mode:"server", complete?}（订阅流）
 //! - 系统方法：rpc.subscribe / rpc.unsubscribe / rpc.heartbeat
-//!   （rpc.cancelStream 已删：run 流移除后无消费者，run 取消走 session.abort）
+//!   （run 取消不走流控制，走 session.abort）
 //!
 //! 端口启动时随机分配，前端经 ws_port command 获取。
 

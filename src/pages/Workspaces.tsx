@@ -9,6 +9,7 @@ import { newSession, sessions, switchSession } from "../lib/state";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
 import { goalStatusMeta, rankCards, type GoalTone } from "../lib/board";
+import { baseName } from "../lib/group-name";
 import { relTime } from "../lib/time";
 import { onDragStart } from "../lib/drag";
 import EmptyLine from "../components/EmptyLine";
@@ -30,7 +31,7 @@ export default function Workspaces() {
   const reload = async () => {
     // 失败保留旧值但记错误态：首载失败（后端没连上）必须与真空（还没有工作区）区分
     const list = await workspacesOverview().catch((e: unknown) => {
-      setLoadErr(formatError(e instanceof Error ? e.message : String(e)));
+      setLoadErr(formatError(e));
       return null;
     });
     if (list) {
@@ -58,7 +59,7 @@ export default function Workspaces() {
       try {
         await switchSession(sessionId);
       } catch (e) {
-        flashErr(`切换会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+        flashErr(`切换会话失败：${formatError(e)}`);
       }
       return;
     }
@@ -69,14 +70,14 @@ export default function Workspaces() {
       try {
         await switchSession(latest.id);
       } catch (e) {
-        flashErr(`切换会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+        flashErr(`切换会话失败：${formatError(e)}`);
       }
       return;
     }
     try {
       await workspaceSwitch(path);
     } catch (e) {
-      flashErr(`切换工作区失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`切换工作区失败：${formatError(e)}`);
       return;
     }
     await newSession();
@@ -146,7 +147,6 @@ function Column(props: {
   onOpen: (path: string, sessionId?: string) => void;
 }) {
   const c = () => props.card;
-  const basename = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
 
   return (
     <div class="w-72 shrink-0 rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] flex flex-col">
@@ -157,7 +157,7 @@ function Column(props: {
       >
         <div class="flex items-center gap-2">
           <FolderGit2 size={14} class="text-[var(--text-dim)] shrink-0" />
-          <span class="text-sm font-medium text-[var(--text)] truncate">{basename(c().path)}</span>
+          <span class="text-sm font-medium text-[var(--text)] truncate">{baseName(c().path)}</span>
           <Show when={c().running > 0}>
             <span class="ml-auto inline-flex items-center gap-1 text-2xs text-[var(--ok)] shrink-0">
               <Play size={10} />

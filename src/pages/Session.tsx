@@ -39,7 +39,7 @@ export default function Session() {
   const [workdir, setWorkdir] = createSignal("");
   let unlisten: (() => void) | undefined;
   let listRef: HTMLDivElement | undefined;
-  // null 哨兵 = 组件首跑强制重载时间线；仅 ""（草稿->激活首发）跳过保住乐观上屏（时间线空白根因修复）
+  // null 哨兵 = 组件首跑强制重载时间线；仅 ""（草稿->激活首发）跳过保住乐观上屏
   let prevSid: string | null = null;
   const [pendingQueue, setPendingQueue] = createSignal<string[]>([]);
 
@@ -68,7 +68,7 @@ export default function Session() {
   // 首载失败必须与真空区分（Workspaces 同模式）：无 catch 时后端不可达只剩 EmptyHero，
   // 「加载失败」被伪装成「新会话」，且裸 Promise 产生 unhandled rejection
   const [loadErr, setLoadErr] = createSignal("");
-  const loadErrText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
+  const loadErrText = (e: unknown) => formatError(e);
 
   const loadQueue = (id: string) => {
     void sessionPendingList(id)
@@ -104,7 +104,7 @@ export default function Session() {
   };
 
   // 切换会话：加载存储的时间线；草稿态（""）清空。
-  // 草稿->激活（首发）跳过重载：此时本地上屏是唯一权威（空载会抹掉乐观消息 = 首行消失的根因）。
+  // 草稿->激活（首发）跳过重载：此时本地上屏是唯一权威（空载会抹掉乐观上屏消息）。
   createEffect(() => {
     const id = activeSessionId();
     setFocusTick((t) => t + 1);

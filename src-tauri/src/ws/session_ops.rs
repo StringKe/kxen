@@ -1,4 +1,4 @@
-//! session 域辅助：rewind / send_message 参数 / 会话级模型与 meta 更新（rpc.rs 拆出，350 门禁）。
+//! session 域辅助：rewind / send_message 参数 / 会话级模型与 meta 更新。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -127,7 +127,7 @@ pub(super) fn session_rewind(params: &Value, state: &crate::AppState) -> Result<
     });
     // rewind 原子性：写锁贯穿「active 检查 -> reset --hard -> 截断重写」。拿不到 = 本 workspace
     // 有 run 持读锁（或并发 rewind 进行中），与门禁 active_run 同口径拒绝（锁语义见 core::rewind_lock）。
-    // 旧实现 check-then-act 无锁：检查通过到新 run 注册进 active_runs 的间隙里，reset 会覆盖新 run 写的文件。
+    // 无锁的 check-then-act 有竞态：检查通过到新 run 注册进 active_runs 的间隙里，reset 会覆盖新 run 写的文件。
     let Some(_guard) = kxen_app::core::rewind_lock::try_rewind_guard(&meta.directory) else {
         return Err(rewind_gate(true, 0, false, target).expect_err("active_run 分支必拒").to_wire());
     };
@@ -166,7 +166,7 @@ pub(crate) async fn chat_default_model(state: &crate::AppState) -> kxen_app::llm
     chat_model_or_fallback(mrm.peek("chat", &store).await)
 }
 
-/// resolve 命中即用（含钉选账号）；None = 无任何可用凭证，回退硬编码默认，行为不劣化于路由修复前。
+/// resolve 命中即用（含钉选账号）；None = 无任何可用凭证，回退硬编码默认兜底。
 fn chat_model_or_fallback(resolved: Option<kxen_app::llm::mrm::Resolved>) -> kxen_app::llm::ModelRef {
     match resolved {
         Some(r) => {
@@ -197,7 +197,7 @@ fn parse_model_override(params: &Value) -> Result<Option<kxen_app::llm::ModelRef
     }
 }
 
-/// session.update_meta RPC（rpc.rs 迁来，350 门禁）：重命名 / 置顶 / 手动排序。
+/// session.update_meta RPC：重命名 / 置顶 / 手动排序。
 pub(super) fn session_update_meta(params: &Value) -> Result<Value, String> {
     let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
     let title = params.get("title").and_then(Value::as_str);
@@ -259,7 +259,7 @@ mod tests {
         let msgs = vec![msg("u1", Role::User), msg("a1", Role::Assistant), msg("u2", Role::User), msg("a2", Role::Assistant)];
         // user 消息：自身即 turn 起点
         assert_eq!(checkpoint_label(&msgs, 2), Some("u2"));
-        // assistant 消息：映射到所属 turn 的 user 消息（assistant 入口不再必败）
+        // assistant 消息：映射到所属 turn 的 user 消息
         assert_eq!(checkpoint_label(&msgs, 3), Some("u2"));
         assert_eq!(checkpoint_label(&msgs, 1), Some("u1"));
         // 首条即 assistant（之前无 user）：无检查点可映射
@@ -290,7 +290,7 @@ mod tests {
         };
         let m = chat_model_or_fallback(Some(resolved));
         assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("anthropic", "claude-sonnet-4-6", Some("work")));
-        // 无可用凭证：回退修复前硬编码默认（行为不劣化）
+        // 无可用凭证：回退硬编码默认兜底
         let m = chat_model_or_fallback(None);
         assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("xai", "grok-build-0.1", None));
     }

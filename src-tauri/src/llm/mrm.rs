@@ -204,7 +204,7 @@ impl ModelResourceManager {
         let keys = crate::auth::credential::accounts_of(store, &binding.provider);
         if keys.is_empty() {
             // 持有其它 provider 凭证时跳过无凭证 provider：降级链才能走到用户真实持有的订阅；
-            // store 全空（首启探测前/测试）保留盲默认键旧行为
+            // store 全空（首启探测前/测试）退回盲默认键
             if !store.is_empty() {
                 return Vec::new();
             }
@@ -237,7 +237,7 @@ impl ModelResourceManager {
     }
 
     /// 并发池按 provider 段归一：同 provider 多账号共享一个池（"" 为全局池，不进此归一以外的拆分）。
-    /// 限额实时读 config：热更换限即生效（P1-6），在飞计数经共享 state 跨重建保留。
+    /// 限额实时读 config：热更换限即生效，在飞计数经共享 state 跨重建保留。
     fn slot_limit(&self, key: &str) -> usize {
         // key 可为账号槽位键（provider:account）：取 provider 段的限额配置
         let provider = key.split(':').next().unwrap_or(key);

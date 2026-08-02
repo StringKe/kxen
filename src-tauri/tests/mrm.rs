@@ -1,4 +1,4 @@
-// mrm 调度测试（从 src/llm/mrm.rs 拆出，350 行门禁）：原子 acquire / provider 级总池 / 账号轮转。
+// mrm 调度测试：原子 acquire / provider 级总池 / 账号轮转。
 use kxen_app::auth::credential::{AuthStore, CredentialKind};
 use kxen_app::core::config::{Config, Limits, ProviderLimit, RoleBinding};
 use kxen_app::llm::mrm::ModelResourceManager;

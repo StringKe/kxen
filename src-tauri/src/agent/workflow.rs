@@ -55,7 +55,7 @@ pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_
 
     let script_owned = script.to_string();
     let cancel_thread = cancel.clone();
-    // 超时/中断级联取消（P2-3）：workflow 级 cancel token 作为派发子代理的父令牌（dispatch 的
+    // 超时/中断级联取消：workflow 级 cancel token 作为派发子代理的父令牌（dispatch 的
     // _cascade watcher 同源），结束/超时随 CancelGuard 一并取消在飞子代理——旧实现只置 JS 中断
     // 标志，挂在 Rust future 上的子代理收不到取消，白烧 tokens 直到自然结束。
     let wf_cancel = crate::agent::cancel::CancelToken::new();
@@ -273,7 +273,7 @@ fn workflow_err(msg: String) -> rquickjs::Error {
 mod tests {
     use super::*;
 
-    /// P2-3 级联回归：作用域结束（超时/提前返回同一 Drop 路径）必须同时置 JS 中断标志
+    /// 级联回归：作用域结束（超时/提前返回同一 Drop 路径）必须同时置 JS 中断标志
     /// 并取消 workflow 令牌——在飞子代理经 dispatch 的 _cascade watcher 收到取消。
     #[test]
     fn cancel_guard_cascades_to_workflow_token() {
@@ -286,7 +286,7 @@ mod tests {
         assert!(token.is_cancelled(), "workflow 令牌必须取消（子代理级联取消的源头）");
     }
 
-    /// P2-3 级联回归：父 run abort 经 cascade_parent 传到 workflow 令牌；
+    /// 级联回归：父 run abort 经 cascade_parent 传到 workflow 令牌；
     /// done_tx 回收后 watcher 退出不再误触。
     #[tokio::test]
     async fn parent_abort_cascades_into_workflow_token() {

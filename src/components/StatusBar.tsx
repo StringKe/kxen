@@ -43,13 +43,13 @@ export default function StatusBar() {
     const idx = w.indexOf(home);
     return idx === 0 ? `~/${w.slice(home.length).split("/").slice(1).join("/")}` : w;
   };
-  // goal 中文徽标：与看板/Dock 共用 board.ts 状态映射，不再渲染原始英文 status
+  // goal 中文徽标：与看板/Dock 共用 board.ts 状态映射，渲染中文徽标而非原始英文 status
   const goalMeta = () => goalStatusMeta(report()?.goal?.status ?? "");
   const goalToneCls = () =>
     ({ ok: "text-[var(--ok)]", warn: "text-[var(--warn)]", dim: "text-[var(--text-dim)]" })[
       goalMeta().tone
     ];
-  // ctx 窗取 catalog 实测值（models.dev），替代过期的 200k 硬编码文案
+  // ctx 窗取 catalog 实测值（models.dev），不写死固定窗口文案
   const ctxWindow = () => {
     const raw = report()?.model ?? "";
     const slash = raw.indexOf("/");

@@ -5,7 +5,7 @@ import SessionTree from "./SessionTree";
 import { initSessions, mountSessionEvents, newSession } from "../lib/state";
 import { onDragStart } from "../lib/drag";
 import { theme, toggleTheme } from "../lib/theme";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 
 /** 左栏：品牌 + 新会话 + 项目-会话树（Codex 式分组）+ 底部应用级入口。 */
 export default function Sidebar() {
@@ -16,7 +16,7 @@ export default function Sidebar() {
       await initSessions();
       setLoadErr("");
     } catch (e) {
-      setLoadErr(formatError(e instanceof Error ? e.message : String(e)));
+      setLoadErr(errText(e));
     }
   };
   onMount(async () => {

@@ -53,7 +53,7 @@ interface StreamChunk {
 }
 
 /** RPC 错误：message 保持后端原文（rewind 靠 message 内嵌 JSON 传结构化 code，不动），
- *  code 供调用方按 -32601/-32603 等归类（此前前端只取 message，两类错误不可区分）。 */
+ *  code 供调用方按 -32601/-32603 等归类。 */
 export class RpcError extends Error {
   constructor(
     message: string,
@@ -83,7 +83,7 @@ let seq = 0;
 const subscriptions = new Map<string, string[]>();
 const chunkHandlers = new Set<(chunk: StreamChunk) => void>();
 
-/** 服务端 bus lag 丢事件后下发的对账控制帧 stream id（P1-14：不再杀连接，前端收此帧重拉快照）。 */
+/** 服务端 bus lag 丢事件后下发的对账控制帧 stream id：前端收此帧重拉快照。 */
 const RESYNC_STREAM_ID = "sys.resync";
 const resyncHandlers = new Set<() => void>();
 
@@ -183,7 +183,7 @@ function drop() {
 
 /**
  * 重连后恢复订阅：先 Array.from 快照再逐个重开。
- * 迭代中 openSubscription 会 set 新 key，JS Map 迭代会访问新插入 entry（P1-15 持续 reopen 的根因）；
+ * 迭代中 openSubscription 会 set 新 key，JS Map 迭代会访问新插入 entry 导致持续 reopen；
  * 单个重开失败不中断其余订阅恢复。
  */
 export async function restoreSubscriptions(
@@ -266,7 +266,7 @@ export const client = {
     });
   },
 
-  /** bus lag 对账信号：服务端丢帧后下发 resync 控制帧，调用方应重拉会话快照（P1-14）。返回注销函数。 */
+  /** bus lag 对账信号：服务端丢帧后下发 resync 控制帧，调用方应重拉会话快照。返回注销函数。 */
   onResync(cb: () => void): Unsub {
     resyncHandlers.add(cb);
     return () => {

@@ -1,4 +1,4 @@
-// workflow 引擎集成测试（350 行门禁从 src/agent/workflow.rs 拆出）。
+// workflow 引擎集成测试。
 // 覆盖：纯 JS 能力、meta 捕获三态、parallel 容错/限流/顺序、agent 双签名、phase 索引匹配与容错、完成信封。
 // 不触网：dispatch 在空凭证下仍 resolve（子 loop 把 LLM 错误吞成返回文本，mrm 对未绑定 role 也有兜底），
 // 唯一确定性失败源是派发预算封顶（32）——失败统计与信封 failures 段用它验证。

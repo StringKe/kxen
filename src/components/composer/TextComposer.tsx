@@ -7,7 +7,7 @@ import { activeSessionId } from "../../lib/state";
 import { clearDraft, getDraft, setDraft, stripTruncMark } from "../../lib/drafts";
 import { createInFlight } from "../../lib/async-guard";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import { COMPOSER_INSERT_EVENT, COMPOSER_INTERRUPT_EVENT } from "../../lib/composer-bus";
 import { detectTrigger, type PopupState, type Trigger } from "./triggers";
 import { createAttachments } from "./composer-attachments";
@@ -100,7 +100,7 @@ export default function TextComposer(props: {
   function closePopupIfCaretOut() {
     const p = popup();
     if (!p || !ta) return;
-    // 按光标实时重算触发段（旧实现拿建弹层时的 stale query 长度判界，继续打 query 会误判移出把弹层关了）
+    // 按光标实时重算触发段：拿建弹层时的 stale query 长度判界，继续打 query 会误判移出把弹层关了
     const t = detectTrigger(text(), ta.selectionStart);
     if (!t || t.start !== p.start) setPopup(null);
   }
@@ -208,8 +208,8 @@ export default function TextComposer(props: {
 
   async function send() {
     voiceCtl.cancelPendingActivation(); // 快速 Enter（按住不足 400ms）不走 stop：废未决激活计时，防发送后触发开录
-    // 录音中发送：先等语音收尾（终稿并入输入框），连终稿一起发。
-    // 旧实现不 await：发出去的是旧 partial，终稿随后倒灌已清空的输入框。
+    // 录音中发送：先等语音收尾（终稿并入输入框），连终稿一起发——
+    // 不 await 发出去的是旧 partial，终稿会倒灌已清空的输入框。
     // 仅启动中（权限弹窗未决）取消不等待：此刻没有终稿可等，发送不能被弹窗卡住。
     if (recording()) await voiceCtl.stop();
     else if (voiceCtl.starting()) void voiceCtl.stop();
@@ -221,7 +221,7 @@ export default function TextComposer(props: {
     props.onSend(value, context, imageParts);
     pastes.clear();
     setValue("", 0);
-    // setValue 现在会落草稿，清草稿必须在其后，否则空串又写回去
+    // setValue 会落草稿，清草稿必须在其后，否则空串又写回去
     clearDraft(activeSessionId());
     setRowChips([]);
     images.clear(); // 图片数据已随 imageParts 消费，不留到下一轮
@@ -231,7 +231,7 @@ export default function TextComposer(props: {
   const sendDedupe = createInFlight();
   const sendGuarded = () => {
     void sendDedupe("send", send).catch((e) => {
-      flashErr(`发送失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`发送失败：${errText(e)}`);
     });
   };
 

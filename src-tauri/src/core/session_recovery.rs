@@ -3,6 +3,7 @@
 //! 删除前先复制完整状态到单目录，再把该目录移入系统废纸篓。
 //! Finder 恢复目录后，宿主扫描并把内容导回原位置。
 
+use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -195,10 +196,6 @@ fn copy_optional(source: &Path, target: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::copy(source, target).map(|_| ()).map_err(|e| e.to_string())
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|duration| duration.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

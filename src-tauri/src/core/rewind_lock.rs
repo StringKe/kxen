@@ -4,7 +4,7 @@
 //!   存亡瞬间广播 session.update（前端 running 圆点的事件源，真源仍是 session.list）。
 //! - rewind（写者）：try_write 拿不到 = 本 workspace 有 run 活着（或另一 rewind 进行中），
 //!   按 active_run 拒；拿到则 active 检查 -> reset --hard -> 截断重写全在写锁内，
-//!   间隙里新起的 run 只能排队等读锁——旧实现 check-then-act 无锁，新 run 会被 reset 覆盖。
+//!   间隙里新起的 run 只能排队等读锁——无锁的 check-then-act 会让新 run 被 reset 覆盖。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

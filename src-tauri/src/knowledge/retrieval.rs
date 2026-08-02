@@ -22,7 +22,7 @@ const W_PROJECT: f64 = 1.0;
 const W_PERSONAL: f64 = 0.85;
 
 /// 近因加成：30 天内线性衰减到 0，只在相关性 > 0 时叠加（守住"无命中不注入"的门槛），
-/// 延续旧的日期序兜底语义，但不让新条目盖过相关性。
+/// 不让新条目盖过相关性。
 const RECENCY_BOOST: f64 = 0.05;
 const RECENCY_WINDOW_DAYS: i64 = 30;
 
@@ -192,7 +192,7 @@ pub fn conflict_losers(token_sets: &[HashSet<String>], dates: &[String], content
 }
 
 /// notes/memory 的选择主入口：返回排序+去重+截断后的条目（render 直接渲染）。
-/// involved 为空：日期序 top 3（新沉淀仍可见，现有语义保留）。
+/// involved 为空：日期序 top 3（新沉淀仍可见）。
 pub fn select_notes<'a>(notes: &[&'a Entry], involved_rel: &[String]) -> Vec<&'a Entry> {
     if involved_rel.is_empty() {
         let mut by_date: Vec<&Entry> = notes.to_vec();

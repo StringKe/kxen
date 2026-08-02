@@ -1,4 +1,4 @@
-// cva 变体定义：组件样式变体的唯一来源（类型化，替代 styles.css 里的变体规则）。
+// cva 变体定义：组件样式变体的唯一来源（类型化）。
 import { cva } from "class-variance-authority";
 
 /** 发送/停止按钮。 */

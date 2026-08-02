@@ -19,3 +19,8 @@ pub fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 /// 共享字符串别名（clone 仅计数，零拷贝共享）。
 pub type SharedStr = std::sync::Arc<str>;
+
+/// Unix 毫秒时间戳；时钟异常时回退 0，保证持久化字段不 panic。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}

@@ -1,4 +1,4 @@
-// 统一异步守卫：seq 过期丢弃与 in-flight 去重，收口各组件手写的竞态处理。
+// 统一异步守卫：seq 过期丢弃与 in-flight 去重。
 import { createSignal } from "solid-js";
 import { flashErr, flashOk } from "./flash";
 

@@ -1,4 +1,4 @@
-//! 会话导出：markdown 渲染与落盘（从 session.rs 拆出，350 行门禁）。
+//! 会话导出：markdown 渲染与落盘。
 
 use std::path::{Path, PathBuf};
 

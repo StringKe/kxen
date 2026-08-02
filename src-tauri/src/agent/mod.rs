@@ -1,4 +1,4 @@
-//! kxen-agent：agent loop（LLM -> tool_call -> 工具执行 -> 回传 -> 循环）、subagent、workflow（后续里程碑）。
+//! kxen-agent：agent loop（LLM -> tool_call -> 工具执行 -> 回传 -> 循环）、subagent、workflow。
 
 pub mod activity;
 pub mod agent_loop;

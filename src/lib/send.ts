@@ -1,4 +1,4 @@
-// 发送链路（Session.tsx 拆出，350 门禁）：乐观上屏 -> RPC -> 失败态标记/点击重发。
+// 发送链路：乐观上屏 -> RPC -> 失败态标记/点击重发。
 import type { Setter } from "solid-js";
 import { sendMessage, type ContextItem } from "./chat";
 import { ensureActiveSession } from "./state";
@@ -28,13 +28,13 @@ export interface SendFlow {
 }
 
 export function createSendFlow(deps: SendFlowDeps): SendFlow {
-  // 不在前端拦截并发：后端按会话排队（此处静默 return 曾经直接吞掉用户消息）
+  // 不在前端拦截并发：后端按会话排队，静默 return 会吞掉用户消息
   const send: SendFlow["send"] = async (text, context, images) => {
     let sid: string;
     try {
       sid = await ensureActiveSession();
     } catch (e) {
-      flashErr(`发送失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`发送失败：${formatError(e)}`);
       return false;
     }
     // 只有本轮把会话从空闲推进 streaming 的首发，失败时才负责收回 streaming；
@@ -56,7 +56,7 @@ export function createSendFlow(deps: SendFlowDeps): SendFlow {
       if (r?.queued) deps.setPendingQueue((prev) => [...prev, text]);
       return r?.queued === true;
     } catch (e) {
-      const msg = formatError(e instanceof Error ? e.message : String(e));
+      const msg = formatError(e);
       flashErr(`发送失败：${msg}`);
       // 引用相等定位本气泡：乐观气泡无 messageId，对账/刷新后已被快照撤下，map 不到是正常
       deps.setItems((prev) => prev.map((it) => (it === bubble ? { ...it, sendError: msg } : it)));

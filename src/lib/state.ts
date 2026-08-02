@@ -180,7 +180,7 @@ export async function refreshAgents(): Promise<void> {
 /** 侧栏会话列表的事件驱动刷新（Sidebar 挂载一次，返回注销）：
  *  run 开始/结束（session.update，后端 rewind_lock::RunGuard 广播）与断线 resync 触发重拉，
  *  250ms 去抖合并连发帧（队列续跑/批量结束会连到）。running 真源是 session.list 的
- *  active_runs 快照，事件只是扳机——旧实现只在挂载/手动操作时刷新，running 圆点常年失准。 */
+ *  active_runs 快照，事件只是扳机。 */
 export function mountSessionEvents(): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const bump = () => {

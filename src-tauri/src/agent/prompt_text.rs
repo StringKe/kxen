@@ -1,5 +1,5 @@
 //! 静态 prompt 文案常量（English by design — models follow English most reliably）。
-//! 从 prompt.rs 拆出：纯文案与组装逻辑分离，单文件行数受 file_gates 约束。
+//! 纯文案与组装逻辑分离，单文件行数受 file_gates 约束。
 
 pub(crate) const IDENTITY: &str = "\
 You are kxen, a coding agent running on macOS (Apple Silicon) inside a native app. \

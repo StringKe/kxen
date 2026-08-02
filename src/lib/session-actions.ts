@@ -1,4 +1,4 @@
-// 消息动作：fork / 重新生成 / 编辑重发（Session.tsx 拆出，350 门禁）。
+// 消息动作：fork / 重新生成 / 编辑重发。
 import { sessionFork, type ContextItem } from "./chat";
 import { activeSessionId, newSession, refreshSessions, switchSession } from "./state";
 import { flashErr, flashOk } from "./flash";
@@ -18,7 +18,7 @@ export async function forkAt(messageId: string): Promise<void> {
     await refreshSessions();
     await switchSession(forked.id);
   } catch (e) {
-    flashErr(`分叉失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+    flashErr(`分叉失败：${formatError(e)}`);
   }
 }
 
@@ -57,7 +57,7 @@ export async function editResend(
         return;
       } catch (e) {
         // fork 失败不再继续往更早消息退避：那会静默丢失比用户预期更多的上下文
-        flashErr(`编辑重发失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+        flashErr(`编辑重发失败：${formatError(e)}`);
         return;
       }
     }

@@ -87,9 +87,7 @@ pub enum Role {
 
 // ---------------- 持久化（<sessions_dir>/<id>.json meta + <id>.jsonl 消息行） ----------------
 
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+pub(crate) use super::shared::now_ms;
 
 // per-session 写锁：cron/队列续跑可能并发 touch 同一会话 JSONL，append 与 rewrite（tmp+rename）必须串行，否则丢并发行
 static WRITE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =

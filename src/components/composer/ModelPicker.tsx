@@ -6,7 +6,7 @@ import { sessionFollowGlobalModel, sessionSetModel } from "../../lib/session-mod
 import { activeSessionId, sessions } from "../../lib/state";
 import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import {
   fmtCtx,
   modelOf,
@@ -29,8 +29,6 @@ interface Row {
   providerName: string;
   model: ModelInfo;
 }
-
-const errText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
 
 export default function ModelPicker() {
   const [cur, setCur] = createSignal({ provider: "", model: "" });
@@ -269,7 +267,7 @@ export default function ModelPicker() {
                 )}
               </For>
             </div>
-            {/* roleMsg 放 popover 内：原来挂 pill 旁，出现/消失都挤压 actionbar 布局 */}
+            {/* roleMsg 放 popover 内：挂 pill 旁出现/消失会挤压 actionbar 布局 */}
             <Show when={roleMsg()}>
               <div class="text-2xs text-[var(--ok)] mt-1">{roleMsg()}</div>
             </Show>

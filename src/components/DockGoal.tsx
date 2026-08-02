@@ -4,7 +4,7 @@ import { createSignal, Show } from "solid-js";
 import { Target } from "lucide-solid";
 import { goalCreate, type GoalAction, type GoalInfo } from "../lib/chat";
 import { insertComposerText } from "../lib/composer-bus";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 import { activeSessionId } from "../lib/state";
 import DockSection from "./DockSection";
 
@@ -42,7 +42,7 @@ export default function DockGoal(props: {
       setCreateErr("");
       setCreating(false);
     } catch (error) {
-      setCreateErr(formatError(error instanceof Error ? error.message : String(error)));
+      setCreateErr(errText(error));
     }
   };
   // 「提高预算并继续」只做状态迁移（budget_limited 时 run 已终态，goal.adjust 不会续跑）：

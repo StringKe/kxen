@@ -6,7 +6,7 @@ import { openMenu } from "../lib/context-menu";
 import { relTime } from "../lib/time";
 import { activeSessionId } from "../lib/state";
 import { flashErr } from "../lib/flash";
-import { formatError } from "../lib/error-text";
+import { errText } from "./err-text";
 
 export default function SessionRow(props: {
   session: SessionMeta;
@@ -41,7 +41,7 @@ export default function SessionRow(props: {
         props.onChanged();
       }
     } catch (e) {
-      flashErr(`重命名失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`重命名失败：${errText(e)}`);
     } finally {
       // RPC 失败也必须退出编辑态，否则输入框卡死
       setRenaming(false);
@@ -53,7 +53,7 @@ export default function SessionRow(props: {
       await sessionUpdateMeta(s().id, { pinned: !s().pinned });
       props.onChanged();
     } catch (e) {
-      flashErr(`置顶失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`置顶失败：${errText(e)}`);
     }
   };
 

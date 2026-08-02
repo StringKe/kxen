@@ -1,4 +1,4 @@
-// streaming 态收放的真源对账（Session.tsx 拆出，350 门禁）。
+// streaming 态收放的真源对账。
 // streamingSid 只由发送动作乐观臂上（即时反馈）；之后的保持/重臂/收回全部由
 // 运行真源（session.list 的 running 快照）决定，不由单帧决定：
 // - 后端先发布终态再 spawn 续跑（ws/run_finalize.rs），收到 done 即清会让续跑 run

@@ -8,7 +8,7 @@ import {
   type VoiceOverview,
 } from "../../lib/voice";
 import { flashErr, flashOk } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 
 const BADGE: Record<string, { text: string; cls: string }> = {
   ready: { text: "就绪", cls: "text-[var(--ok)]" },
@@ -19,8 +19,6 @@ const BADGE: Record<string, { text: string; cls: string }> = {
 
 // Apple Speech 常用识别语言；config.toml 的 [voice] locale 是同一键
 const LOCALES = ["zh-CN", "zh-HK", "en-US", "ja-JP", "ko-KR"];
-
-const errText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
 
 export default function VoiceSection() {
   const [ov, setOv] = createSignal<VoiceOverview | null>(null);
@@ -105,7 +103,7 @@ export default function VoiceSection() {
       <Show when={!ov() && !loadErr()}>
         <div class="text-xs text-[var(--text-faint)]">加载中…</div>
       </Show>
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+      <div class="list-card">
         <For each={ov()?.engines ?? []}>
           {(e) => {
             const badge = () => BADGE[e.status] ?? { text: e.status, cls: "" };
@@ -158,7 +156,7 @@ export default function VoiceSection() {
               <div class="text-xs text-[var(--text-faint)]">Apple 本地识别与转写的 locale</div>
             </div>
             <select
-              class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+              class="form-select"
               value={o().locale}
               onChange={(e) => setLocale(e.currentTarget.value)}
             >
@@ -169,7 +167,7 @@ export default function VoiceSection() {
           </div>
         )}
       </Show>
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+      <div class="list-card">
         <For each={keyProviders()}>
           {(e) => (
             <div class="flex items-center gap-3 px-4 py-3">

@@ -1,4 +1,4 @@
-// fs_tool 公开 API 集成测试（从 fs_tool.rs 拆出，350 行门禁）：
+// fs_tool 公开 API 集成测试：
 // read 分页 / 文件新鲜度（纳秒精度）/ edit 双模式。
 use kxen_app::tools::fs_tool::{AnchorEdit, EditSpec, FileTracker, FsToolError, delete, edit, read, write};
 use kxen_app::tools::hashline::generate_anchors;
@@ -13,7 +13,7 @@ fn temp_file(tag: &str, content: &str) -> PathBuf {
 }
 
 fn rand() -> u32 {
-    // 纳秒 + 进程内序号混合：并行测试同纳秒也不再撞目录（flake 实证）
+    // 纳秒 + 进程内序号混合：并行测试同纳秒也不再撞目录
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     nanos ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_mul(0x9e37)

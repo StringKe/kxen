@@ -10,7 +10,6 @@ fn repo_dir(workdir: &Path) -> PathBuf {
     use sha2::Digest;
     // canonicalize：/var 与 /private/var 这类拼写分叉必须收敛到同一 shadow repo；
     // sha256 取代 DefaultHasher：后者输出跨 Rust 版本不受保证，工具链升级会让存量检查点变孤儿。
-    // 代价：从 DefaultHasher 迁到 sha256 是一次性断代，存量 shadow repo 变孤儿（仅多占盘，可手动清）
     let path = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
     let digest = sha2::Sha256::digest(path.to_string_lossy().as_bytes());
     crate::core::paths::data_dir().join("shadow").join(format!("{:x}.git", digest))

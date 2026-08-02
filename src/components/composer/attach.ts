@@ -2,6 +2,7 @@
 // 1. 拖拽/粘贴的浏览器 File 只暴露 basename + size，真实位置靠后端 workspace 索引反查（fs.resolve_name），同名按 size 消歧；
 // 2. 原生对话框选中带真实绝对路径，经 fs.allow_path 登记授权，图片再走 fs.read_attachment 读 base64。
 import { client } from "../../lib/client";
+import { errText } from "../err-text";
 
 export interface NameMatch {
   path: string;
@@ -39,10 +40,9 @@ export function isImagePath(p: string): boolean {
   return /\.(png|jpe?g|gif|webp|bmp)$/i.test(p);
 }
 
-/** basename 提取：chip label 只显示文件名，完整路径放 title。 */
-export function baseName(p: string): string {
-  return p.split("/").filter(Boolean).pop() ?? p;
-}
+import { baseName } from "../../lib/group-name";
+
+export { baseName };
 
 export interface AllowPathResult {
   path: string;
@@ -73,12 +73,8 @@ export type PickedChip =
     }
   | { kind: "file"; ref: string; label: string; title: string };
 
-/** 对话框路径解析结果：失败带人话原因（调用方上 err chip，不再静默跳过）。 */
+/** 对话框路径解析结果：失败带人话原因（调用方上 err chip，不静默跳过）。 */
 export type PickedResult = { ok: true; chip: PickedChip } | { ok: false; reason: string };
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 /** 对话框路径 -> chip 数据：登记授权后按图片/文件分流；任一步失败返回原因（授权/读取/超 2MB cap）。 */
 export async function resolvePickedPath(sessionId: string, path: string): Promise<PickedResult> {

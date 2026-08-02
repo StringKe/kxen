@@ -6,6 +6,7 @@ import { mcpAuth, mcpRestart, mcpStatus, type McpServerStatus } from "../../lib/
 import { formatError } from "../../lib/error-text";
 import { flashErr } from "../../lib/flash";
 import { writeClipboard } from "../../lib/clipboard";
+import { errText } from "../err-text";
 
 export default function McpSection() {
   const [mcpServers, setMcpServers] = createSignal<McpServerStatus[]>([]);
@@ -26,7 +27,7 @@ export default function McpSection() {
   const restart = async (name: string) => {
     await mcpRestart(name)
       .then(refreshMcp)
-      .catch((e: unknown) => flashErr(`重启失败：${e instanceof Error ? e.message : String(e)}`));
+      .catch((e: unknown) => flashErr(`重启失败：${errText(e)}`));
   };
 
   const startMcpAuth = async (name: string) => {
@@ -37,7 +38,7 @@ export default function McpSection() {
       return next;
     });
     const r = await mcpAuth(name).catch((e: unknown) => {
-      setAuthErrs((p) => ({ ...p, [name]: e instanceof Error ? e.message : String(e) }));
+      setAuthErrs((p) => ({ ...p, [name]: errText(e) }));
       return null;
     });
     if (!r) {

@@ -55,8 +55,8 @@ export async function startVoiceSession(
   onError: (msg: string) => void,
   sessionId = "",
 ): Promise<VoiceSession> {
-  // 订阅自带 session topic：后端 stream ACL 要求连接持有 session:<id> 绑定才放行带 session_id 的帧
-  //（旧实现裸订 llm.delta，靠 delta.ts/RightColumn 恰好持有会话订阅隐式放行——那是隐式耦合）
+  // 订阅自带 session topic：后端 stream ACL 要求连接持有 session:<id> 绑定才放行带 session_id 的帧，
+  // 裸订 llm.delta 只能靠别的订阅恰好持有会话绑定隐式放行
   const off = client
     .stream(sessionId ? ["llm.delta", `session:${sessionId}`] : ["llm.delta"])
     .on((payload) => {

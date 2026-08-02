@@ -1,4 +1,4 @@
-//! P1-02：session metadata 的 model 覆盖 —— 持久化往返 / 旧格式缺省兼容 / fork 继承 / 优先级。
+//! session metadata 的 model 覆盖 —— 持久化往返 / 旧格式缺省兼容 / fork 继承 / 优先级。
 
 use kxen_app::core::session as ses;
 use kxen_app::llm::ModelRef;

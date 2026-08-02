@@ -17,7 +17,7 @@ pub struct Shared {
 }
 
 /// 并发计数池：限额在占槽时实时读 config 传入（调低调高热更即生效，describe 与真实闸门
-/// 同源不脱节）。Semaphore 方案把容量焊死在建池时刻，热更低限额后闸门不变（P1-6）。
+/// 同源不脱节）。Semaphore 方案把容量焊死在建池时刻，热更低限额后闸门不变。
 #[derive(Default)]
 pub struct Pools {
     counts: std::sync::Mutex<HashMap<String, usize>>,
@@ -38,7 +38,7 @@ impl Pools {
         }
     }
 
-    /// 非阻塞占槽：limit 由调用方实时从 config 算出（0 按 1 兜底，与旧 Semaphore::new(limit.max(1)) 同口径）。
+    /// 非阻塞占槽：limit 由调用方实时从 config 算出（0 按 1 兜底）。
     pub fn try_acquire(self: &Arc<Self>, key: &str, limit: usize) -> Option<PoolPermit> {
         let mut counts = crate::core::shared::lock(&self.counts);
         let count = counts.entry(key.to_string()).or_insert(0);
@@ -70,7 +70,7 @@ impl Pools {
     }
 }
 
-/// RAII 槽位：Drop 归还计数并唤醒等待方（对应旧 OwnedSemaphorePermit 语义）。
+/// RAII 槽位：Drop 归还计数并唤醒等待方。
 pub struct PoolPermit {
     pools: Arc<Pools>,
     key: String,

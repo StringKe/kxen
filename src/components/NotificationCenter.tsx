@@ -9,6 +9,7 @@ import { relTime } from "../lib/time";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
 import { sessions, switchSession } from "../lib/state";
+import { errText } from "./err-text";
 
 interface Notice {
   at: number;
@@ -43,8 +44,8 @@ export default function NotificationCenter() {
   // Solid 忽略 onMount 返回值（React 写法）：轮询 timer 必须挂 onCleanup，否则卸载后泄漏
   onCleanup(() => timer && clearInterval(timer));
 
-  // 订阅 notification topic 即时上屏（ws/stream.rs topic 映射早已存在，前端此前零订阅纯靠轮询）；
-  // 5s 轮询保留降为对账：整列按服务端真源替换，本地即时插入的重复项随之收敛
+  // 订阅 notification topic 即时上屏；5s 轮询保留降为对账：整列按服务端真源替换，
+  // 本地即时插入的重复项随之收敛
   const offNotice = client
     .stream<{ text: string; session_id?: string | null }>("notification")
     .on((p) => {
@@ -91,7 +92,7 @@ export default function NotificationCenter() {
       await switchSession(sid);
       setOpen(false);
     } catch (e) {
-      flashErr(`切换会话失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`切换会话失败：${errText(e)}`);
     }
   };
 

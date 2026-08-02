@@ -137,7 +137,7 @@ pub fn drain_to_session_in(router: &NotifyRouter, dir: &std::path::Path, session
     notifications_message(notes)
 }
 
-/// late 通知入队后的续跑触发（P0-2 同款）：kxen_app spawn 不了 run_llm，binary crate 启动时注入。
+/// late 通知入队后的续跑触发：kxen_app spawn 不了 run_llm，binary crate 启动时注入。
 static LATE_KICK: std::sync::OnceLock<std::sync::Mutex<Option<SharedCallback>>> = std::sync::OnceLock::new();
 
 fn late_kick_slot() -> &'static std::sync::Mutex<Option<SharedCallback>> {

@@ -21,6 +21,7 @@ import { formatError } from "../../lib/error-text";
 import AddAccountPanel from "./AddAccountPanel";
 import ProviderCompatibility from "./ProviderCompatibility";
 import { badge, labelOf, type Row } from "./providers-row";
+import { errText } from "../err-text";
 
 // 实测结果与拉模型条数是时点探测：切分区重挂载后需用户重新点按获取，
 // 不缓存陈旧探测结果上屏（缓存会误导，探测本身一键可重发）。
@@ -72,7 +73,7 @@ export default function ProvidersSection() {
     const r = await providerModels(row.provider, account).catch((e: unknown) => ({
       models: [] as string[],
       source: "error",
-      detail: e instanceof Error ? e.message : String(e),
+      detail: errText(e),
     }));
     setRows((prev) => prev.map((x) => (x.id === row.id ? { ...x, modelsResult: r } : x)));
   };
@@ -84,7 +85,7 @@ export default function ProvidersSection() {
       flashOk(`已更新 ${row.id} 区域`);
       await load();
     } catch (e) {
-      flashErr(`改区域失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`改区域失败：${errText(e)}`);
     }
   };
 
@@ -103,7 +104,7 @@ export default function ProvidersSection() {
       await load();
       verifyAll(); // 重新导入 = 用户主动动作，导入后逐个验证一次
     } catch (e) {
-      flashErr(`重新导入失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`重新导入失败：${errText(e)}`);
     } finally {
       setReprobing(false);
     }
@@ -121,7 +122,7 @@ export default function ProvidersSection() {
       flashOk(`已删除 ${row.id}`);
       await load();
     } catch (e) {
-      flashErr(`删除失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      flashErr(`删除失败：${errText(e)}`);
     }
   };
 
@@ -178,7 +179,7 @@ export default function ProvidersSection() {
         />
       </Show>
 
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+      <div class="list-card">
         <For each={rows()}>
           {(r) => {
             const b = () => badge(r);

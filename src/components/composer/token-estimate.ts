@@ -1,5 +1,5 @@
 // composer token 估算分级：阈值跟当前模型 ctx 窗走（80% 警 / 95% 险），
-// 查不到模型回退 200k 窗（160k/190k 硬编码与 200k 窗同义，行为对老模型不变）。
+// 查不到模型回退 200k 窗。
 import { createSessionCtxWindow } from "../../lib/session-model";
 
 export function createTokenEstimate(getText: () => string, getSid: () => string) {

@@ -1,7 +1,6 @@
 //! 事件桥：bus 事件 -> JSON-RPC 3.0 stream chunk。
 //! 全部走订阅流：命中 topic 的订阅流 chunk（result 携带 {topic, payload}）。
-//! run 流分支（stream.id=run-* chunk）已删：chunk 无 topic，前端按 topic 匹配必丢弃，
-//! 实际消费全靠 llm.delta，属双端闲置通道。
+//! run 增量只经 llm.delta 下发：chunk 必须带 topic，前端按 topic 匹配消费，无 topic 的帧会被丢弃。
 //!
 //! 会话 ACL：带 session_id 的 LlmDelta 只发给订阅了 `session:<id>` topic 的连接
 //! （别的会话的增量是越权信息）；无 session_id 的全局事件（voice、审批）行为不变。

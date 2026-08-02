@@ -1,7 +1,7 @@
 //! OS 桌面通知（会话完成）+ 点击跳回来源会话。
 //! tauri-plugin-notification 桌面端只有发接口：action handler（register_action_types / on_action）是
 //! mobile-only，桌面 show() 拿不到点击回调。改走其底层 notify-rust 的 wait_for_action：
-//! 投递路径同一实现（行为不变），多拿点击语义 -> 聚焦主窗口 + emit 事件由前端切会话。
+//! 投递路径同一实现，多拿点击语义 -> 聚焦主窗口 + emit 事件由前端切会话。
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -14,7 +14,7 @@ pub const CLICK_EVENT: &str = "os-notification-click";
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// wait_for_action 串行 dispatcher：单 worker 依次派发各通知的点击等待，
-/// job 跑在各自 detached 线程（退出语义同旧逐条 spawn：进程退出即收，不 join 不阻塞退出）。
+/// job 跑在各自 detached 线程（进程退出即收，不 join 不阻塞退出）。
 struct Dispatcher {
     tx: std::sync::mpsc::Sender<WaitJob>,
 }

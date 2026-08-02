@@ -1,6 +1,6 @@
 // 会话树分组名：basename 为主；worktree 目录显示「树名 (worktree)」与项目组区分；撞名上提一级。
 
-/** 分组名取 basename；撞名时上提一级（parent/name），否则两个同名项目分组无法区分。 */
+/** 路径末段（空路径原样返回）。 */
 export function baseName(p: string): string {
   return p.split("/").filter(Boolean).pop() ?? p;
 }

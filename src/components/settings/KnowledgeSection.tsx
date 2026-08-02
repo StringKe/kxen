@@ -18,9 +18,7 @@ import {
 import { badgeChip } from "../../lib/variants";
 import { activeSessionId } from "../../lib/state";
 import { flashErr, flashOk } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
-
-const errText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
+import { errText } from "../err-text";
 
 const SCOPES: { id: KnowledgeScope; label: string; hint: string }[] = [
   { id: "project", label: "项目", hint: ".agents/ · 入 git 共享" },
@@ -168,7 +166,7 @@ export default function KnowledgeSection() {
               <span class="text-xs font-medium">{s.label}</span>
               <span class="text-2xs text-[var(--text-faint)]">{s.hint}</span>
             </div>
-            <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
+            <div class="list-card">
               <For each={KIND_ORDER.filter((k) => byKind(s.id, k).length > 0)}>
                 {(k) => (
                   <div class="px-4 py-2.5">
@@ -281,7 +279,7 @@ export default function KnowledgeSection() {
         </div>
         <div class="flex gap-2">
           <select
-            class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+            class="form-select"
             value={scope()}
             onChange={(e) => setScope(e.currentTarget.value as KnowledgeScope)}
           >
@@ -289,7 +287,7 @@ export default function KnowledgeSection() {
             <option value="project">项目（克制）</option>
           </select>
           <select
-            class="bg-transparent border border-[var(--border)] rounded px-1.5 py-1 text-xs text-[var(--text-dim)]"
+            class="form-select"
             value={noteType()}
             onChange={(e) => setNoteType(e.currentTarget.value)}
           >

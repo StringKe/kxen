@@ -20,7 +20,7 @@ pub enum Verdict {
     Recoverable,
 }
 
-// 高危但合法：走 ask-user 审批档（原来按 Allow 静默放行）
+// 高危但合法：走 ask-user 审批档
 pub(super) static ASK_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (Regex::new(r"\bgit\s+push\b[^|;]*\s(-f\b|--force\b)").unwrap(), "git push --force 覆盖远端历史"),

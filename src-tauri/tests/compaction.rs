@@ -1,4 +1,4 @@
-//! compaction 检查点集成测试（P1-06/P1-07）：手动压缩落盘、保留尾结构存活、
+//! compaction 检查点集成测试：手动压缩落盘、保留尾结构存活、
 //! 重开复用压缩态不重复支付、rewind 到压缩前消息仍可用。
 
 use kxen_app::agent::compact;

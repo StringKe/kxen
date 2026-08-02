@@ -3,7 +3,7 @@
 // 失败不静默跳过：push err 态 chip（title 写明原因，可点 X 移除）。
 import { ensureActiveSession } from "../../lib/state";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
+import { errText } from "../err-text";
 import { baseName, fsResolveName, resolveAttachPath, resolvePickedPath } from "./attach";
 import { fileToImageDataUrl } from "./image-scale";
 import type { RowChip } from "./RowChips";
@@ -11,10 +11,6 @@ import type { RowChip } from "./RowChips";
 export interface AttachDeps {
   images: Map<string, { media_type: string; data: string }>;
   pushChip: (chip: Omit<RowChip, "id">) => void;
-}
-
-function errText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
 }
 
 export function createAttachments(deps: AttachDeps) {
@@ -64,7 +60,7 @@ export function createAttachments(deps: AttachDeps) {
     // 会话创建（草稿态落库）失败不能吞：拖放/AttachMenu 入口都是 void 调用，
     // 无 catch 就是 unhandled rejection + 用户零反馈
     const sid = await ensureActiveSession().catch((e: unknown) => {
-      flashErr(`添加附件失败：${formatError(errText(e))}`);
+      flashErr(`添加附件失败：${errText(e)}`);
       return null;
     });
     if (!sid) return;

@@ -2,6 +2,7 @@
 //! 全部帧带 "jsonrpc":"3.0"；流帧身份只在 stream.id（无根 id）。
 //! 2.0 向后兼容：无版本字段的帧按 2.0 处理。
 
+use kxen_app::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -91,8 +92,8 @@ pub const INTERNAL_ERROR: i64 = -32603;
 #[allow(dead_code)]
 pub const STREAM_NOT_FOUND: i64 = -32801;
 
-/// RPC 调用失败：携带 JSON-RPC 错误码。unknown method 必须回 METHOD_NOT_FOUND（-32601），
-/// 此前与内部错误同回 INTERNAL_ERROR（-32603），客户端无法区分「方法不存在」与「调用炸了」。
+/// RPC 调用失败：携带 JSON-RPC 错误码。unknown method 必须回 METHOD_NOT_FOUND（-32601）：
+/// 与内部错误同回 INTERNAL_ERROR（-32603）会让客户端无法区分「方法不存在」与「调用炸了」。
 pub struct CallError {
     pub code: i64,
     pub message: String,
@@ -131,10 +132,6 @@ pub fn res_id() -> String {
 /// 流 id 生成（run-* / sub-* 前缀区分用途）。
 pub fn stream_id(prefix: &str) -> String {
     format!("{prefix}-{}-{:04x}", now_ms(), RES_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xffff)
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

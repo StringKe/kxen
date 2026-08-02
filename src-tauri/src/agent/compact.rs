@@ -4,7 +4,7 @@
 use crate::llm::{Delta, LlmClient, Message, ModelRef};
 
 /// 粗估 tokens（chars/4，与 composer 的预估同口径）。
-/// 计入 tool_calls 与多模态块（P2-8）：tool_call 的 name+arguments 同样占上下文（可占大头），
+/// 计入 tool_calls 与多模态块：tool_call 的 name+arguments 同样占上下文（可占大头），
 /// 漏算会让 needs_compact 迟迟不触发直到 provider 400。图片 base64 长度与实际 token 无稳定
 /// 换算，按常见档位固定近似（1000/张），宁高估勿漏估。
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(estimate_tokens(&msgs), 200);
     }
 
-    /// P2-8 回归：tool_calls 的 name+arguments 与图片块计入预估（漏算会让大 tool_call
+    /// tool_calls 的 name+arguments 与图片块计入预估（漏算会让大 tool_call
     /// 历史永不触发压缩直到 provider 400）。
     #[test]
     fn estimate_counts_tool_calls_and_images() {

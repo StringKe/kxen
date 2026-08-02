@@ -1,0 +1,207 @@
+/* composer 整卡与 action bar（语义化样式，不用任意值）；focus 时边框/光晕同步过渡（150ms ease-out） */
+.composer-card {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  transition:
+    border-color var(--dur-fade) var(--ease-out),
+    box-shadow var(--dur-fade) var(--ease-out);
+}
+.composer-card:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+.composer-card.recording {
+  border-color: var(--err);
+  box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.18);
+}
+/* 拖文件悬停：与 focus-within 同款高亮，提示可投放 */
+.composer-card.drag-over {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+.composer-actionbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 8px;
+}
+.action-icon {
+  padding: 6px;
+  border-radius: 6px;
+  color: var(--text-dim);
+  transition: transform var(--dur-press) var(--ease-out);
+}
+.action-icon:hover {
+  background: var(--bg-overlay);
+}
+.action-icon:active {
+  transform: scale(0.97);
+}
+.send-btn {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+.send-btn:hover {
+  background: var(--accent-hover);
+}
+.send-btn:active {
+  transform: scale(0.97);
+}
+.send-btn:disabled {
+  opacity: 0.4;
+}
+.send-btn-stop,
+.send-btn-stop:hover {
+  background: var(--err);
+}
+
+/* composer 上方：渐变淡出代替 1px 硬线（scroll edge effect） */
+.composer-fade {
+  position: relative;
+}
+.composer-fade::before {
+  content: "";
+  position: absolute;
+  top: -16px;
+  left: 0;
+  right: 0;
+  height: 16px;
+  background: linear-gradient(to bottom, transparent, var(--bg));
+  pointer-events: none;
+}
+
+/* ============ 交互反应层（reaction）：所有可操作元素的状态反馈 ============ */
+
+/* attach + 开启时旋为 ×（150ms ease-out） */
+.attach-icon {
+  transition: transform var(--dur-fade) var(--ease-out);
+}
+.attach-open .attach-icon {
+  transform: rotate(45deg);
+}
+
+/* mic 录音：外圈扩散脉冲（state indication，1.4s 循环） */
+.mic-btn {
+  position: relative;
+}
+.mic-recording {
+  color: var(--err);
+}
+.mic-recording::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 8px;
+  border: 1.5px solid var(--err);
+  animation: pulse-ring 1.4s var(--ease-out) infinite;
+}
+@keyframes pulse-ring {
+  from {
+    opacity: 0.8;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+}
+
+/* send 就绪态（有内容时从禁用灰暗到强调，state indication） */
+.send-btn {
+  transition:
+    transform var(--dur-press) var(--ease-out),
+    background-color var(--dur-fade) var(--ease-out),
+    opacity var(--dur-fade) var(--ease-out);
+}
+.send-ready {
+  opacity: 1;
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.25);
+}
+
+/* 弹窗行 */
+.popup-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 12px;
+  text-align: left;
+  font-size: 0.75rem;
+}
+.popup-row:hover {
+  background: var(--bg-overlay);
+}
+
+/* 模型 pill 与行 */
+.model-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  transition: transform var(--dur-press) var(--ease-out);
+}
+.model-pill:hover {
+  background: var(--bg-overlay);
+}
+.model-pill:active {
+  transform: scale(0.97);
+}
+.model-pill-name {
+  max-width: 144px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.model-row:hover {
+  background: var(--bg-overlay);
+}
+.model-row-active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.role-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 0.625rem;
+  color: var(--text-dim);
+  transition: transform var(--dur-press) var(--ease-out);
+}
+.role-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+}
+.role-chip:active {
+  transform: scale(0.97);
+}
+.role-chip:disabled {
+  opacity: 0.4;
+}
+
+/* reduced motion：reaction 层降级（保留 opacity，去掉位移/缩放） */
+@media (prefers-reduced-motion: reduce) {
+  .attach-icon,
+  .mic-recording::after {
+    animation: none;
+  }
+  .attach-icon {
+    transition: none;
+  }
+}
