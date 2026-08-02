@@ -1,66 +1,128 @@
+---
 name: Release
 
 on:
-  push:
-    tags:
-      - v*
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to release
+        description: Existing stable SemVer tag to release
         required: true
-        default: v0.1.0
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release
+  group: stable-release
   cancel-in-progress: false
 
 jobs:
-  macos:
-    name: macOS ARM64
-    runs-on: macos-14
-    timeout-minutes: 90
-    environment: release
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+  validate:
+    name: Validate release source
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
-      - uses: pnpm/action-setup@v6
+          # workflow_dispatch 必须从 main 运行，校验器与 workflow 固定在同一 commit。
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag, ancestry, version, changelog, and updater config
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          source scripts/release-lib.sh
+          kxen_require_release_tag "$RELEASE_TAG"
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/release-lib.sh scripts/validate-release.sh "$RUNNER_TEMP/release-tools/"
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            printf 'release tag does not exist locally: %s\n' "$RELEASE_TAG"
+            exit 1
+          fi
+          release_revision="${RELEASE_TAG}^{commit}"
+          release_commit="$(git rev-parse --verify "$release_revision")"
+          main_commit="$(git rev-parse --verify 'origin/main^{commit}')"
+          if ! git merge-base --is-ancestor "$release_commit" "$main_commit"; then
+            printf 'tag %s at %s is not an ancestor of origin/main at %s\n' \
+              "$RELEASE_TAG" "$release_commit" "$main_commit"
+            exit 1
+          fi
+          git checkout --detach "$release_commit"
+          bash "$RUNNER_TEMP/release-tools/validate-release.sh" \
+            "$RELEASE_TAG" origin/main "$GITHUB_REPOSITORY"
+
+  quality:
+    name: Quality gates
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit }}
+
+  macos:
+    name: Build signed macOS ARM64 assets
+    needs:
+      - validate
+      - quality
+    runs-on: macos-14
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve trusted release tools
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/trusted-release-tools"
+          cp scripts/{github-release,prepare-macos-release-assets,release-lib,validate-release,verify-macos-release,verify-release-assets}.sh \
+            scripts/verify-updater-signature.mjs \
+            "$RUNNER_TEMP/trusted-release-tools/"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
         with:
           version: 11.15.1
           run_install: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
       - run: pnpm install --frozen-lockfile
-      - name: Validate release credentials
+      - name: Validate signing credentials
         shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          KXEN_VERSION="$(jq -r '.version' src-tauri/tauri.conf.json)"
-          if [[ "$RELEASE_TAG" != "v$KXEN_VERSION" ]]; then
-            printf 'release tag %s does not match v%s\n' "$RELEASE_TAG" "$KXEN_VERSION"
-            exit 1
-          fi
-          printf 'KXEN_VERSION=%s\n' "$KXEN_VERSION" >> "$GITHUB_ENV"
           required=(
             APPLE_CERTIFICATE
             APPLE_CERTIFICATE_PASSWORD
@@ -77,10 +139,27 @@ jobs:
               exit 1
             fi
           done
+          if [[ ! "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            printf 'APPLE_TEAM_ID must contain 10 uppercase letters or digits\n'
+            exit 1
+          fi
+          if [[ ! "$APPLE_API_KEY" =~ ^[A-Z0-9]{10}$ ]]; then
+            printf 'APPLE_API_KEY must contain 10 uppercase letters or digits\n'
+            exit 1
+          fi
+          if [[ ! "$APPLE_API_ISSUER" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+            printf 'APPLE_API_ISSUER must be a UUID\n'
+            exit 1
+          fi
       - name: Import Developer ID certificate
         shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
+          umask 077
           KXEN_KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
           KXEN_KEYCHAIN_PATH="$RUNNER_TEMP/kxen-signing.keychain-db"
           KXEN_CERTIFICATE_PATH="$RUNNER_TEMP/kxen-certificate.p12"
@@ -98,40 +177,155 @@ jobs:
             -s \
             -k "$KXEN_KEYCHAIN_PASSWORD" \
             "$KXEN_KEYCHAIN_PATH"
-          KXEN_SIGNING_IDENTITY="$(
+          KXEN_SIGNING_IDENTITY_LINES="$(
             security find-identity -v -p codesigning "$KXEN_KEYCHAIN_PATH" |
-              awk -F '"' '/Developer ID Application/ { print $2; exit }'
+              awk '/Developer ID Application/'
           )"
-          if [[ -z "$KXEN_SIGNING_IDENTITY" ]]; then
-            printf 'Developer ID Application identity not found\n'
+          KXEN_SIGNING_IDENTITY_COUNT="$(printf '%s\n' "$KXEN_SIGNING_IDENTITY_LINES" | awk 'NF { count += 1 } END { print count + 0 }')"
+          if [[ "$KXEN_SIGNING_IDENTITY_COUNT" != 1 ]]; then
+            printf 'expected exactly one Developer ID Application identity, found %s\n' "$KXEN_SIGNING_IDENTITY_COUNT"
+            exit 1
+          fi
+          if [[ "$KXEN_SIGNING_IDENTITY_LINES" != *"($APPLE_TEAM_ID)"* ]]; then
+            printf 'Developer ID Application identity does not match APPLE_TEAM_ID\n'
+            exit 1
+          fi
+          KXEN_SIGNING_IDENTITY="$(awk '{ print $2 }' <<< "$KXEN_SIGNING_IDENTITY_LINES")"
+          if [[ ! "$KXEN_SIGNING_IDENTITY" =~ ^[0-9A-F]{40}$ ]]; then
+            printf 'Developer ID Application identity does not expose one SHA-1 hash\n'
             exit 1
           fi
           printf 'APPLE_SIGNING_IDENTITY=%s\n' "$KXEN_SIGNING_IDENTITY" >> "$GITHUB_ENV"
       - name: Prepare App Store Connect key
         shell: bash
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           umask 077
-          KXEN_API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          KXEN_API_KEY_PATH="$RUNNER_TEMP/app-store-connect.p8"
           printf '%s' "$APPLE_API_PRIVATE_KEY" > "$KXEN_API_KEY_PATH"
           printf 'APPLE_API_KEY_PATH=%s\n' "$KXEN_API_KEY_PATH" >> "$GITHUB_ENV"
-      - name: Build and publish GitHub release
-        uses: tauri-apps/tauri-action@v1
+      - name: Build, sign, notarize, and staple
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --target aarch64-apple-darwin
+      - name: Clear temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/kxen-signing.keychain-db" 2>/dev/null || true
+          for path in "$RUNNER_TEMP/kxen-certificate.p12" "$RUNNER_TEMP/app-store-connect.p8"; do
+            if [[ -f "$path" ]]; then
+              : > "$path"
+              chmod 000 "$path"
+            fi
+          done
+      - name: Verify signed app, DMG, and updater artifacts
+        shell: bash
+        run: bash "$RUNNER_TEMP/trusted-release-tools/verify-macos-release.sh"
+      - name: Prepare verified release asset set
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          bash "$RUNNER_TEMP/trusted-release-tools/prepare-macos-release-assets.sh" \
+            "$RELEASE_TAG" \
+            "$GITHUB_REPOSITORY" \
+            src-tauri/target/aarch64-apple-darwin/release/bundle \
+            "$RUNNER_TEMP/release-assets"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          tagName: v__VERSION__
-          releaseName: Kxen v__VERSION__ development preview
-          releaseBody: macOS 14+ Apple Silicon signed and notarized build.
-          releaseDraft: true
-          prerelease: false
-          uploadUpdaterJson: true
-          args: --target aarch64-apple-darwin
-      - name: Verify signed artifacts and publish release
+          name: macos-release-${{ needs.validate.outputs.tag }}
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish verified GitHub release
+    needs:
+      - validate
+      - macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Preserve trusted release tools
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/trusted-release-tools"
+          cp scripts/{github-release,prepare-macos-release-assets,release-lib,validate-release,verify-macos-release,verify-release-assets}.sh \
+            scripts/verify-updater-signature.mjs \
+            "$RUNNER_TEMP/trusted-release-tools/"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: macos-release-${{ needs.validate.outputs.tag }}
+          path: ${{ runner.temp }}/release-assets
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Revalidate tag immediately before publishing
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          bash scripts/verify-macos-release.sh
-          gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: bash "$RUNNER_TEMP/trusted-release-tools/validate-release.sh" "$RELEASE_TAG" origin/main "$GITHUB_REPOSITORY"
+      - name: Verify downloaded release assets
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: bash "$RUNNER_TEMP/trusted-release-tools/verify-release-assets.sh" "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RUNNER_TEMP/release-assets"
+      - name: Create draft release from verified assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: >-
+          bash "$RUNNER_TEMP/trusted-release-tools/github-release.sh"
+          create-draft "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RELEASE_COMMIT" "$RUNNER_TEMP/release-assets"
+      - name: Verify draft release asset set
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: >-
+          bash "$RUNNER_TEMP/trusted-release-tools/github-release.sh"
+          verify-draft "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RELEASE_COMMIT" "$RUNNER_TEMP/release-assets"
+      - name: Publish verified release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: >-
+          bash "$RUNNER_TEMP/trusted-release-tools/github-release.sh"
+          publish "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RELEASE_COMMIT" "$RUNNER_TEMP/release-assets"
+      - name: Clean up incomplete draft after failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: >-
+          bash "$RUNNER_TEMP/trusted-release-tools/github-release.sh"
+          cleanup-draft "$RELEASE_TAG" "$GITHUB_REPOSITORY" "$RELEASE_COMMIT" "$RUNNER_TEMP/release-assets"

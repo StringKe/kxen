@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vp dev",
     "build": "node scripts/build.mjs app",
-    "check": "vp check",
+    "check": "vp check && pnpm typecheck",
+    "typecheck": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "coverage": "node scripts/test.mjs --coverage",
     "tauri": "tauri",
@@ -48,5 +49,8 @@
       "version": "11.15.1",
       "onFail": "download"
     }
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }
