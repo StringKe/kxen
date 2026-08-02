@@ -10,16 +10,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::TeamState;
-use super::inbox::{append_inbox, drain_inbox};
+use super::inbox::append_inbox;
 use super::relay::{LeadPath, LeadRelay};
 use super::tasks::{claim_task, complete_task, create_task};
 use super::types::SpawnDeps;
 
+mod lead_inbox;
+mod lifecycle;
 mod restore;
 
 pub struct TeamManager {
     root: PathBuf,
     sessions: std::sync::Mutex<HashMap<String, Arc<TeamState>>>,
+    /// 启动恢复失败的 Session 必须保持 fail-closed，直到原文件被修复并显式恢复。
+    restore_blocked: std::sync::Mutex<HashMap<String, String>>,
+    registry_lock: std::sync::Mutex<()>,
     deps: SpawnDeps,
     bus: EventBus,
     /// session metadata 目录：session_workdir 的真相源（session.create 记录的 directory）
@@ -33,7 +38,16 @@ impl TeamManager {
         let relay = LeadRelay::new(pending);
         // teammate 转录写穿接线：registry 是全局共享组件，team 根目录只有 manager 知道
         deps.agents.set_team_root(root.clone());
-        let mgr = Arc::new(Self { root, sessions: std::sync::Mutex::new(HashMap::new()), deps, bus, sessions_dir, relay });
+        let mgr = Arc::new(Self {
+            root,
+            sessions: std::sync::Mutex::new(HashMap::new()),
+            restore_blocked: std::sync::Mutex::new(HashMap::new()),
+            registry_lock: std::sync::Mutex::new(()),
+            deps,
+            bus,
+            sessions_dir,
+            relay,
+        });
         mgr.restore();
         mgr
     }
@@ -43,49 +57,36 @@ impl TeamManager {
         &self.relay
     }
 
-    /// member 工作目录唯一解析口：session metadata 的 directory 是真相源
-    ///（workspace switch 只改活跃目录，已建 session 的归属目录不漂移），缺失回退启动目录。
-    pub fn session_workdir(&self, session_id: &str) -> Arc<std::path::Path> {
+    /// member 工作目录唯一解析口：session metadata 的 directory 是真相源。
+    /// metadata 缺失或损坏时不得回退到当前 workspace，否则恢复会在错误项目重启 teammate。
+    pub fn session_workdir(&self, session_id: &str) -> Result<Arc<std::path::Path>, String> {
+        crate::core::ids::validate_id(session_id)?;
         crate::core::session::load_meta(&self.sessions_dir, session_id)
-            .map(|m| Arc::from(std::path::PathBuf::from(m.directory)))
-            .unwrap_or_else(|_| self.deps.fallback_workdir.clone())
+            .map(|meta| Arc::from(std::path::PathBuf::from(meta.directory)))
+            .map_err(|error| format!("load session {session_id} workspace: {error}"))
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn detach_session(&self, session_id: &str) {
-        if crate::core::ids::validate_id(session_id).is_err() {
-            return;
+    pub(super) fn state_for(self: &Arc<Self>, session_id: &str) -> Result<Arc<TeamState>, String> {
+        crate::core::ids::validate_id(session_id)?;
+        self.ensure_session_available(session_id)?;
+        let _registry = lock(&self.registry_lock);
+        if let Some(error) = lock(&self.restore_blocked).get(session_id).cloned() {
+            return Err(format!("team session {session_id} recovery blocked: {error}"));
         }
-        if let Some(state) = lock(&self.sessions).remove(session_id) {
-            for token in lock(&state.cancels).values() {
-                token.cancel();
-            }
-            for notify in lock(&state.notifies).values() {
-                notify.notify_waiters();
-            }
+        if let Some(state) = lock(&self.sessions).get(session_id).cloned() {
+            return Ok(state);
         }
-    }
-
-    /// 会话删除连带：内存状态与 team 目录一起清（幂等；非法 id 拒在拼路径之前，防目录穿越误删）。
-    pub fn drop_session(&self, session_id: &str) {
-        if crate::core::ids::validate_id(session_id).is_err() {
-            return;
-        }
-        self.detach_session(session_id);
-        let _ = std::fs::remove_dir_all(self.root.join(session_id));
-        super::inbox::drop_session_locks(&self.root.join(session_id));
-    }
-
-    pub(super) fn state_for(self: &Arc<Self>, session_id: &str) -> Arc<TeamState> {
+        let workdir = self.session_workdir(session_id)?;
+        let dir = self.root.join(session_id);
+        std::fs::create_dir_all(dir.join("inboxes")).map_err(|error| format!("create team session {}: {error}", dir.display()))?;
         let mut map = lock(&self.sessions);
-        map.entry(session_id.to_string())
+        Ok(map
+            .entry(session_id.to_string())
             .or_insert_with(|| {
-                let dir = self.root.join(session_id);
-                let _ = std::fs::create_dir_all(dir.join("inboxes"));
-                let workdir = self.session_workdir(session_id);
                 Arc::new(TeamState {
                     session_id: session_id.to_string(),
                     dir,
@@ -94,20 +95,25 @@ impl TeamManager {
                     members: std::sync::Mutex::new(Vec::new()),
                     cancels: std::sync::Mutex::new(HashMap::new()),
                     notifies: std::sync::Mutex::new(HashMap::new()),
+                    quiescing: std::sync::atomic::AtomicBool::new(false),
+                    lifecycle_lock: std::sync::Mutex::new(()),
+                    active_loops: std::sync::atomic::AtomicUsize::new(0),
+                    loops_idle: tokio::sync::Notify::new(),
                     tasks: std::sync::Mutex::new(Vec::new()),
                     next_task_id: std::sync::atomic::AtomicU64::new(1),
                     deps: self.deps.clone(),
                     bus: self.bus.clone(),
                 })
             })
-            .clone()
+            .clone())
     }
 
     /// lead 工具入口。
     pub async fn lead_action(self: &Arc<Self>, session_id: &str, args: &Value) -> Result<String, String> {
         // session_id/member name 都会拼进 team 目录与 inbox 文件路径，先过白名单
         crate::core::ids::validate_id(session_id)?;
-        let state = self.state_for(session_id);
+        self.ensure_session_available(session_id)?;
+        let state = self.state_for(session_id)?;
         match args.get("action").and_then(Value::as_str).ok_or("missing action")? {
             "spawn" => {
                 let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?.to_string();
@@ -170,7 +176,7 @@ impl TeamManager {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Value::as_u64).collect())
                     .unwrap_or_default();
-                let task = create_task(&state, title, depends_on);
+                let task = create_task(&state, title, depends_on)?;
                 Ok(format!("task #{} created: {}", task.id, task.title))
             }
             "task_cancel" => {
@@ -201,7 +207,8 @@ impl TeamManager {
     pub fn user_message(self: &Arc<Self>, session_id: &str, name: &str, text: &str) -> Result<String, String> {
         crate::core::ids::validate_id(session_id)?;
         crate::core::ids::validate_id(name)?;
-        let state = self.state_for(session_id);
+        self.ensure_session_available(session_id)?;
+        let state = self.state_for(session_id)?;
         self.send(&state, "user", name, text)?;
         Ok(format!("sent to {name}"))
     }
@@ -250,32 +257,29 @@ impl TeamManager {
             .map(|m| m.name.clone())
             .collect();
         for name in observers {
-            let _ = append_inbox(&state.dir, &name, "feed", &format!("[observed {from} -> {to}] {text}"));
-            if let Some(n) = lock(&state.notifies).get(&name) {
-                n.notify_one();
+            match append_inbox(&state.dir, &name, "feed", &format!("[observed {from} -> {to}] {text}")) {
+                Ok(()) => {
+                    if let Some(n) = lock(&state.notifies).get(&name) {
+                        n.notify_one();
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, observer = name, "observer feed delivery failed");
+                    self.bus.publish(crate::core::event::Event::notify(
+                        format!("Observer {name} 消息保存失败：{error}"),
+                        Some(state.session_id.clone()),
+                    ));
+                }
             }
         }
-    }
-
-    /// lead inbox 排空（run_llm 每轮注入用）。P1-1：排出的信件同步落盘为 user 消息——
-    /// 只进内存的注入在重启/压缩后蒸发，lead 对 teammate 报告过目即忘。
-    pub fn drain_lead_inbox(self: &Arc<Self>, session_id: &str) -> Vec<(String, String)> {
-        let state = self.state_for(session_id);
-        let inbox = drain_inbox(&state.dir, "lead");
-        for (from, note) in &inbox {
-            // 文本与 llm_task 注入 messages 的口径一致（[teammate {from}] 前缀）
-            let part = crate::core::session::Part::Text { text: format!("[teammate {from}] {note}") };
-            let msg = crate::core::session::new_message(session_id, crate::core::session::Role::User, vec![part]);
-            let _ = crate::core::session::append_message(&self.sessions_dir, &msg);
-        }
-        inbox
     }
 
     /// teammate 工具入口（send_message / team_task）。
     pub async fn teammate_action(self: &Arc<Self>, session_id: &str, from: &str, args: &Value) -> Result<String, String> {
         crate::core::ids::validate_id(session_id)?;
         crate::core::ids::validate_id(from)?;
-        let state = self.state_for(session_id);
+        self.ensure_session_available(session_id)?;
+        let state = self.state_for(session_id)?;
         match args.get("action").and_then(Value::as_str).ok_or("missing action")? {
             "send" => {
                 let to = args.get("to").and_then(Value::as_str).ok_or("missing to")?;
@@ -299,10 +303,10 @@ impl TeamManager {
         }
     }
 
-    pub fn list_json(self: &Arc<Self>, session_id: &str) -> Value {
-        let state = self.state_for(session_id);
+    pub fn list_json(self: &Arc<Self>, session_id: &str) -> Result<Value, String> {
+        let state = self.state_for(session_id)?;
         let members = lock(&state.members).clone();
         let tasks = lock(&state.tasks).clone();
-        json!({ "members": members, "tasks": tasks })
+        Ok(json!({ "members": members, "tasks": tasks }))
     }
 }

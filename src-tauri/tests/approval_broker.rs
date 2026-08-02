@@ -283,6 +283,44 @@ async fn empty_session_id_persists_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deadline_race_persists_only_the_effective_outcome() {
+    let dir = tmp_dir("deadline-race");
+    let session = ses::create(&dir, "/tmp/work").unwrap();
+    let broker = std::sync::Arc::new(ApprovalBroker::with_timeout(std::time::Duration::from_millis(2)).with_sessions_dir(dir.clone()));
+    let mut observed = Vec::new();
+    for index in 0..64 {
+        let command = format!("race-{index}");
+        let (id, rx) = broker.register(&session.id, &command, "r");
+        let responder = broker.clone();
+        let response_id = id.clone();
+        let response = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            responder.respond(&response_id, true)
+        });
+        let outcome = broker.wait(&id, rx, None).await;
+        let delivered = response.await.unwrap();
+        observed.push((command, outcome, delivered));
+    }
+
+    let decisions: std::collections::HashMap<_, _> = persisted_decisions(&dir, &session.id).into_iter().collect();
+    for (command, outcome, delivered) in observed {
+        let decision = decisions.get(&command).expect("every race has exactly one durable outcome");
+        match outcome {
+            ApprovalOutcome::Allow => {
+                assert!(delivered);
+                assert_eq!(decision, "allow");
+            }
+            ApprovalOutcome::Timeout => {
+                assert!(!delivered);
+                assert_eq!(decision, "timeout");
+            }
+            ApprovalOutcome::Deny => panic!("allow/timeout race cannot produce deny: {command} -> {decision}"),
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn approval_part_serde_roundtrip() {
     // 落盘 JSONL 形态：type=approval + command/reason/decision，重载原样读回

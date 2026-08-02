@@ -33,6 +33,7 @@ pub(super) enum IdleWake {
     Cancel,
     Inbox(Vec<(String, String)>),
     Nudge,
+    Error(String),
 }
 
 /// idle 等待（P1-3）：notify / timeout / cancel 三路醒；空醒（无 inbox 且无可 claim）继续等。
@@ -54,7 +55,10 @@ pub(super) async fn idle_wait(
         if cancel.is_cancelled() {
             return IdleWake::Cancel;
         }
-        let inbox = drain_inbox(&state.dir, name);
+        let inbox = match drain_inbox(&state.dir, name) {
+            Ok(inbox) => inbox,
+            Err(error) => return IdleWake::Error(error),
+        };
         if !inbox.is_empty() {
             return IdleWake::Inbox(inbox);
         }
@@ -67,9 +71,9 @@ pub(super) async fn idle_wait(
 /// 首轮 user 消息：brief 本体；restore 场景并入残存 inbox（P1-2：崩溃期间来信不丢）
 /// 与本人未完成 claim 清单（列出让模型自己续，不替它改任务状态）。
 /// spawn 与 restore 同路：新成员 inbox 必空、无本人任务，并入项自然为零。
-pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> String {
+pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> Result<String, String> {
     let mut out = brief.to_string();
-    let inbox = drain_inbox(&state.dir, name);
+    let inbox = drain_inbox(&state.dir, name)?;
     if !inbox.is_empty() {
         push_inbox_transcript(state, name, &inbox);
         out.push_str(&format!("\n\n---\nNew messages:\n{}", inbox_text(&inbox)));
@@ -85,7 +89,7 @@ pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> S
             mine.join("\n")
         ));
     }
-    out
+    Ok(out)
 }
 
 /// 每轮 messages 装配：新鲜 system（roster 实时重建，不随历史冻结）+ 跨 wake 历史
@@ -162,8 +166,10 @@ mod tests {
 
     fn state(tag: &str) -> (Arc<TeamState>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kxen-wake-{tag}-{}", std::process::id()));
-        let mgr = crate::agent::team::TeamManager::new(dir.clone(), deps(), EventBus::default(), dir.join("sessions"), None);
-        (mgr.state_for("s1"), dir)
+        let sessions = dir.join("sessions");
+        super::super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
+        let mgr = crate::agent::team::TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, None);
+        (mgr.state_for("s1").unwrap(), dir)
     }
 
     /// P0-1：两轮 wake 后 messages 仍含首条 brief、前轮 assistant 结论与工具结果
@@ -193,16 +199,16 @@ mod tests {
     fn first_prompt_merges_inbox_and_claims() {
         let (state, dir) = state("first");
         super::super::inbox::append_inbox(&state.dir, "w", "lead", "extra context").unwrap();
-        let t = super::super::tasks::create_task(&state, "job-x", vec![]);
+        let t = super::super::tasks::create_task(&state, "job-x", vec![]).unwrap();
         super::super::tasks::claim_task(&state, "w").unwrap();
-        let other = super::super::tasks::create_task(&state, "job-y", vec![]);
+        let other = super::super::tasks::create_task(&state, "job-y", vec![]).unwrap();
         super::super::tasks::claim_task(&state, "z").unwrap();
-        let text = first_prompt(&state, "w", "brief here");
+        let text = first_prompt(&state, "w", "brief here").unwrap();
         assert!(text.starts_with("brief here"));
         assert!(text.contains("[lead] extra context"), "残存 inbox 必须并入首轮: {text}");
         assert!(text.contains(&format!("#{} job-x", t.id)), "本人未完成 claim 必须列出: {text}");
         assert!(!text.contains(&format!("#{}", other.id)), "他人任务不得混入: {text}");
-        assert!(drain_inbox(&state.dir, "w").is_empty(), "首轮 drain 后 inbox 应空");
+        assert!(drain_inbox(&state.dir, "w").unwrap().is_empty(), "首轮 drain 后 inbox 应空");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -242,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn idle_timeout_nudges_claim_when_task_pending() {
         let (state, dir) = state("nudge");
-        super::super::tasks::create_task(&state, "job", vec![]);
+        super::super::tasks::create_task(&state, "job", vec![]).unwrap();
         let notify = Arc::new(Notify::new());
         let cancel = CancelToken::new();
         let wake = idle_wait(&state, "w", &notify, &cancel, std::time::Duration::from_millis(30), true).await;
@@ -288,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn idle_no_nudge_when_unapproved() {
         let (state, dir) = state("nonudge");
-        super::super::tasks::create_task(&state, "job", vec![]);
+        super::super::tasks::create_task(&state, "job", vec![]).unwrap();
         let notify = Arc::new(Notify::new());
         let cancel = CancelToken::new();
         let st = state.clone();

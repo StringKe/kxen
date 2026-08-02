@@ -12,6 +12,16 @@ use super::member_loop::teammate_loop;
 use super::member_wake::{PLAN_VERDICT_APPROVED, PLAN_VERDICT_REJECTED};
 use super::types::{Member, MemberStatus};
 
+struct ActiveLoopGuard(Arc<TeamState>);
+
+impl Drop for ActiveLoopGuard {
+    fn drop(&mut self) {
+        if self.0.active_loops.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            self.0.loops_idle.notify_waiters();
+        }
+    }
+}
+
 impl TeamManager {
     pub(super) fn spawn(
         &self,
@@ -22,20 +32,30 @@ impl TeamManager {
         model_ref: ModelRef,
         plan_approval: bool,
     ) -> Result<String, String> {
-        if lock(&state.members).iter().any(|m| m.name == name) {
-            return Err(format!("teammate already exists: {name}"));
+        let _lifecycle = lock(&state.lifecycle_lock);
+        if state.quiescing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(format!("session deletion in progress: {}", state.session_id));
         }
         let model_name = model_ref.model.clone();
-        lock(&state.members).push(Member {
-            name: name.clone(),
-            role: role.clone(),
-            model: model_ref.clone(),
-            status: MemberStatus::Working,
-            plan_approval,
-            prompt: prompt.clone(),
-            approved: !plan_approval,
-        });
-        super::types::persist_config(state);
+        {
+            let mut members = lock(&state.members);
+            if members.iter().any(|m| m.name == name) {
+                return Err(format!("teammate already exists: {name}"));
+            }
+            members.push(Member {
+                name: name.clone(),
+                role: role.clone(),
+                model: model_ref.clone(),
+                status: MemberStatus::Working,
+                plan_approval,
+                prompt: prompt.clone(),
+                approved: !plan_approval,
+            });
+            if let Err(error) = super::types::persist_config_locked(state, &members) {
+                members.pop();
+                return Err(error);
+            }
+        }
         Self::start_member_loop(state, name, role, prompt, model_ref, !plan_approval);
         Ok(format!("teammate spawned (model {model_name})"))
     }
@@ -61,7 +81,9 @@ impl TeamManager {
             return;
         };
         let st = state.clone();
+        state.active_loops.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         handle.spawn(async move {
+            let _active = ActiveLoopGuard(st.clone());
             teammate_loop(st, name, role, model_ref, prompt, approved, cancel, notify).await;
         });
     }
@@ -75,11 +97,16 @@ impl TeamManager {
             if member.status != MemberStatus::AwaitingPlanApproval {
                 return Err(format!("{name} is not awaiting plan approval (status: {:?})", member.status));
             }
+            let previous = (member.status, member.approved);
             member.status = MemberStatus::Working;
             // 审批结果落盘：崩溃重启后 restore 按 approved 初值续跑，不要求重批
             member.approved = approve;
+            if let Err(error) = super::types::persist_config_locked(state, &members) {
+                let member = members.iter_mut().find(|member| member.name == name).expect("member remains present");
+                (member.status, member.approved) = previous;
+                return Err(error);
+            }
         }
-        super::types::persist_config(state);
         // 结构化前缀替代旧子串语义：member_loop 只认 starts_with 精确匹配，
         // lead 手写/转述 "Plan approved" 不再误批；from=lead + 前缀双条件，正文不再内嵌 [lead]
         let text = if approve {
@@ -96,11 +123,19 @@ impl TeamManager {
         let Some(token) = token else {
             return Err(format!("teammate not found: {name}"));
         };
-        token.cancel();
-        if let Some(m) = lock(&state.members).iter_mut().find(|m| m.name == name) {
-            m.status = MemberStatus::Shutdown;
+        {
+            let mut members = lock(&state.members);
+            let Some(member) = members.iter_mut().find(|member| member.name == name) else {
+                return Err(format!("teammate not found: {name}"));
+            };
+            let previous = member.status;
+            member.status = MemberStatus::Shutdown;
+            if let Err(error) = super::types::persist_config_locked(state, &members) {
+                members.iter_mut().find(|member| member.name == name).expect("member remains present").status = previous;
+                return Err(error);
+            }
         }
-        super::types::persist_config(state);
+        token.cancel();
         Ok(format!("shutdown requested: {name}"))
     }
 }

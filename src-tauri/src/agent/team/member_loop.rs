@@ -1,12 +1,6 @@
 // ---------------- teammate 常驻 loop ----------------
 
-use crate::agent::agent_loop::{AgentContext, run_turn};
-use crate::agent::cancel::CancelToken;
-use crate::core::shared::{lock, read};
-use crate::llm::{Message, ModelRef};
-use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::Notify;
+mod context;
 
 use super::TeamState;
 use super::inbox::append_inbox;
@@ -15,6 +9,16 @@ use super::member_wake::{
     round_messages, strip_system,
 };
 use super::types::MemberStatus;
+use crate::agent::agent_loop::run_turn;
+use crate::agent::cancel::CancelToken;
+use crate::auth::refresh::RefreshOutcome;
+use crate::core::shared::lock;
+use crate::llm::{Message, ModelRef};
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+use context::*;
 
 // 参数逐项都是独立生命周期句柄（state/cancel/notify 各属不同所有者），打包 struct 只换层皮
 #[allow(clippy::too_many_arguments)]
@@ -50,40 +54,58 @@ pub(super) async fn teammate_loop(
         // 阶段 ctx：plan_approval 未批准前只读
         let allowed: Option<&'static [&'static str]> = if approved { None } else { Some(READONLY_TEAM_TOOLS) };
         // 凭证预防刷新：build_ctx 只克隆共享 store 快照，长过期 token 不先换新则当轮失败下轮才自愈
-        refresh_store_credentials(&state, &model).await;
-        let mut ctx = build_ctx(&state, &runtime, &name, &role, &model, allowed, cancel.clone());
+        let refresh = refresh_store_credentials(&state, &model, &cancel).await;
+        let stop_after_run = match refresh {
+            CredentialRefresh::Cancelled => break,
+            CredentialRefresh::GoalStopped => true,
+            CredentialRefresh::Finished(RefreshOutcome::Failed(error)) => {
+                report_to_lead(&state, &name, &format!("{} OAuth refresh failed: {error}", model.provider));
+                set_status(&state, &name, MemberStatus::Failed);
+                return;
+            }
+            CredentialRefresh::Finished(RefreshOutcome::NotNeeded | RefreshOutcome::Refreshed) => false,
+        };
+        let mut ctx = build_ctx(&state, &runtime, &name, &model, allowed, cancel.clone());
         if first_round {
             first_round = false;
             // 首轮从 brief 建起（restore 场景并入残存 inbox 与本人未完成 claim，P1-2）
-            history.push(Message::user(first_prompt(&state, &name, &prompt)));
+            let first = match first_prompt(&state, &name, &prompt) {
+                Ok(first) => first,
+                Err(error) => {
+                    report_delivery_error(&state, &name, "inbox drain", &error);
+                    set_status(&state, &name, MemberStatus::Failed);
+                    return;
+                }
+            };
+            history.push(Message::user(first));
         }
         let mut messages = round_messages(teammate_system(&state, &name, &role, approved), &history);
         let outcome = run_turn(&mut ctx, &mut messages).await;
         history = strip_system(messages);
 
+        // refresh 等待期间 goal 到期：run_turn 的统一 preflight 负责落 BudgetLimited
+        // 与终态事件。结束后重读，避免 pause/resume 恰好跨过旧 deadline 时按过期快照关闭成员。
+        let goal_still_stopped = stop_after_run
+            && matches!(
+                goal_refresh_budget_in(&crate::core::paths::goals_dir(), &state.session_id),
+                crate::core::goal::RuntimeBudget::Stop(_)
+            );
+        if goal_still_stopped {
+            if !outcome.final_text.is_empty() {
+                report_to_lead(&state, &name, &outcome.final_text);
+            }
+            break;
+        }
+
         if !approved {
             // 计划出炉：递交 lead 审批（经 manager.send：observer 抄送 + 前端通知）
             let text = format!("[plan for approval]\n{}", outcome.final_text);
-            match state.manager.upgrade() {
-                Some(mgr) => {
-                    let _ = mgr.send(&state, &name, "lead", &text);
-                }
-                None => {
-                    let _ = append_inbox(&state.dir, "lead", &name, &text);
-                }
-            }
+            report_to_lead(&state, &name, &text);
             set_status(&state, &name, MemberStatus::AwaitingPlanApproval);
         } else {
             // 本轮成果上报 lead（经 manager.send：observer 抄送 + 前端通知）
             if !outcome.final_text.is_empty() {
-                match state.manager.upgrade() {
-                    Some(mgr) => {
-                        let _ = mgr.send(&state, &name, "lead", &outcome.final_text);
-                    }
-                    None => {
-                        let _ = append_inbox(&state.dir, "lead", &name, &outcome.final_text);
-                    }
-                }
+                report_to_lead(&state, &name, &outcome.final_text);
             }
             // teammate_idle hook：exit 非零 = 打回（反馈进 inbox， teammate 继续工作）
             let appr = crate::tools::exec::ApprovalCtx::new(
@@ -106,6 +128,11 @@ pub(super) async fn teammate_loop(
         match idle_wait(&state, &name, &notify, &cancel, IDLE_TIMEOUT, approved).await {
             IdleWake::Cancel => break,
             IdleWake::Nudge => history.push(Message::user(CLAIM_NUDGE)),
+            IdleWake::Error(error) => {
+                report_delivery_error(&state, &name, "inbox drain", &error);
+                set_status(&state, &name, MemberStatus::Failed);
+                return;
+            }
             IdleWake::Inbox(inbox) => {
                 if inbox_has_plan_approval(&inbox) {
                     approved = true;
@@ -118,98 +145,33 @@ pub(super) async fn teammate_loop(
     }
     set_status(&state, &name, MemberStatus::Shutdown);
 }
-
 const READONLY_TEAM_TOOLS: &[&str] = &["read", "glob", "grep", "send_message", "team_task"];
 
 /// idle hook 打回：反馈进 inbox 并唤醒（不唤醒则 teammate 沉睡到下一封外部来信，打回形同虚设）。
 fn idle_rejected(state: &Arc<TeamState>, name: &str, feedback: &str) {
-    let _ = append_inbox(&state.dir, name, "hooks", &format!("keep working: {feedback}"));
-    if let Some(n) = lock(&state.notifies).get(name) {
-        n.notify_one();
-    }
-}
-
-fn build_ctx(
-    state: &Arc<TeamState>,
-    runtime: &Arc<crate::workspace_runtime::WorkspaceRuntime>,
-    name: &str,
-    _role: &str,
-    model: &ModelRef,
-    allowed: Option<&'static [&'static str]>,
-    cancel: CancelToken,
-) -> AgentContext {
-    let agent_name = name.to_string();
-    let session_id = state.session_id.clone();
-    let session_id_event = session_id.clone();
-    let bus = state.bus.clone();
-    let agents = state.deps.agents.clone();
-    let agent_name_tx = name.to_string();
-    let session_id_tx = session_id.clone();
-    AgentContext {
-        registry: state.deps.registry.clone(),
-        tracker: crate::tools::fs_tool::FileTracker::default(),
-        // member 绑其 team session 的目录，不随 workspace switch 漂移（旧 workspace 的活跃 member 继续干活）
-        workdir: state.workdir.clone(),
-        // Teammates do not inherit native-picker grants because their loops can
-        // outlive the foreground run that captured the grant snapshot.
-        path_grants: Arc::new(std::collections::HashSet::new()),
-        model: model.clone(),
-        // 每轮取实时凭证快照：探测/刷新晚于 deps 构造，冻结副本会让派发报假「无可用模型」
-        store: lock(&state.deps.store).clone(),
-        max_turns: 16,
-        mrm: Some(read(&state.deps.mrm).clone()),
-        allowed_tools: allowed,
-        // lead 与 teammates 同会话作用域：共享该 session 的 extras（todo/挂载工具互通）
-        extras: Some(state.deps.extras.extras_for(&state.session_id)),
-        hooks: Some(runtime.hooks()),
-        loop_detector: crate::agent::loop_detect::LoopDetector::new(),
-        cancel: Some(cancel),
-        team: state.manager.upgrade(),
-        team_identity: Some((session_id.clone(), agent_name.clone())),
-        session_id: Some(session_id),
-        agents: Some(state.deps.agents.clone()),
-        bus: Some(state.bus.clone()),
-        approvals: state.deps.approvals.clone(),
-        mcp: Some(runtime.mcp()),
-        lsp: Some(runtime.lsp()),
-        // teammate 不开通知通道：background 派发只从主会话发起（teammate 走 send_message 回 lead）
-        notify: None,
-        stream_override: None,
-        on_event: Arc::new(move |event| {
-            let mut payload = match serde_json::to_value(&event) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("agent".into(), json!(agent_name));
-                obj.insert("session_id".into(), json!(session_id_event));
+    match append_inbox(&state.dir, name, "hooks", &format!("keep working: {feedback}")) {
+        Ok(()) => {
+            if let Some(n) = lock(&state.notifies).get(name) {
+                n.notify_one();
             }
-            agents.push_transcript(&session_id_tx, &agent_name_tx, payload.clone());
-            bus.publish(crate::core::event::Event::LlmDelta(payload));
-        }),
+        }
+        Err(error) => report_delivery_error(state, name, "idle feedback", &error),
     }
 }
 
-/// 凭证预防刷新（主会话 llm_task 同款）：克隆出 store 刷（避免持锁跨 await），成功回写共享 store。
-/// 只刷 ctx 快照不回写时，共享 store 里的旧 refresh 被吊销后每轮快照都是废票，当轮失败下轮才自愈。
-pub(super) async fn refresh_store_credentials(state: &Arc<TeamState>, model: &ModelRef) {
-    let mut store = lock(&state.deps.store).clone();
-    if crate::auth::refresh::ensure_fresh(&mut store, &model.provider, model.account.as_deref()).await {
-        write_back_credential(&state.deps.store, &model.provider, model.account.as_deref(), &store);
+fn report_to_lead(state: &Arc<TeamState>, name: &str, text: &str) {
+    let result = match state.manager.upgrade() {
+        Some(manager) => manager.send(state, name, "lead", text),
+        None => append_inbox(&state.dir, "lead", name, text),
+    };
+    if let Err(error) = result {
+        report_delivery_error(state, name, "lead report", &error);
     }
 }
 
-/// 刷新成果回写共享 store：克隆刷新的新凭证只活在副本里，不回写下一轮快照又拿旧值。
-pub(super) fn write_back_credential(
-    store: &Arc<std::sync::Mutex<crate::auth::credential::AuthStore>>,
-    provider: &str,
-    account: Option<&str>,
-    refreshed: &crate::auth::credential::AuthStore,
-) {
-    let key = account.map(|a| crate::auth::credential::account_id(provider, a)).unwrap_or_else(|| provider.to_string());
-    if let Some(cred) = refreshed.get(&key).cloned() {
-        lock(store).insert(key, cred);
-    }
+fn report_delivery_error(state: &TeamState, name: &str, operation: &str, error: &str) {
+    tracing::error!(%error, member = name, %operation, "team message delivery failed");
+    state.bus.publish(crate::core::event::Event::notify(format!("Teammate {name} 消息保存失败：{error}"), Some(state.session_id.clone())));
 }
 
 pub(super) fn teammate_system(state: &Arc<TeamState>, name: &str, role: &str, approved: bool) -> String {
@@ -239,8 +201,29 @@ pub(super) fn teammate_system(state: &Arc<TeamState>, name: &str, role: &str, ap
 }
 
 fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) {
-    if let Some(m) = lock(&state.members).iter_mut().find(|m| m.name == name) {
-        m.status = status;
+    if status == MemberStatus::Failed
+        && let Err(error) = super::tasks::fail_member_tasks(state, name)
+    {
+        tracing::error!(%error, member = name, "failed teammate tasks could not be finalized");
+        state.bus.publish(crate::core::event::Event::notify(
+            format!("Teammate {name} 任务失败状态保存失败：{error}"),
+            Some(state.session_id.clone()),
+        ));
+    }
+    {
+        let mut members = lock(&state.members);
+        let Some(member) = members.iter_mut().find(|member| member.name == name) else { return };
+        let previous = member.status;
+        member.status = status;
+        if let Err(error) = super::types::persist_config_locked(state, &members) {
+            members.iter_mut().find(|member| member.name == name).expect("member remains present").status = previous;
+            tracing::error!(%error, member = name, "team member status save failed");
+            state.bus.publish(crate::core::event::Event::notify(
+                format!("Teammate {name} 状态保存失败：{error}"),
+                Some(state.session_id.clone()),
+            ));
+            return;
+        }
     }
     let activity_status = match status {
         MemberStatus::Working => crate::agent::activity::ActivityStatus::Working,
@@ -250,7 +233,6 @@ fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) {
         MemberStatus::Shutdown => crate::agent::activity::ActivityStatus::Shutdown,
     };
     state.deps.agents.set_status(&state.session_id, name, activity_status);
-    super::types::persist_config(state);
     let label = match status {
         MemberStatus::Working => "working",
         MemberStatus::Idle => "idle",

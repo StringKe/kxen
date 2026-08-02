@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
+mod process;
+
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct HookRunner {
@@ -90,9 +92,7 @@ impl HookRunner {
     }
 
     fn matching(&self, event: &str, tool: &str) -> Vec<CompiledHook> {
-        self.hooks
-            .read()
-            .expect("hooks")
+        crate::core::shared::read(&self.hooks)
             .get(event)
             .map(|defs| defs.iter().filter(|h| h.matcher.as_ref().is_none_or(|m| m.is_match(tool))).cloned().collect())
             .unwrap_or_default()
@@ -126,29 +126,13 @@ impl HookRunner {
             }
             _ => {}
         }
-        let payload_str = serde_json::to_string(payload).unwrap_or_default();
-        let result = tokio::time::timeout(
-            HOOK_TIMEOUT,
-            tokio::process::Command::new("/bin/zsh")
-                .arg("-c")
-                .arg(&hook.command)
-                .current_dir(&self.workdir)
-                .env("KXEN_EVENT", event)
-                .env("KXEN_TOOL", tool)
-                .env("KXEN_PAYLOAD", &payload_str)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output(),
-        )
-        .await;
-        match result {
-            Err(_) => Err(format!("hook timed out after {}s", HOOK_TIMEOUT.as_secs())),
-            Ok(Err(e)) => Err(format!("hook spawn failed: {e}")),
-            Ok(Ok(out)) if out.status.success() => Ok(()),
-            Ok(Ok(out)) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                Err(format!("hook exited {}: {}", out.status.code().unwrap_or(-1), stderr.chars().take(200).collect::<String>()))
-            }
+        let payload_str = serde_json::to_string(payload).map_err(|error| format!("serialize hook payload: {error}"))?;
+        let cancel = approval.and_then(|context| context.cancel);
+        let out = process::run(&hook.command, &self.workdir, event, tool, &payload_str, HOOK_TIMEOUT, cancel).await?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!("hook exited {}: {}", out.status.code().unwrap_or(-1), out.stderr.chars().take(200).collect::<String>()))
         }
     }
 }

@@ -63,7 +63,7 @@ pub struct TeamTask {
 #[derive(Clone)]
 pub struct SpawnDeps {
     pub registry: Arc<crate::tools::task::TaskRegistry>,
-    /// 只兜底：session metadata 缺失时的回退目录；真实 workdir 由 TeamManager::session_workdir 解析
+    /// App 启动 workspace 快照。Team member 的实际 workdir 只从 session metadata 解析。
     pub fallback_workdir: Arc<Path>,
     /// 共享句柄而非冻结副本：凭证探测/token 刷新晚于 TeamManager 构造，操作点 lock 取实时快照
     pub store: Arc<std::sync::Mutex<crate::auth::credential::AuthStore>>,
@@ -72,6 +72,7 @@ pub struct SpawnDeps {
     pub extras: Arc<crate::agent::agent_loop::SessionExtrasRegistry>,
     pub agents: Arc<crate::agent::activity::AgentRegistry>,
     pub approvals: Option<Arc<crate::agent::approval::ApprovalBroker>>,
+    pub session_usage: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::core::usage::SessionUsage>>>,
 }
 
 /// 各测试模块共用的 SpawnDeps fixture（4 处调用点：mod/tasks/member_wake/member_loop tests）。
@@ -86,7 +87,26 @@ pub(crate) fn test_deps() -> SpawnDeps {
         extras: Arc::new(crate::agent::agent_loop::SessionExtrasRegistry::default()),
         agents: Arc::new(crate::agent::activity::AgentRegistry::default()),
         approvals: None,
+        session_usage: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_test_session(sessions_dir: &Path, id: &str, workdir: &Path) {
+    std::fs::create_dir_all(sessions_dir).expect("create team test sessions directory");
+    let now = crate::core::session::now_ms();
+    let session = crate::core::session::Session {
+        id: id.to_string(),
+        title: "test".into(),
+        directory: workdir.to_string_lossy().into_owned(),
+        parent_id: None,
+        created_at: now,
+        updated_at: now,
+        pinned: false,
+        sort_order: None,
+        model: None,
+    };
+    crate::core::session::save_meta(sessions_dir, &session).expect("seed team test session metadata");
 }
 
 pub(crate) struct TeamState {
@@ -98,6 +118,11 @@ pub(crate) struct TeamState {
     pub(crate) members: std::sync::Mutex<Vec<Member>>,
     pub(crate) cancels: std::sync::Mutex<HashMap<String, CancelToken>>,
     pub(crate) notifies: std::sync::Mutex<HashMap<String, Arc<Notify>>>,
+    /// Session 删除 quiesce 屏障：禁止新 loop，并等待已取消 loop 全部退出后再 stage recovery bundle。
+    pub(crate) quiescing: std::sync::atomic::AtomicBool,
+    pub(crate) lifecycle_lock: std::sync::Mutex<()>,
+    pub(crate) active_loops: std::sync::atomic::AtomicUsize,
+    pub(crate) loops_idle: Notify,
     pub(crate) tasks: std::sync::Mutex<Vec<TeamTask>>,
     pub(crate) next_task_id: std::sync::atomic::AtomicU64,
     pub(crate) deps: SpawnDeps,
@@ -106,16 +131,36 @@ pub(crate) struct TeamState {
 
 /// config.json 唯一写路径：manager 状态变更（spawn/verdict/shutdown）与 member_loop 状态机共用，
 /// 各写一份内联序列化会在字段演进时漂移（一处改了另一处漏改）。
-pub(crate) fn persist_config(state: &TeamState) {
-    let config = serde_json::json!({ "session_id": state.session_id, "members": *crate::core::shared::lock(&state.members) });
-    // tmp+rename 原子写：崩溃不留半截 config（restore 靠它重建常驻 teammate，半截 JSON = 整队丢失）
-    let path = state.dir.join("config.json");
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) =
-        std::fs::write(&tmp, serde_json::to_string_pretty(&config).unwrap_or_default()).and_then(|_| std::fs::rename(&tmp, &path))
-    {
-        tracing::warn!(session = state.session_id, error = %e, "team config.json persist failed");
+pub(crate) fn persist_config(state: &TeamState) -> Result<(), String> {
+    let members = crate::core::shared::lock(&state.members);
+    persist_config_locked(state, &members)
+}
+
+pub(crate) fn persist_config_locked(state: &TeamState, members: &[Member]) -> Result<(), String> {
+    let config = serde_json::json!({ "session_id": state.session_id, "members": members });
+    write_json_atomic(&state.dir.join("config.json"), &config)
+}
+
+pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
+    let text = serde_json::to_vec_pretty(value).map_err(|error| format!("serialize {}: {error}", path.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+    file.write_all(&text).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|error| {
+        std::fs::remove_file(&tmp).ok();
+        format!("replace {}: {error}", path.display())
+    })
 }
 
 /// 成员 + 任务的可读清单（lead/teammate 的 list 动作输出）

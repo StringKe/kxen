@@ -48,24 +48,28 @@ mod tests {
 
     fn manager(tag: &str) -> (Arc<TeamManager>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("kxen-team-{tag}-{}", std::process::id()));
-        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), dir.join("sessions"), None);
+        let sessions = dir.join("sessions");
+        super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
+        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, None);
         (mgr, dir)
     }
 
     /// 配了 pending queue 的 manager（P0-2 双路测试用）
     fn manager_with_pending(tag: &str) -> (Arc<TeamManager>, PathBuf, Arc<crate::core::pending_queue::PendingQueues>) {
         let dir = std::env::temp_dir().join(format!("kxen-team-{tag}-{}", std::process::id()));
+        let sessions = dir.join("sessions");
+        super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
         let pending = Arc::new(crate::core::pending_queue::PendingQueues::new(dir.join("queues")));
-        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), dir.join("sessions"), Some(pending.clone()));
+        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, Some(pending.clone()));
         (mgr, dir, pending)
     }
 
     #[tokio::test]
     async fn task_dependency_unlocks_on_complete() {
         let (mgr, dir) = manager("deps");
-        let state = mgr.state_for("s1");
-        let t1 = create_task(&state, "first", vec![]);
-        let _t2 = create_task(&state, "second", vec![t1.id]);
+        let state = mgr.state_for("s1").unwrap();
+        let t1 = create_task(&state, "first", vec![]).unwrap();
+        let _t2 = create_task(&state, "second", vec![t1.id]).unwrap();
         assert!(claim_task(&state, "a").unwrap().contains("first"));
         assert!(claim_task(&state, "b").is_err(), "t2 应被依赖阻塞");
         complete_task(&state, "a", t1.id).await.unwrap();
@@ -74,27 +78,32 @@ mod tests {
     }
 
     #[test]
-    fn inbox_drain_validates_and_clears() {
+    fn malformed_inbox_fails_closed_and_preserves_bytes() {
         let (mgr, dir) = manager("inbox");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         append_inbox(&state.dir, "a", "x", "hello").unwrap();
         let path = dir.join("s1/inboxes/a.json");
         let mut content = std::fs::read_to_string(&path).unwrap();
         content.push_str("not json\n");
-        std::fs::write(&path, content).unwrap();
-        let drained = drain_inbox(&state.dir, "a");
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].1, "hello");
-        assert!(drain_inbox(&state.dir, "a").is_empty(), "drain 后应清空");
+        std::fs::write(&path, &content).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = drain_inbox(&state.dir, "a").expect_err("坏行必须阻止整批交付和清空");
+        assert!(error.contains("line 2"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "损坏 inbox 原件必须保持不变");
+
+        std::fs::write(&path, content.lines().next().unwrap().to_string() + "\n").unwrap();
+        let drained = drain_inbox(&state.dir, "a").unwrap();
+        assert_eq!(drained, vec![("x".to_string(), "hello".to_string())]);
+        assert!(drain_inbox(&state.dir, "a").unwrap().is_empty(), "修复后 drain 应清空");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn lead_inbox_via_manager() {
         let (mgr, dir) = manager("lead");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         mgr.send(&state, "worker1", "lead", "result here").unwrap();
-        let drained = mgr.drain_lead_inbox("s1");
+        let drained = mgr.drain_lead_inbox("s1").unwrap();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].0, "worker1");
         let _ = std::fs::remove_dir_all(&dir);
@@ -104,12 +113,12 @@ mod tests {
     #[test]
     fn lead_report_injected_into_active_run() {
         let (mgr, dir, pending) = manager_with_pending("wake-notify");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         let router = Arc::new(crate::agent::background::NotifyRouter::new());
         mgr.relay().register("s1", &router);
         mgr.send(&state, "worker1", "lead", "result here").unwrap();
         assert_eq!(router.drain(), vec!["[teammate worker1] result here".to_string()]);
-        assert!(drain_inbox(&state.dir, "lead").is_empty(), "走 notify 再躺 lead.json 会被下次 run 重复注入");
+        assert!(drain_inbox(&state.dir, "lead").unwrap().is_empty(), "走 notify 再躺 lead.json 会被下次 run 重复注入");
         assert!(!pending.has_queued("s1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -118,14 +127,14 @@ mod tests {
     #[test]
     fn lead_report_queued_without_run() {
         let (mgr, dir, pending) = manager_with_pending("wake-pending");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         let kicks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let kicks2 = kicks.clone();
         mgr.relay().set_kick(move |sid| kicks2.lock().unwrap().push(sid));
         mgr.send(&state, "worker1", "lead", "result here").unwrap();
         assert_eq!(pending.texts("s1"), vec!["[teammate worker1] result here".to_string()]);
         assert_eq!(kicks.lock().unwrap().as_slice(), &["s1".to_string()], "入队必须触发续跑 kick");
-        assert!(drain_inbox(&state.dir, "lead").is_empty());
+        assert!(drain_inbox(&state.dir, "lead").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -136,9 +145,9 @@ mod tests {
         // append_message 要求 session meta 存在（防孤儿 JSONL），先建真会话取其 id
         let sessions_dir = dir.join("sessions");
         let ses = crate::core::session::create(&sessions_dir, "/tmp").unwrap();
-        let state = mgr.state_for(&ses.id);
+        let state = mgr.state_for(&ses.id).unwrap();
         mgr.send(&state, "worker1", "lead", "result here").unwrap();
-        let drained = mgr.drain_lead_inbox(&ses.id);
+        let drained = mgr.drain_lead_inbox(&ses.id).unwrap();
         assert_eq!(drained.len(), 1);
         let msgs = crate::core::session::load_messages(&sessions_dir, &ses.id);
         assert_eq!(msgs.len(), 1, "注入必须落盘一条 user 消息");
@@ -152,6 +161,24 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "[teammate worker1] result here");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_lead_inbox_retries_partial_commit_without_duplicate() {
+        let (mgr, dir) = manager("drain-partial-commit");
+        let state = mgr.state_for("s1").unwrap();
+        mgr.send(&state, "worker1", "lead", "durable result").unwrap();
+        let sessions = dir.join("sessions");
+        let meta_tmp = sessions.join("s1.json.tmp");
+        std::fs::create_dir_all(&meta_tmp).unwrap();
+
+        assert!(mgr.drain_lead_inbox("s1").is_err(), "meta 更新失败时本轮必须中止");
+        assert_eq!(crate::core::session::load_messages(&sessions, "s1").len(), 1, "JSONL 已越过真实 commit point");
+
+        std::fs::remove_dir(&meta_tmp).unwrap();
+        assert!(mgr.drain_lead_inbox("s1").unwrap().is_empty(), "历史已含该稳定 ID 时不得再次注入模型");
+        assert_eq!(crate::core::session::load_messages(&sessions, "s1").len(), 1, "稳定 message id 重放不得重复追加");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -170,19 +197,19 @@ mod tests {
     #[test]
     fn observer_receives_traffic_copy() {
         let (mgr, dir) = manager("observer");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "a", "execution");
         push_member(&state, "b", "execution");
         push_member(&state, "c", "observer");
         // teammate 互发抄送
         mgr.send(&state, "a", "b", "ping").unwrap();
-        let feed = drain_inbox(&state.dir, "c");
+        let feed = drain_inbox(&state.dir, "c").unwrap();
         assert_eq!(feed.len(), 1);
         assert_eq!(feed[0].0, "feed", "observer 抄送 from=feed，防误判为 lead 直发");
         assert!(feed[0].1.contains("[observed a -> b] ping"));
         // 上报 lead 也抄送
         mgr.send(&state, "a", "lead", "done").unwrap();
-        let feed2 = drain_inbox(&state.dir, "c");
+        let feed2 = drain_inbox(&state.dir, "c").unwrap();
         assert_eq!(feed2.len(), 1);
         assert!(feed2[0].1.contains("[observed a -> lead]"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -191,7 +218,7 @@ mod tests {
     #[test]
     fn roster_injected_into_system_prompt() {
         let (mgr, dir) = manager("roster");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "a", "execution");
         let sys = super::member_loop::teammate_system(&state, "a", "execution", true);
         assert!(sys.contains("Current team roster:"));
@@ -218,8 +245,10 @@ mod tests {
             ]
         });
         std::fs::write(session_dir.join("config.json"), serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), dir.join("sessions"), None);
-        let state = mgr.state_for("s1");
+        let sessions = dir.join("sessions");
+        super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
+        let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, None);
+        let state = mgr.state_for("s1").unwrap();
         // live：loop 重启（通道重建是 deterministic 信号；状态随后由 loop 自管）
         assert!(lock(&state.cancels).contains_key("live"), "崩前活跃成员必须重建取消通道");
         assert!(lock(&state.notifies).contains_key("live"), "崩前活跃成员必须重建唤醒通道");
@@ -233,11 +262,11 @@ mod tests {
     #[tokio::test]
     async fn user_message_lands_as_user_not_lead() {
         let (mgr, dir) = manager("usermsg");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "w", "execution");
         mgr.user_message("s1", "w", "hello teammate").unwrap();
         mgr.lead_action("s1", &serde_json::json!({ "action": "message", "name": "w", "text": "lead speaking" })).await.unwrap();
-        let got = drain_inbox(&state.dir, "w");
+        let got = drain_inbox(&state.dir, "w").unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, "user", "RPC 直发必须标 user，防用户流量被伪装成 lead 权威指令");
         assert_eq!(got[0].1, "hello teammate");
@@ -250,7 +279,7 @@ mod tests {
     #[tokio::test]
     async fn direct_message_echoes_into_recipient_transcript() {
         let (mgr, dir) = manager("echo");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "w", "execution");
         push_member(&state, "p", "execution");
         let model = crate::llm::ModelRef::new("p", "m");
@@ -272,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn plan_verdict_carries_structured_prefix() {
         let (mgr, dir) = manager("verdict");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "w", "execution");
         push_member(&state, "v", "execution");
         for m in lock(&state.members).iter_mut() {
@@ -280,11 +309,11 @@ mod tests {
         }
         mgr.lead_action("s1", &serde_json::json!({ "action": "approve", "name": "w" })).await.unwrap();
         mgr.lead_action("s1", &serde_json::json!({ "action": "reject", "name": "v", "feedback": "too vague" })).await.unwrap();
-        let approved = drain_inbox(&state.dir, "w");
+        let approved = drain_inbox(&state.dir, "w").unwrap();
         assert_eq!(approved.len(), 1);
         assert!(approved[0].1.starts_with("[plan-verdict:approved]"), "approve 必须带结构化前缀: {}", approved[0].1);
         assert!(super::member_wake::inbox_has_plan_approval(&approved), "前缀必须被批准侦测命中");
-        let rejected = drain_inbox(&state.dir, "v");
+        let rejected = drain_inbox(&state.dir, "v").unwrap();
         assert!(rejected[0].1.starts_with("[plan-verdict:rejected]"));
         assert!(rejected[0].1.contains("too vague"), "reject 反馈必须保留");
         assert!(!super::member_wake::inbox_has_plan_approval(&rejected), "reject 不得算批准");
@@ -295,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cancels_token_and_persists_status() {
         let (mgr, dir) = manager("shutdown");
-        let state = mgr.state_for("s1");
+        let state = mgr.state_for("s1").unwrap();
         push_member(&state, "w", "execution");
         // 复刻 start_member_loop 的通道注册，不起真 loop（loop 退出才写注册表，这里只验 manager 语义）
         let token = crate::agent::cancel::CancelToken::new();

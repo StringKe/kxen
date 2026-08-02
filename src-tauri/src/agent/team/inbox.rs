@@ -1,20 +1,21 @@
 // ---------------- inbox ----------------
 
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::session::now_ms;
 
-#[derive(Debug, Deserialize)]
-struct InboxEntry {
-    from: String,
-    text: String,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct InboxEntry {
+    pub(super) from: String,
+    pub(super) text: String,
+    /// lead transcript 使用稳定 ID。JSONL 已提交但 meta 更新失败时，同一 mailbox 记录重放不会重复追加。
     #[serde(default)]
-    #[allow(dead_code)]
-    at: u64,
+    pub(super) transcript_id: String,
+    #[serde(default)]
+    pub(super) at: u64,
 }
 
 /// 按 inbox 文件路径分桶的写锁：append 与 drain 必须互斥，
@@ -42,13 +43,28 @@ pub(super) fn drop_session_locks(session_dir: &Path) {
 pub(super) const INBOX_TEXT_CAP: usize = 4000;
 
 pub(super) fn append_inbox(dir: &Path, to: &str, from: &str, text: &str) -> Result<(), String> {
+    append_entry(
+        dir,
+        to,
+        &InboxEntry { from: from.to_string(), text: cap_text(text), transcript_id: crate::core::ids::new_id("msg"), at: now_ms() },
+    )
+}
+
+pub(super) fn restore_inbox(dir: &Path, to: &str, entry: &InboxEntry) -> Result<(), String> {
+    append_entry(dir, to, entry)
+}
+
+fn append_entry(dir: &Path, to: &str, entry: &InboxEntry) -> Result<(), String> {
     use std::io::Write;
+    crate::core::ids::validate_id(to)?;
+    crate::core::ids::validate_id(&entry.from)?;
     let path = dir.join("inboxes").join(format!("{to}.json"));
-    let entry = json!({ "from": from, "text": cap_text(text), "at": now_ms() });
     let lock = lock_for(&path);
     let _guard = lock.lock().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(path.parent().expect("inbox path has a parent")).map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
-    writeln!(file, "{}", entry).map_err(|e| e.to_string())
+    writeln!(file, "{}", serde_json::to_string(entry).map_err(|error| error.to_string())?).map_err(|e| e.to_string())?;
+    file.sync_data().map_err(|error| error.to_string())
 }
 
 /// 按 char 计数截断（不劈 UTF-8 边界），超限标注原始长度让收信方知道看的是残篇
@@ -61,28 +77,52 @@ fn cap_text(text: &str) -> String {
     format!("{kept}...[truncated, original {total} chars]")
 }
 
-/// 读 + 校验 + 清空（坏行报错剔除，valid 照常送达——对齐 Claude Code v2.1.207+ 行为）。
+/// 读 + 校验 + 清空。任一坏行使整批 fail closed，原文件保持不变，避免清空时永久丢失损坏行。
 /// 临界区覆盖完整「读-校验-清空」：append 不会落在读取与清空的间隙里。
-pub(super) fn drain_inbox(dir: &Path, name: &str) -> Vec<(String, String)> {
+pub(super) fn drain_inbox(dir: &Path, name: &str) -> Result<Vec<(String, String)>, String> {
+    drain_inbox_entries(dir, name).map(|entries| entries.into_iter().map(|entry| (entry.from, entry.text)).collect())
+}
+
+pub(super) fn drain_inbox_entries(dir: &Path, name: &str) -> Result<Vec<InboxEntry>, String> {
+    crate::core::ids::validate_id(name)?;
     let path = dir.join("inboxes").join(format!("{name}.json"));
     let lock = lock_for(&path);
-    let _guard = match lock.lock() {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(inbox = name, error = %e, "inbox lock poisoned");
-            return Vec::new();
-        }
+    let _guard = lock.lock().map_err(|error| format!("lock inbox {name}: {error}"))?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read inbox {}: {error}", path.display())),
     };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
     let mut out = Vec::new();
-    for line in text.lines() {
-        match serde_json::from_str::<InboxEntry>(line) {
-            Ok(entry) => out.push((entry.from, entry.text)),
-            Err(e) => tracing::warn!(inbox = name, error = %e, "dropping malformed inbox entry"),
+    for (index, line) in text.lines().enumerate() {
+        let mut entry = serde_json::from_str::<InboxEntry>(line)
+            .map_err(|error| format!("parse inbox {} line {}: {error}", path.display(), index + 1))?;
+        if entry.transcript_id.is_empty() {
+            entry.transcript_id = crate::core::ids::new_id("msg");
         }
+        out.push(entry);
     }
-    let _ = std::fs::write(&path, "");
-    out
+    // 未提交清空时不得交付，否则下一次 drain 会重复注入同一批消息。
+    clear_atomic(&path)?;
+    Ok(out)
+}
+
+fn clear_atomic(path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+    file.write_all(b"").map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|error| {
+        std::fs::remove_file(&tmp).ok();
+        format!("replace {}: {error}", path.display())
+    })
 }
 
 #[cfg(test)]
@@ -97,7 +137,7 @@ mod tests {
         let big = "x".repeat(9000);
         append_inbox(&dir, "a", "w", &big).unwrap();
         append_inbox(&dir, "a", "w", "short").unwrap();
-        let got = drain_inbox(&dir, "a");
+        let got = drain_inbox(&dir, "a").unwrap();
         assert_eq!(got.len(), 2);
         assert!(got[0].1.len() < INBOX_TEXT_CAP + 64, "截断后必须贴近 cap: {}", got[0].1.len());
         assert!(got[0].1.ends_with("original 9000 chars]"), "截断必须标注原始长度");
@@ -129,7 +169,7 @@ mod tests {
             let drained = drained.clone();
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    for (_, text) in drain_inbox(&dir, "a") {
+                    for (_, text) in drain_inbox(&dir, "a").unwrap() {
                         drained.lock().unwrap().push(text);
                     }
                     std::thread::yield_now();
@@ -140,13 +180,13 @@ mod tests {
             w.join().unwrap();
         }
         // 写入全部完成后收尾排空，再停 drainer
-        for (_, text) in drain_inbox(&dir, "a") {
+        for (_, text) in drain_inbox(&dir, "a").unwrap() {
             drained.lock().unwrap().push(text);
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         drainer.join().unwrap();
         // join 后可能还有最后一轮 drain 遗漏：再收一次尾
-        for (_, text) in drain_inbox(&dir, "a") {
+        for (_, text) in drain_inbox(&dir, "a").unwrap() {
             drained.lock().unwrap().push(text);
         }
 

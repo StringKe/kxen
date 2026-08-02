@@ -124,13 +124,18 @@ impl ApprovalBroker {
             .collect()
     }
 
-    /// 用户应答（RPC 通道）：id 存在则送达并返回 true。应答即落盘（allow/deny）——
-    /// 发送失败（等待方已随 run 消失）也照落：用户确实做过决定，痕迹按决定记。
+    /// 用户应答（RPC 通道）：从 pending 摘除即赢得唯一终态；发送成功后才记录 allow/deny。
+    /// 若等待方已消失，实际执行不可能发生，记录 cancel 而不是虚假的 allow。
     pub fn respond(&self, id: &str, allow: bool) -> bool {
         let entry = crate::core::shared::lock(&self.pending).remove(id);
         let Some(e) = entry else { return false };
         let delivered = e.tx.send(allow).is_ok();
-        self.persist_decision(&e.session_id, &e.command, &e.reason, if allow { "allow" } else { "deny" });
+        if delivered {
+            self.persist_decision(&e.session_id, &e.command, &e.reason, if allow { "allow" } else { "deny" });
+        } else {
+            self.persist_decision(&e.session_id, &e.command, &e.reason, "cancel");
+            self.publish_resolved(id, &e.session_id, "cancelled");
+        }
         delivered
     }
 
@@ -150,52 +155,50 @@ impl ApprovalBroker {
         entries.len()
     }
 
-    /// 等待决定：abort 优先（视为拒绝）；超时自动 Timeout。
-    /// 返回前兜底摘除：respond/cancel_session 已摘则无操作，其余路径（超时）防泄漏。
-    /// 超时与中断各发一条 approval.resolved；cancel_session 的已由其代发（entry 不在 = 有人代发，不重复）。
-    /// 落盘同口径：entry 还在 = 本函数了结（timeout/cancel），entry 不在 = respond/cancel_session 已落。
+    /// 等待决定：respond/timeout/cancel/abort 竞争同一 pending map entry，只有摘除成功者能决定、发布和落盘。
+    /// 若 timeout/abort 醒来时 entry 已被 respond/cancel_session 摘除，必须等待其 oneshot 结果，不能自造矛盾终态。
     pub async fn wait(&self, id: &str, rx: oneshot::Receiver<bool>, cancel: Option<&crate::agent::cancel::CancelToken>) -> ApprovalOutcome {
-        // 唤醒源三态：用户应答 / 发送方 drop（cancel_session 清场）/ abort 令牌
         enum Wake {
-            Respond(bool),
-            Closed,
+            Response(Result<bool, oneshot::error::RecvError>),
             Aborted,
+            Timeout,
         }
-        let decided = async move {
-            let wake = |r: Result<bool, oneshot::error::RecvError>| match r {
-                Ok(v) => Wake::Respond(v),
-                Err(_) => Wake::Closed,
-            };
-            match cancel {
-                Some(token) => tokio::select! {
-                    r = rx => wake(r),
-                    _ = token.wait() => Wake::Aborted,
-                },
-                None => wake(rx.await),
-            }
+        let mut rx = rx;
+        let timeout = tokio::time::sleep(self.timeout);
+        tokio::pin!(timeout);
+        let wake = match cancel {
+            Some(token) => tokio::select! {
+                response = &mut rx => Wake::Response(response),
+                _ = token.wait() => Wake::Aborted,
+                _ = &mut timeout => Wake::Timeout,
+            },
+            None => tokio::select! {
+                response = &mut rx => Wake::Response(response),
+                _ = &mut timeout => Wake::Timeout,
+            },
         };
-        let (outcome, lapsed) = match tokio::time::timeout(self.timeout, decided).await {
-            Ok(Wake::Respond(true)) => (ApprovalOutcome::Allow, None),
-            Ok(Wake::Respond(false)) => (ApprovalOutcome::Deny, None),
-            Ok(Wake::Closed) => (ApprovalOutcome::Deny, None),
-            Ok(Wake::Aborted) => (ApprovalOutcome::Deny, Some("cancelled")),
-            Err(_) => (ApprovalOutcome::Timeout, Some("timeout")),
-        };
-        let entry = crate::core::shared::lock(&self.pending).remove(id);
-        if let Some(entry) = entry {
-            let decision = match (outcome, lapsed) {
-                (ApprovalOutcome::Timeout, _) => Some("timeout"),
-                (ApprovalOutcome::Deny, Some("cancelled")) => Some("cancel"),
-                _ => None,
-            };
-            if let Some(d) = decision {
-                self.persist_decision(&entry.session_id, &entry.command, &entry.reason, d);
-            }
-            if let Some(outcome_str) = lapsed {
-                self.publish_resolved(id, &entry.session_id, outcome_str);
+        match wake {
+            Wake::Response(Ok(true)) => ApprovalOutcome::Allow,
+            Wake::Response(Ok(false) | Err(_)) => ApprovalOutcome::Deny,
+            lapse @ (Wake::Aborted | Wake::Timeout) => {
+                let entry = crate::core::shared::lock(&self.pending).remove(id);
+                if let Some(entry) = entry {
+                    let (outcome, persisted, published) = match lapse {
+                        Wake::Aborted => (ApprovalOutcome::Deny, "cancel", "cancelled"),
+                        Wake::Timeout => (ApprovalOutcome::Timeout, "timeout", "timeout"),
+                        Wake::Response(_) => unreachable!(),
+                    };
+                    self.persist_decision(&entry.session_id, &entry.command, &entry.reason, persisted);
+                    self.publish_resolved(id, &entry.session_id, published);
+                    outcome
+                } else {
+                    match rx.await {
+                        Ok(true) => ApprovalOutcome::Allow,
+                        Ok(false) | Err(_) => ApprovalOutcome::Deny,
+                    }
+                }
             }
         }
-        outcome
     }
 }
 
