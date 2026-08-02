@@ -112,6 +112,26 @@ describe("Workspaces resync 自愈", () => {
     dispose();
     expect(h.resync.size).toBe(0);
   });
+
+  it("成功后刷新失败保留 last-good 并持续标记 stale，恢复成功后清除", async () => {
+    const dispose = render(() => <Workspaces />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("/a");
+
+    h.workspacesOverview.mockRejectedValueOnce(new Error("poll timeout"));
+    for (const cb of h.resync) cb();
+    await flush();
+    expect(document.body.textContent).toContain("刷新工作区失败，正在显示上次结果");
+    expect(document.body.textContent).toContain("poll timeout");
+    expect(document.body.textContent).toContain("/a");
+
+    h.workspacesOverview.mockResolvedValueOnce([]);
+    btnByText("重试")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush();
+    expect(document.body.textContent).not.toContain("刷新工作区失败");
+    expect(document.body.textContent).toContain("还没有工作区");
+    dispose();
+  });
 });
 
 describe("Workspaces 首载三态", () => {

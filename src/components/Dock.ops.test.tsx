@@ -18,6 +18,7 @@ const h = vi.hoisted(() => ({
   },
   diffReload: vi.fn(async () => {}),
   diffFile: vi.fn(async (_sid: string, _path: string) => ({ state: "ok", text: "" }) as unknown),
+  resync: new Set<() => void>(),
 }));
 
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -42,7 +43,12 @@ vi.mock("../lib/agent-diff", () => ({
 }));
 
 vi.mock("../lib/client", () => ({
-  client: { onResync: (_cb: () => void) => () => {} },
+  client: {
+    onResync: (cb: () => void) => {
+      h.resync.add(cb);
+      return () => h.resync.delete(cb);
+    },
+  },
 }));
 
 // Markdown / DockWorktree 与本测试无关（重依赖 + 自带 RPC），桩掉保持用例聚焦
@@ -76,6 +82,7 @@ afterEach(() => {
   h.goalList.mockResolvedValue([]);
   h.taskList.mockResolvedValue([]);
   h.diffStatus = { state: "ok", entries: [] };
+  h.resync.clear();
   for (const m of flash.msgs()) flash.dismiss(m.id);
   setActiveSessionId("");
 });
@@ -128,6 +135,68 @@ describe("Dock 会话改动三态", () => {
   });
 });
 
+describe("Dock goal/tasks 首载失败", () => {
+  it("显示错误和重试，不把 UNKNOWN 误报为真空", async () => {
+    h.goalFocus.mockRejectedValueOnce(new Error("goal offline"));
+    h.taskList.mockRejectedValueOnce(new Error("task offline"));
+    const dispose = render(() => <Dock />, document.body);
+    await flush();
+
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("加载目标失败：goal offline");
+    expect(text).toContain("加载后台任务失败：task offline");
+    expect(text).not.toContain("无焦点 goal");
+    expect(text).not.toContain("无后台任务");
+
+    const retries = [...document.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) => button.textContent === "重试",
+    );
+    expect(retries).toHaveLength(2);
+    retries[0]!.click();
+    retries[1]!.click();
+    await flush();
+    expect(document.body.textContent).toContain("无焦点 goal");
+    expect(document.body.textContent).toContain("无后台任务");
+    dispose();
+  });
+
+  it("成功后刷新失败保留 goal/tasks 并标记 stale，重试恢复后清除", async () => {
+    setActiveSessionId("s-stale");
+    h.goalFocus.mockResolvedValue(goal({ id: "g-stale", objective: "keep goal" }));
+    h.taskList.mockResolvedValue([
+      { id: "t-stale", command: "keep task", status: "running", uptime_ms: 1000, tail: "" },
+    ]);
+    const dispose = render(() => <Dock />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("keep goal");
+    expect(document.body.textContent).toContain("keep task");
+
+    h.goalFocus.mockRejectedValueOnce(new Error("goal refresh timeout"));
+    h.taskList.mockRejectedValueOnce(new Error("task refresh timeout"));
+    for (const callback of h.resync) callback();
+    await flush();
+    const stale = document.body.textContent ?? "";
+    expect(stale).toContain("刷新目标失败，正在显示上次结果");
+    expect(stale).toContain("刷新后台任务失败，正在显示上次结果");
+    expect(stale).toContain("keep goal");
+    expect(stale).toContain("keep task");
+
+    h.goalFocus.mockResolvedValueOnce(null);
+    h.goalList.mockResolvedValueOnce([]);
+    h.taskList.mockResolvedValueOnce([]);
+    for (const retry of [...document.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) => button.textContent === "重试",
+    )) {
+      retry.click();
+    }
+    await flush();
+    expect(document.body.textContent).not.toContain("正在显示上次结果");
+    expect(document.body.textContent).toContain("无焦点 goal");
+    expect(document.body.textContent).toContain("无后台任务");
+    dispose();
+  });
+});
+
 describe("Dock 任务操作失败反馈", () => {
   const runningTask = {
     id: "t1",
@@ -138,6 +207,7 @@ describe("Dock 任务操作失败反馈", () => {
   };
 
   it("终止失败 flashErr 带原因（不再裸 rejection）", async () => {
+    setActiveSessionId("s-task");
     h.taskList.mockResolvedValue([runningTask]);
     h.taskKill.mockRejectedValueOnce(new Error("no such task"));
     const dispose = render(() => <Dock />, document.body);
@@ -153,6 +223,7 @@ describe("Dock 任务操作失败反馈", () => {
   });
 
   it("重启失败 flashErr 带原因", async () => {
+    setActiveSessionId("s-task");
     h.taskList.mockResolvedValue([runningTask]);
     h.taskRestart.mockRejectedValueOnce(new Error("spawn failed"));
     const dispose = render(() => <Dock />, document.body);

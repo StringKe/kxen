@@ -4,6 +4,8 @@ import { Show } from "solid-js";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FilePlus2, ImagePlus, Plus } from "lucide-solid";
 import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
+import { flashErr } from "../../lib/flash";
+import { errText } from "../err-text";
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
@@ -17,11 +19,17 @@ export default function AttachMenu(props: { onPaths: (paths: string[]) => void }
 
   const pick = async (images: boolean) => {
     setOpen(false);
-    const selected = await openDialog({
-      multiple: true,
-      title: images ? "选择图片" : "选择文件",
-      ...(images ? { filters: [{ name: "图片", extensions: IMAGE_EXTS }] } : {}),
-    }).catch(() => null);
+    let selected: string | string[] | null;
+    try {
+      selected = await openDialog({
+        multiple: true,
+        title: images ? "选择图片" : "选择文件",
+        ...(images ? { filters: [{ name: "图片", extensions: IMAGE_EXTS }] } : {}),
+      });
+    } catch (error) {
+      flashErr(`打开附件选择器失败：${errText(error)}`);
+      return;
+    }
     const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
     if (paths.length > 0) props.onPaths(paths);
   };

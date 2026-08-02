@@ -98,6 +98,7 @@ function btnByTitle(title: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  h.cfg.mockReset();
   h.cfg.mockResolvedValue({ roles: {} });
   h.accounts.mockResolvedValue([]);
   h.list.mockResolvedValue([]);
@@ -197,6 +198,23 @@ describe("ProvidersSection 区域", () => {
 });
 
 describe("ProvidersSection 删除", () => {
+  it("角色占用关系读取失败时禁止删除，避免把使用中账号误判为空闲", async () => {
+    h.accounts.mockResolvedValue([{ ...XAI_B }]);
+    h.cfg.mockRejectedValue(new Error("config offline"));
+    const dispose = render(() => <ProvidersSection />, document.body);
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("角色占用关系：config offline"),
+    );
+
+    btnByTitle("删除账号").click();
+    expect(document.body.textContent).not.toContain("确认删除 xai:b");
+    expect(flash.msgs().some((message) => message.text.includes("角色占用关系 UNKNOWN"))).toBe(
+      true,
+    );
+    expect(h.removeAccount).not.toHaveBeenCalled();
+    dispose();
+  });
+
   it("使用中账号：先出确认条列受影响角色，确认后才发 RPC", async () => {
     h.accounts.mockResolvedValue([{ ...XAI_B }]);
     h.cfg.mockResolvedValue({

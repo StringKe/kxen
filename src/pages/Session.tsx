@@ -1,44 +1,38 @@
-import { createEffect, createSignal, For, Show, onCleanup, onMount } from "solid-js";
-import {
-  approvalPending,
-  onLlmDelta,
-  sessionAbort,
-  sessionExport,
-  sessionMessages,
-  sessionPendingList,
-  statusline,
-} from "../lib/chat";
+import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
+import { onLlmDelta, sessionAbort, sessionExport } from "../lib/chat";
+import type { ModelIdentity } from "../lib/chat";
 import { createConverge } from "../lib/converge";
 import { createDeltaBatcher } from "../lib/delta-batch";
-import { pendingApprovalItems, respondApproval as respondApprovalImpl } from "../lib/approvals";
+import { respondApproval as respondApprovalImpl } from "../lib/approvals";
 import { applyStreamEvent, appendRawItem } from "../lib/session-events";
 import { editResend as editResendImpl, forkAt, rerun as rerunImpl } from "../lib/session-actions";
 import { createSendFlow } from "../lib/send";
 import { createSessionRewind } from "../lib/rewind";
-import { createSessionModelLabel } from "../lib/session-model";
 import { createStreamingReconcile } from "../lib/streaming-reconcile";
 import SessionItem from "../components/SessionItem";
 import PendingQueue from "../components/PendingQueue";
 import RewindConfirm from "../components/RewindConfirm";
 import { activeSessionId, sessions, setHasConversation } from "../lib/state";
-import { onDragStart } from "../lib/drag";
-import ThinkingOrb from "../components/ThinkingOrb";
 import type { OrbState } from "../lib/orb";
 import EmptyHero from "../components/EmptyHero";
 import AgentRunCards from "../components/AgentRunCards";
 import Composer from "../components/composer/TextComposer";
-import { ArrowDown, Download, FolderOpen } from "lucide-solid";
-import { toItems, type Item } from "../lib/items";
+import SessionHeader from "../components/SessionHeader";
+import { ArrowDown } from "lucide-solid";
+import type { Item } from "../lib/items";
 import { formatError } from "../lib/error-text";
+import { createAutoScroll } from "../lib/auto-scroll";
+import { flashErr } from "../lib/flash";
+import { createSessionLoader, mountDraftWorkdir } from "../lib/session-loader";
 
 export default function Session() {
   const [items, setItems] = createSignal<Item[]>([]);
   const [streamingSid, setStreamingSid] = createSignal("");
   const [orbPhase, setOrbPhase] = createSignal<OrbState>("thinking");
   const [focusTick, setFocusTick] = createSignal(0);
-  const [workdir, setWorkdir] = createSignal("");
-  let unlisten: (() => void) | undefined;
+  const [draftWorkdir, setDraftWorkdir] = createSignal("");
   let listRef: HTMLDivElement | undefined;
+  let liveModel: ModelIdentity | undefined;
   // null 哨兵 = 组件首跑强制重载时间线；仅 ""（草稿->激活首发）跳过保住乐观上屏
   let prevSid: string | null = null;
   const [pendingQueue, setPendingQueue] = createSignal<string[]>([]);
@@ -48,74 +42,73 @@ export default function Session() {
     activeSessionId() === ""
       ? "新会话"
       : (sessions().find((s) => s.id === activeSessionId())?.title ?? "会话");
-  // 钉底跟随：用户上翻即停跟（每 delta 硬拉到底 = 滚动闪烁的根因），底部给回跳按钮
-  const [pinned, setPinned] = createSignal(true);
-  const onListScroll = () =>
-    listRef && setPinned(listRef.scrollHeight - listRef.scrollTop - listRef.clientHeight < 48);
-  const scroll = (force = false) => {
-    if (force || pinned()) {
-      // rAF 等布局完成再钉底（queueMicrotask 抢在 layout 前，位置算错再纠偏 = 闪）
-      requestAnimationFrame(() => {
-        if (listRef) listRef.scrollTop = listRef.scrollHeight;
-        setPinned(true);
-      });
-    }
+  const workdir = () => {
+    const sid = activeSessionId();
+    return sid ? (sessions().find((s) => s.id === sid)?.directory ?? "") : draftWorkdir();
   };
+  const { pinned, onScroll: onListScroll, scroll } = createAutoScroll(() => listRef);
 
   // 有对话内容才驱动右 dock 滑入
   createEffect(() => setHasConversation(items().length > 0));
 
-  // 首载失败必须与真空区分（Workspaces 同模式）：无 catch 时后端不可达只剩 EmptyHero，
-  // 「加载失败」被伪装成「新会话」，且裸 Promise 产生 unhandled rejection
-  const [loadErr, setLoadErr] = createSignal("");
-  const loadErrText = (e: unknown) => formatError(e);
+  const { loadErr, timelineLoading, loadQueue, loadTimeline, retryLoad, resetLoad } =
+    createSessionLoader({ activeSessionId, setItems, setPendingQueue, scroll });
 
-  const loadQueue = (id: string) => {
-    void sessionPendingList(id)
-      .then((q) => {
-        if (activeSessionId() === id) setPendingQueue(q);
-      })
-      .catch((e: unknown) => {
-        if (activeSessionId() === id) setLoadErr(loadErrText(e));
-      });
+  // 待刷新 delta 必须绑定收到它时的 session + 实际模型。定时器触发时
+  // 再读 activeSessionId/liveModel 会把旧会话文本写进新会话，或把旧模型文本重标为新模型。
+  let batchSid = "";
+  let batchModel: ModelIdentity | undefined;
+  const sameModel = (left?: ModelIdentity, right?: ModelIdentity) =>
+    left?.provider === right?.provider &&
+    left?.model === right?.model &&
+    (left?.account ?? null) === (right?.account ?? null);
+  const appendRaw = (field: "content" | "reasoning", text: string) => {
+    if (!batchSid || activeSessionId() !== batchSid) return;
+    const model = batchModel;
+    setItems((prev) => appendRawItem(prev, field, text, model));
+    scroll();
   };
-
-  const loadTimeline = (id: string) => {
-    setLoadErr("");
-    void Promise.all([sessionMessages(id), approvalPending(id)])
-      .then(([messages, pend]) => {
-        if (activeSessionId() === id) {
-          // 落盘决定由 toItems 渲染为已决历史卡；仍在等的审批（broker 300s 窗口内）恢复为等待卡
-          setItems([...toItems(messages), ...pendingApprovalItems(pend)]);
-          scroll();
-        }
-      })
-      .catch((e: unknown) => {
-        if (activeSessionId() === id) setLoadErr(loadErrText(e));
-      });
+  const batcher = createDeltaBatcher(appendRaw);
+  const discardPendingDelta = () => {
+    batcher.discard();
+    batchSid = "";
+    batchModel = undefined;
   };
-
-  // 重试：时间线与排队队列一起重拉（两者任一失败都落在同一条错误条上）
-  const retryLoad = () => {
-    const id = activeSessionId();
-    if (!id) return;
-    loadQueue(id);
-    loadTimeline(id);
+  const appendAssistant = (field: "content" | "reasoning", text: string) => {
+    const sid = activeSessionId();
+    if (!sid) return;
+    if (batchSid && batchSid !== sid) discardPendingDelta();
+    if (batchSid === sid && !sameModel(batchModel, liveModel)) batcher.flushNow();
+    batchSid = sid;
+    batchModel = liveModel;
+    setOrbPhase("composing");
+    batcher.push(field, text);
   };
 
   // 切换会话：加载存储的时间线；草稿态（""）清空。
   // 草稿->激活（首发）跳过重载：此时本地上屏是唯一权威（空载会抹掉乐观上屏消息）。
   createEffect(() => {
     const id = activeSessionId();
+    if (prevSid !== id) {
+      discardPendingDelta();
+      liveModel = undefined;
+    }
     setFocusTick((t) => t + 1);
     if (!id) {
       setItems([]);
       setPendingQueue([]);
-      setLoadErr("");
+      resetLoad();
       prevSid = id;
       return;
     }
-    if (prevSid !== id) loadQueue(id);
+    if (prevSid !== id) {
+      // items/queue 未按 session 建模，切换时必须先撤下旧会话可交互内容；
+      // 否则慢加载或失败期间，旧消息的重发/清队列会作用到新会话。
+      setItems([]);
+      setPendingQueue([]);
+      resetLoad();
+      loadQueue(id);
+    }
     const fromDraft = prevSid === "";
     prevSid = id;
     if (fromDraft) return;
@@ -136,57 +129,59 @@ export default function Session() {
   });
   onCleanup(mountSource());
 
-  const appendRaw = (field: "content" | "reasoning", text: string) => {
-    setItems((prev) => appendRawItem(prev, field, text));
-    scroll();
-  };
+  // delta 订阅必须在当前 Solid owner 内同步注册；statusline 是独立数据源，不能制造订阅空窗。
+  onLlmDelta(
+    activeSessionId,
+    (text) => appendAssistant("content", text),
+    (reasoning) => appendAssistant("reasoning", reasoning),
+    (stats, error) => {
+      setOrbPhase(error ? "error" : "thinking");
+      batcher.flushNow(); // 残余 delta 先上屏再对账
+      // Done 对账：存储快照为最终权威（含终态文本），stats/error 尾注重挂；
+      // streaming 不当场清：终态先于续跑 spawn 发布，按真源核对（RPC 失败按 run 已终收回）
+      const sid = activeSessionId();
+      converge(sid, { stats, error });
+      if (sid) reconcile(sid, "clear");
+      batchSid = "";
+      batchModel = undefined;
+      liveModel = undefined;
+    },
+    (event) => {
+      // 工具/审批/压缩事件立即上屏，必须先排空更早到达的延迟文本。
+      batcher.flushNow();
+      applyStreamEvent(event, { setItems, setOrbPhase, scroll });
+    },
+    () => {
+      // resync（bus lag / 断线重连）：只对账；streaming 按真源保持/重臂/收回，
+      // 核对失败（null）保守保留等下轮 resync
+      batcher.flushNow();
+      const sid = activeSessionId();
+      if (!sid) return;
+      converge(sid);
+      reconcile(sid, "keep");
+    },
+    (model) => {
+      liveModel = model;
+    },
+  );
+  mountDraftWorkdir(activeSessionId, setDraftWorkdir);
 
-  // delta 批量上屏：50ms 合并（实现见 lib/delta-batch.ts）
-  const batcher = createDeltaBatcher(appendRaw);
-  const appendAssistant = (field: "content" | "reasoning", text: string) => {
-    setOrbPhase("composing");
-    batcher.push(field, text);
-  };
-
-  onMount(async () => {
-    const sl = await statusline("").catch(() => null);
-    if (sl) setWorkdir(sl.workdir);
-    unlisten = await onLlmDelta(
-      activeSessionId,
-      (text) => appendAssistant("content", text),
-      (reasoning) => appendAssistant("reasoning", reasoning),
-      (stats, error) => {
-        setOrbPhase(error ? "error" : "thinking");
-        batcher.flushNow(); // 残余 delta 先上屏再对账
-        // Done 对账：存储快照为最终权威（含终态文本），stats/error 尾注重挂；
-        // streaming 不当场清：终态先于续跑 spawn 发布，按真源核对（RPC 失败按 run 已终收回）
-        const sid = activeSessionId();
-        converge(sid, { stats, error });
-        if (sid) reconcile(sid, "clear");
-      },
-      (event) => applyStreamEvent(event, { setItems, setOrbPhase, scroll }),
-      () => {
-        // resync（bus lag / 断线重连）：只对账；streaming 按真源保持/重臂/收回，
-        // 核对失败（null）保守保留等下轮 resync
-        batcher.flushNow();
-        const sid = activeSessionId();
-        if (!sid) return;
-        converge(sid);
-        reconcile(sid, "keep");
-      },
-    );
+  onCleanup(() => {
+    discardPendingDelta();
   });
-
-  onCleanup(() => unlisten?.());
 
   // 发送链路实现见 lib/send.ts（乐观上屏 + 失败态标记/点击重发）
   const { send, retry: retrySend } = createSendFlow({
     streaming,
     onStreamStart: (sid) => {
+      discardPendingDelta();
+      liveModel = undefined;
       setStreamingSid(sid);
       setOrbPhase("thinking");
     },
     onStreamStop: (sid) => {
+      discardPendingDelta();
+      liveModel = undefined;
       if (streamingSid() === sid) setStreamingSid("");
     },
     setItems,
@@ -195,18 +190,21 @@ export default function Session() {
   });
   const stop = () => {
     const sid = activeSessionId();
-    if (sid) {
-      resetHold(); // abort 清队列是用户本意：pop 窗口保留逻辑不得把清掉的消息捞回
-      setPendingQueue([]);
-      void sessionAbort(sid);
-    }
+    if (!sid) return;
+    void sessionAbort(sid)
+      .then(() => {
+        if (activeSessionId() !== sid) return;
+        resetHold(); // 后端确认 abort+清队列后，作废 pop 窗口保留，避免把已清消息捞回
+        setPendingQueue([]);
+      })
+      .catch((error: unknown) => flashErr(`停止失败：${formatError(error)}`));
   };
 
-  const respondApproval = (id: string, allow: boolean) => respondApprovalImpl(setItems, id, allow);
+  const respondApproval = async (id: string, allow: boolean) => {
+    await respondApprovalImpl(setItems, id, allow);
+  };
 
   const [exportNote, setExportNote] = createSignal("");
-  // assistant 消息署名：当前 session 的生效模型（覆盖优先；切会话/切模型自动重取）
-  const modelLabel = createSessionModelLabel(activeSessionId);
   const doExport = async () => {
     const r = await sessionExport(activeSessionId()).catch(() => null);
     setExportNote(r ? `已导出 ${r.path}` : "导出失败");
@@ -223,42 +221,15 @@ export default function Session() {
 
   return (
     <div class="h-full flex-1 min-w-0 flex flex-col relative">
-      <div
-        class="material px-4 py-2.5 border-b border-[var(--border)] text-xs flex items-center gap-3"
-        data-tauri-drag-region
-        onMouseDown={onDragStart}
-      >
-        <span class="font-medium text-[var(--text)] truncate">{title()}</span>
-        <span
-          class="flex items-center gap-1 text-[var(--text-faint)] truncate popup-detail"
-          title={workdir()}
-        >
-          <FolderOpen size={12} />
-          <span class="truncate">{workdir()}</span>
-        </span>
-        <Show when={streaming()}>
-          <span class="inline-flex items-center gap-1.5 text-[var(--accent-hover)]">
-            <ThinkingOrb state={orbPhase} size={20} />
-            {orbPhase() === "thinking" && "思考中"}
-            {orbPhase() === "searching" && "检索中"}
-            {orbPhase() === "composing" && "生成中"}
-            {orbPhase() === "error" && "出错"}
-          </span>
-        </Show>
-        <span class="ml-auto flex items-center gap-1">
-          <Show when={exportNote()}>
-            <span class="text-2xs text-[var(--ok)]">{exportNote()}</span>
-          </Show>
-          <button
-            class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-40"
-            disabled={activeSessionId() === ""}
-            title={activeSessionId() === "" ? "暂无可导出内容" : "导出会话为 markdown"}
-            onClick={() => void doExport()}
-          >
-            <Download size={13} />
-          </button>
-        </span>
-      </div>
+      <SessionHeader
+        title={title}
+        workdir={workdir}
+        streaming={streaming}
+        orbPhase={orbPhase}
+        exportNote={exportNote}
+        canExport={() => activeSessionId() !== ""}
+        onExport={() => void doExport()}
+      />
 
       <div
         ref={(el) => (listRef = el)}
@@ -272,7 +243,6 @@ export default function Session() {
                 item={item}
                 streaming={streaming}
                 live={() => streaming() && i() === items().length - 1}
-                modelLabel={modelLabel}
                 onForkId={(id) => void forkAt(id)}
                 onEditResend={(text) => void editResendImpl(send, items(), i(), text)}
                 onRewindId={(id) => void rewindAt(id)}
@@ -280,7 +250,7 @@ export default function Session() {
                 onRerun={() => void rerun(i())}
                 onContinue={() => void send("继续", [], [])}
                 onImageLoad={() => scroll()}
-                onRespondApproval={(id, allow) => void respondApproval(id, allow)}
+                onRespondApproval={respondApproval}
               />
             )}
           </For>
@@ -301,7 +271,11 @@ export default function Session() {
             </div>
           </Show>
 
-          <Show when={items().length === 0 && !loadErr()}>
+          <Show when={timelineLoading() && items().length === 0 && !loadErr()}>
+            <div class="text-xs text-[var(--text-faint)]">加载会话中…</div>
+          </Show>
+
+          <Show when={items().length === 0 && !loadErr() && !timelineLoading()}>
             <EmptyHero />
           </Show>
         </div>

@@ -88,6 +88,27 @@ describe("toItems 落盘审批决定（Part approval）", () => {
 });
 
 describe("toItems 完整消息还原", () => {
+  it("相邻 Assistant 消息不合并，并各自保留实际模型", () => {
+    const messages: StoredMessage[] = [
+      {
+        ...stored("assistant", "第一条", "a1"),
+        model: { provider: "xai", model: "grok-4" },
+      },
+      {
+        ...stored("assistant", "第二条", "a2"),
+        model: { provider: "anthropic", model: "claude-sonnet-4-6" },
+      },
+      stored("assistant", "旧消息", "a3"),
+    ];
+
+    const items = toItems(messages) as MsgItem[];
+    expect(items).toHaveLength(3);
+    expect(items.map((item) => item.content)).toEqual(["第一条", "第二条", "旧消息"]);
+    expect(items[0]?.model).toEqual({ provider: "xai", model: "grok-4" });
+    expect(items[1]?.model).toEqual({ provider: "anthropic", model: "claude-sonnet-4-6" });
+    expect(items[2]?.model).toBeUndefined();
+  });
+
   it("合并同角色文本与图片并保留 message id", () => {
     const messages: StoredMessage[] = [
       {

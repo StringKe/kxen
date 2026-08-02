@@ -1,5 +1,3 @@
-// 知识库控制台：双 scope 分区（项目/个人）x kind 分组 + 注入预览 + 启停/晋升/删除。
-// 数据源即统一知识系统（knowledge::*），rules/skills/commands/notes 同树展示，非表单堆砌。
 import { createSignal, For, onMount, Show } from "solid-js";
 import { ChevronDown, ChevronRight, Eye, Trash2 } from "lucide-solid";
 import EmptyLine from "../EmptyLine";
@@ -19,7 +17,6 @@ import { badgeChip } from "../../lib/variants";
 import { activeSessionId } from "../../lib/state";
 import { flashErr, flashOk } from "../../lib/flash";
 import { errText } from "../err-text";
-
 const SCOPES: { id: KnowledgeScope; label: string; hint: string }[] = [
   { id: "project", label: "项目", hint: ".agents/ · 入 git 共享" },
   { id: "personal", label: "个人", hint: "~/.agents/ · 跨项目" },
@@ -52,18 +49,37 @@ export default function KnowledgeSection() {
   const [noteType, setNoteType] = createSignal("convention");
   const [desc, setDesc] = createSignal("");
   const [content, setContent] = createSignal("");
-  // 待确认删除的条目：删除统一走行内确认条（对齐 ScheduleSection/DockWorktree 的二次确认模式）
+  const [listLoaded, setListLoaded] = createSignal(false);
+  const [listErr, setListErr] = createSignal("");
+  const [previewLoaded, setPreviewLoaded] = createSignal(false);
+  const [previewErr, setPreviewErr] = createSignal("");
   const [confirmDel, setConfirmDel] = createSignal("");
   const keyOf = (e: KnowledgeEntry) => `${e.scope}:${e.kind}:${e.slug}`;
+  let reloadSeq = 0;
 
   const reload = async () => {
-    // 首屏双源独立降级：单源失败只缺对应区块；用户操作路径各自显错
-    const [list, prev] = await Promise.all([
-      knowledgeList().catch(() => []),
-      knowledgeInjectionPreview(activeSessionId() || undefined).catch(() => null),
+    const seq = ++reloadSeq;
+    const [list, prev] = await Promise.allSettled([
+      knowledgeList(),
+      knowledgeInjectionPreview(activeSessionId() || undefined),
     ]);
-    setEntries(list);
-    setPreview(prev?.block ?? null);
+    if (seq !== reloadSeq) return;
+    if (list.status === "fulfilled") {
+      setEntries(list.value);
+      setListLoaded(true);
+      setListErr("");
+    } else {
+      setListLoaded(false);
+      setListErr(errText(list.reason));
+    }
+    if (prev.status === "fulfilled") {
+      setPreview(prev.value.block ?? null);
+      setPreviewLoaded(true);
+      setPreviewErr("");
+    } else {
+      setPreviewLoaded(false);
+      setPreviewErr(errText(prev.reason));
+    }
   };
   onMount(() => void reload());
 
@@ -108,7 +124,7 @@ export default function KnowledgeSection() {
       await knowledgeRemove(e.scope, e.slug);
     } catch (err) {
       flashErr(`删除失败：${errText(err)}`);
-      setConfirmDel(""); // 错误已 flash：退出确认态，确认条不挂着
+      setConfirmDel("");
       return;
     }
     setConfirmDel("");
@@ -119,7 +135,6 @@ export default function KnowledgeSection() {
   const byScope = (s: KnowledgeScope) => entries().filter((e) => e.scope === s);
   const byKind = (s: KnowledgeScope, k: KnowledgeKind) => byScope(s).filter((e) => e.kind === k);
   const enabledOf = (s: KnowledgeScope) => byScope(s).filter((e) => e.enabled).length;
-  // 同 slug 双 scope 共存 = 项目覆盖个人（first-wins），个人版永远不会被读到
   const shadowed = () => {
     const projectSlugs = new Set(byScope("project").map((e) => `${e.kind}:${e.slug}`));
     return new Set(
@@ -133,10 +148,20 @@ export default function KnowledgeSection() {
     <>
       <CodingRulesBlock />
 
+      <Show when={listErr()}>
+        <div class="text-xs text-[var(--err)]">
+          知识列表读取失败，当前结果为 UNKNOWN：{listErr()}
+          <button class="ml-2 hover:underline" onClick={() => void reload()}>
+            重试
+          </button>
+        </div>
+      </Show>
+
       <div class="flex items-center justify-between">
         <div class="text-xs text-[var(--text-faint)]">
-          项目 {enabledOf("project")}/{byScope("project").length} · 个人 {enabledOf("personal")}/
-          {byScope("personal").length}（启用/总条数）
+          {listLoaded()
+            ? `项目 ${enabledOf("project")}/${byScope("project").length} · 个人 ${enabledOf("personal")}/${byScope("personal").length}（启用/总条数）`
+            : "知识条目统计 UNKNOWN"}
         </div>
         <button
           class="pressable flex items-center gap-1 px-2 py-1 rounded text-xs text-[var(--text-dim)] hover:bg-[var(--bg-overlay)]/60"
@@ -154,7 +179,11 @@ export default function KnowledgeSection() {
             模型下轮 system prompt 实际看到的知识文本（启停即时生效）
           </div>
           <pre class="selectable text-2xs font-mono whitespace-pre-wrap text-[var(--text-dim)]">
-            {preview() ?? "（无注入知识）"}
+            {previewLoaded()
+              ? (preview() ?? "（无注入知识）")
+              : previewErr()
+                ? `注入预览 UNKNOWN：${previewErr()}`
+                : "加载中…"}
           </pre>
         </div>
       </Show>
@@ -265,7 +294,7 @@ export default function KnowledgeSection() {
                   </div>
                 )}
               </For>
-              <Show when={byScope(s.id).length === 0}>
+              <Show when={listLoaded() && byScope(s.id).length === 0}>
                 <EmptyLine text={`暂无${s.label}知识`} />
               </Show>
             </div>

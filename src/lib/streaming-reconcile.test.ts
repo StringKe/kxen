@@ -99,6 +99,23 @@ describe("reconcile（done/事件/resync 扳机）", () => {
     await flush();
     expect(c.sid()).toBe("s2");
   });
+
+  it("同会话并发核对按最后发起者落地，旧 running=true 不得覆盖新终态", async () => {
+    const c = setup();
+    c.arm();
+    const resolvers: Array<(value: boolean | null) => void> = [];
+    h.sessionRunning.mockImplementation(
+      () => new Promise<boolean | null>((resolve) => resolvers.push(resolve)),
+    );
+    c.reconcile("s1", "keep");
+    c.reconcile("s1", "keep");
+    resolvers[1]?.(false);
+    await flush();
+    expect(c.sid()).toBe("");
+    resolvers[0]?.(true);
+    await flush();
+    expect(c.sid()).toBe("");
+  });
 });
 
 describe("mountSource（session.update 存亡广播）", () => {

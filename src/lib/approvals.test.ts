@@ -80,6 +80,25 @@ describe("respondApproval", () => {
     expect(String(flashMock.flashErr.mock.calls[0]?.[0])).toContain("审批应答失败");
     expect(String(flashMock.flashErr.mock.calls[0]?.[0])).toContain("connection lost");
   });
+
+  it("同一 approval id 的并发应答只发送首个决定", async () => {
+    let finish: ((value: { resolved: boolean }) => void) | undefined;
+    chatMock.approvalRespond.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const a = setup();
+    const allow = respondApproval(a.setItems, "a1", true);
+    const deny = respondApproval(a.setItems, "a1", false);
+    await expect(deny).resolves.toBe(false);
+    expect(chatMock.approvalRespond).toHaveBeenCalledTimes(1);
+    expect(chatMock.approvalRespond).toHaveBeenCalledWith("a1", true);
+    finish?.({ resolved: true });
+    await expect(allow).resolves.toBe(true);
+    expect(a.card().resolved).toBe("allowed");
+  });
 });
 
 describe("会话重载恢复等待卡（approval.pending）", () => {

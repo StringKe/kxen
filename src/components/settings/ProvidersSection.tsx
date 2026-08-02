@@ -1,5 +1,3 @@
-// 订阅状态台（多账号）：默认账号官方导入 + 命名账号手动添加；逐账号实测与修复指引。
-// provider 标签与区域来自后端 provider.list（registry），前端不维护硬编码清单。
 import { createSignal, For, onMount, Show } from "solid-js";
 import { Plus, RefreshCw, Trash2, Wrench } from "lucide-solid";
 import { configGet } from "../../lib/chat";
@@ -22,10 +20,6 @@ import AddAccountPanel from "./AddAccountPanel";
 import ProviderCompatibility from "./ProviderCompatibility";
 import { badge, labelOf, type Row } from "./providers-row";
 import { errText } from "../err-text";
-
-// 实测结果与拉模型条数是时点探测：切分区重挂载后需用户重新点按获取，
-// 不缓存陈旧探测结果上屏（缓存会误导，探测本身一键可重发）。
-
 export default function ProvidersSection() {
   const [rows, setRows] = createSignal<Row[]>([]);
   const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
@@ -33,25 +27,52 @@ export default function ProvidersSection() {
   const [issues, setIssues] = createSignal<ReprobeIssue[]>([]);
   const [adding, setAdding] = createSignal(false);
   const [guideFor, setGuideFor] = createSignal("");
-  // 待确认删除的行 id（所有删除先出行内确认条，占用中的账号条内列明受影响角色）
   const [confirmDel, setConfirmDel] = createSignal("");
+  const [loadErr, setLoadErr] = createSignal("");
+  const [configLoaded, setConfigLoaded] = createSignal(false);
+  let loadSeq = 0;
 
   const specOf = (key: string) => providers().find((p) => p.key === key);
   const regionsOf = (r: Row) => specOf(r.provider)?.regions ?? [];
 
   const load = async () => {
-    const [accounts, cfg, list] = await Promise.all([
-      providerAccounts().catch(() => []),
-      configGet().catch(() => null),
-      providerList().catch(() => [] as ProviderInfo[]),
+    const seq = ++loadSeq;
+    const [accounts, cfg, list] = await Promise.allSettled([
+      providerAccounts(),
+      configGet(),
+      providerList(),
     ]);
-    setProviders(list);
+    if (seq !== loadSeq) return;
+    if (list.status === "fulfilled") setProviders(list.value);
+    setConfigLoaded(cfg.status === "fulfilled");
     const usedBy = new Map<string, string[]>();
-    for (const [role, b] of Object.entries(cfg?.roles ?? {})) {
+    for (const [role, b] of Object.entries(cfg.status === "fulfilled" ? cfg.value.roles : {})) {
       const key = b.account ? `${b.provider}:${b.account}` : b.provider;
       usedBy.set(key, [...(usedBy.get(key) ?? []), role]);
     }
-    setRows(accounts.map((a) => ({ ...a, verifying: false, usedBy: usedBy.get(a.id) ?? [] })));
+    if (accounts.status === "fulfilled") {
+      const old = new Map(rows().map((row) => [row.id, row]));
+      setRows(
+        accounts.value.map((account) => ({
+          ...account,
+          verifying: false,
+          usedBy:
+            cfg.status === "fulfilled"
+              ? (usedBy.get(account.id) ?? [])
+              : (old.get(account.id)?.usedBy ?? []),
+        })),
+      );
+    }
+    setLoadErr(
+      [accounts, cfg, list]
+        .map((result, index) =>
+          result.status === "rejected"
+            ? `${["账号", "角色占用关系", "Provider 列表"][index]}：${errText(result.reason)}`
+            : "",
+        )
+        .filter(Boolean)
+        .join("；"),
+    );
   };
 
   const verifyOne = async (row: Row) => {
@@ -67,7 +88,6 @@ export default function ProvidersSection() {
     );
   };
 
-  /** 手动拉取模型清单（端点 /models）：成功显示条数，失败就地显错（不伪装空清单）。 */
   const fetchModels = async (row: Row) => {
     const account = row.account === "default" ? undefined : row.account;
     const r = await providerModels(row.provider, account).catch((e: unknown) => ({
@@ -78,7 +98,6 @@ export default function ProvidersSection() {
     setRows((prev) => prev.map((x) => (x.id === row.id ? { ...x, modelsResult: r } : x)));
   };
 
-  /** 改区域：region 空串 = 清掉回落缺省区域（registry 首条）。 */
   const changeRegion = async (row: Row, region: string) => {
     try {
       await setAccountRegion(row.provider, row.account, region || undefined);
@@ -91,7 +110,6 @@ export default function ProvidersSection() {
 
   const verifyAll = () => rows().forEach((r) => void verifyOne(r));
 
-  // 打开页面零自动请求（同类型产品共识：探测只在首次导入 + 用户主动点）
   onMount(() => void load());
 
   const reprobe = async () => {
@@ -99,7 +117,7 @@ export default function ProvidersSection() {
     setIssues([]);
     try {
       const r = await providerReprobe();
-      setIssues(r.issues ?? []); // 未导入条目常驻，下一次重新导入才清
+      setIssues(r.issues ?? []);
       flashOk(`已重新导入（${r.outcomes.join("，")}）`);
       await load();
       verifyAll(); // 重新导入 = 用户主动动作，导入后逐个验证一次
@@ -110,9 +128,10 @@ export default function ProvidersSection() {
     }
   };
 
-  // 删除统一走行内确认条（对齐会话删除/worktree 的二次确认模式）：被角色占用的账号
-  // 在条内列明受影响角色，未占用的也只少一次误触点击的代价
-  const requestRemove = (row: Row) => setConfirmDel(row.id);
+  const requestRemove = (row: Row) => {
+    if (configLoaded()) setConfirmDel(row.id);
+    else flashErr("角色占用关系 UNKNOWN，当前不能安全删除账号");
+  };
 
   const doRemove = async (row: Row) => {
     setConfirmDel("");
@@ -152,6 +171,14 @@ export default function ProvidersSection() {
       </div>
 
       <ProviderCompatibility providers={providers()} />
+      <Show when={loadErr()}>
+        <div class="text-xs text-[var(--err)]">
+          Provider 数据加载失败，已保留上次结果：{loadErr()}
+          <button class="ml-2 hover:underline" onClick={() => void load()}>
+            重试
+          </button>
+        </div>
+      </Show>
 
       <Show when={issues().length > 0}>
         <div class="rounded border border-[var(--warn)]/50 bg-[var(--warn)]/5 px-3 py-2 text-xs space-y-0.5">

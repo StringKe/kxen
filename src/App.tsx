@@ -35,6 +35,7 @@ import {
   sidebarWidth,
 } from "./lib/panels";
 import ResizeHandle from "./components/ResizeHandle";
+import GlobalApprovalHost from "./components/GlobalApprovalHost";
 import { useLocation, useNavigate } from "@solidjs/router";
 import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 
@@ -120,6 +121,7 @@ function Layout(props: { children?: import("solid-js").JSX.Element }) {
       <CommandPalette />
       <ContextMenu />
       <FlashHost />
+      <GlobalApprovalHost />
     </div>
   );
 }

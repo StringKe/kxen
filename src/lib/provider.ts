@@ -1,4 +1,5 @@
 import { client } from "./client";
+import type { UsageCompleteness } from "./usage";
 
 export interface RegionInfo {
   key: string;
@@ -170,7 +171,7 @@ export interface MrmStats {
   health: MrmHealth[];
 }
 
-export interface MrmHealth {
+export interface MrmHealth extends UsageCompleteness {
   provider: string;
   consecutive_failures: number;
   circuit_open: boolean;

@@ -23,7 +23,7 @@ vi.mock("./state", () => ({
 }));
 vi.mock("./flash", () => ({ flashErr: h.flashErr, flashOk: h.flashOk }));
 
-import { editResend, rerun } from "./session-actions";
+import { editResend, forkAt, rerun } from "./session-actions";
 
 const ctx: ContextItem[] = [{ type: "file", path: "/a.ts" }];
 const imgs = [{ media_type: "image/png", data: "QUJD" }];
@@ -44,8 +44,10 @@ const assistant = (id: string): Item => ({
 
 beforeEach(() => {
   h.sessionFork.mockReset();
-  h.refreshSessions.mockClear();
-  h.switchSession.mockClear();
+  h.refreshSessions.mockReset();
+  h.refreshSessions.mockResolvedValue(undefined);
+  h.switchSession.mockReset();
+  h.switchSession.mockResolvedValue(undefined);
   h.newSession.mockClear();
   h.flashErr.mockClear();
   h.flashOk.mockClear();
@@ -79,6 +81,18 @@ describe("rerun 重新生成", () => {
   });
 });
 
+describe("forkAt 分叉", () => {
+  it("创建成功但列表刷新失败时仍切入，并准确说明 post-commit 警告", async () => {
+    h.sessionFork.mockResolvedValueOnce({ id: "s2" });
+    h.refreshSessions.mockRejectedValueOnce(new Error("list offline"));
+
+    await forkAt("m1");
+    expect(h.switchSession).toHaveBeenCalledWith("s2");
+    expect(String(h.flashErr.mock.calls[0]?.[0])).toContain("分叉已创建并切入");
+    expect(String(h.flashErr.mock.calls[0]?.[0])).not.toContain("分叉失败");
+  });
+});
+
 describe("editResend 编辑重发", () => {
   it("fork 到前一条后发送：原文 images 与 @context 带回", async () => {
     h.sessionFork.mockResolvedValueOnce({ id: "s2" });
@@ -104,5 +118,27 @@ describe("editResend 编辑重发", () => {
     await editResend(send, [user("u1", "一"), user("u2", "二")], 1, "改");
     expect(h.flashErr).toHaveBeenCalledTimes(1);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("fork 已提交但列表刷新失败：仍切入并发送，错误文案不谎称 fork 失败", async () => {
+    h.sessionFork.mockResolvedValueOnce({ id: "s2" });
+    h.refreshSessions.mockRejectedValueOnce(new Error("list offline"));
+    const send = vi.fn(async () => false);
+
+    await editResend(send, [user("u1", "一"), user("u2", "二")], 1, "改");
+    expect(h.switchSession).toHaveBeenCalledWith("s2");
+    expect(send).toHaveBeenCalledWith("改", [], []);
+    expect(String(h.flashErr.mock.calls[0]?.[0])).toContain("编辑分支已创建并切入");
+    expect(String(h.flashErr.mock.calls[0]?.[0])).not.toContain("编辑重发失败");
+  });
+
+  it("fork 已提交但切换失败：说明已创建且不把消息发到旧会话", async () => {
+    h.sessionFork.mockResolvedValueOnce({ id: "s2" });
+    h.switchSession.mockRejectedValueOnce(new Error("activate failed"));
+    const send = vi.fn(async () => false);
+
+    await editResend(send, [user("u1", "一"), user("u2", "二")], 1, "改");
+    expect(send).not.toHaveBeenCalled();
+    expect(String(h.flashErr.mock.calls[0]?.[0])).toContain("编辑分支已创建（s2），但切换失败");
   });
 });

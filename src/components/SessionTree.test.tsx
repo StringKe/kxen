@@ -179,3 +179,69 @@ describe("SessionTree 手动路径输入", () => {
     dispose();
   });
 });
+
+describe("SessionTree 拖拽排序补偿", () => {
+  const orderedSessions = () => [
+    { ...S1, id: "s1", title: "会话一", sort_order: 1 },
+    { ...S1, id: "s2", title: "会话二", sort_order: 2, updated_at: 2 },
+    { ...S1, id: "s3", title: "会话三", sort_order: 3, updated_at: 3 },
+  ];
+
+  const rowByTitle = (title: string) => {
+    const row = byText(title)?.parentElement;
+    if (!row) throw new Error(`session row not found: ${title}`);
+    return row;
+  };
+
+  it("中途失败时回写整组原 sort_order 并报告回滚 PASS", async () => {
+    setSessions(orderedSessions());
+    h.sessionList.mockResolvedValue(orderedSessions());
+    let writes = 0;
+    h.rpc.mockImplementation((method: string) => {
+      if (method !== "session.update_meta") return Promise.resolve(undefined);
+      writes += 1;
+      return writes === 2 ? Promise.reject(new Error("disk full")) : Promise.resolve(undefined);
+    });
+    const dispose = render(() => <SessionTree />, document.body);
+    await flush();
+
+    rowByTitle("会话三").dispatchEvent(new Event("dragstart", { bubbles: true }));
+    rowByTitle("会话一").dispatchEvent(new Event("drop", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(flash.msgs().some((message) => message.text.includes("原顺序回滚 PASS"))).toBe(true),
+    );
+    const updates = h.rpc.mock.calls.filter(([method]) => method === "session.update_meta");
+    expect(updates).toEqual([
+      ["session.update_meta", { id: "s3", sort_order: 1 }],
+      ["session.update_meta", { id: "s1", sort_order: 2 }],
+      ["session.update_meta", { id: "s3", sort_order: 3 }],
+      ["session.update_meta", { id: "s1", sort_order: 1 }],
+      ["session.update_meta", { id: "s2", sort_order: 2 }],
+    ]);
+    dispose();
+  });
+
+  it("回滚也失败时明确标记 UNKNOWN", async () => {
+    setSessions(orderedSessions());
+    h.sessionList.mockResolvedValue(orderedSessions());
+    let writes = 0;
+    h.rpc.mockImplementation((method: string) => {
+      if (method !== "session.update_meta") return Promise.resolve(undefined);
+      writes += 1;
+      return writes === 2 || writes === 4
+        ? Promise.reject(new Error(writes === 2 ? "save failed" : "rollback failed"))
+        : Promise.resolve(undefined);
+    });
+    const dispose = render(() => <SessionTree />, document.body);
+    await flush();
+
+    rowByTitle("会话三").dispatchEvent(new Event("dragstart", { bubbles: true }));
+    rowByTitle("会话一").dispatchEvent(new Event("drop", { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(flash.msgs().some((message) => message.text.includes("回滚 UNKNOWN"))).toBe(true),
+    );
+    dispose();
+  });
+});

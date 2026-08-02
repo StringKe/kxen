@@ -129,6 +129,18 @@ describe("AgentRunCards", () => {
     dispose();
   });
 
+  it("等待 plan 审批的 run 仍可停止", async () => {
+    setAgents([run("planner", "awaiting_plan_approval")]);
+    setActiveSessionId("s1");
+    const { dispose, stops } = mount();
+
+    expect(stops()).toHaveLength(1);
+    stops()[0]!.click();
+    await tick();
+    expect(stopMock.calls).toEqual([{ sid: "s1", name: "planner" }]);
+    dispose();
+  });
+
   it("停止失败：flashErr 提示，不切焦点，卡还原可点", async () => {
     setAgents([run("builder", "working")]);
     setActiveSessionId("s1");

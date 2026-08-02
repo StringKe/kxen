@@ -21,7 +21,7 @@ vi.mock("./chat", () => ({
 }));
 vi.mock("./approvals", () => ({ pendingApprovalItems: () => [] }));
 vi.mock("./state", () => ({ activeSessionId: () => h.sid }));
-vi.mock("./flash", () => ({ flashErr: h.flashErr }));
+vi.mock("./flash", () => ({ flashErr: h.flashErr, flashOk: vi.fn() }));
 
 import { createConverge } from "./converge";
 
@@ -75,6 +75,23 @@ describe("converge 失败兜底", () => {
     c.converge("s1");
     await flush();
     expect(c.lastQueue()).toEqual([]);
+  });
+
+  it("同会话并发对账乱序返回时只允许最后发起的快照落地", async () => {
+    const c = setup();
+    const resolvers: Array<(messages: StoredMessage[]) => void> = [];
+    h.sessionMessages.mockImplementation(
+      () => new Promise<StoredMessage[]>((resolve) => resolvers.push(resolve)),
+    );
+    c.converge("s1");
+    c.converge("s1");
+    resolvers[1]?.([userMsg("new", "新快照")]);
+    await flush();
+    expect(hasUserBubble(c.lastItems(), "新快照")).toBe(true);
+    resolvers[0]?.([userMsg("old", "旧快照")]);
+    await flush();
+    expect(hasUserBubble(c.lastItems(), "新快照")).toBe(true);
+    expect(hasUserBubble(c.lastItems(), "旧快照")).toBe(false);
   });
 
   it("clearQueue RPC 失败：flash 错误反馈，UI 保持原队列（不静默、不重载）", async () => {

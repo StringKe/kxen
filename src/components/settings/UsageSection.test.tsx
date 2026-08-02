@@ -64,37 +64,30 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("UsageSection 加载失败与真零区分", () => {
-  it("RPC 失败：错误态 + 重试，不显示全零假象", async () => {
-    h.rpc.mockRejectedValue(new Error("ws closed"));
-    const dispose = render(() => <UsageSection />, document.body);
-    await vi.waitFor(() =>
-      expect(document.body.textContent).toContain("加载用量统计失败：ws closed"),
-    );
-    expect(document.body.textContent).not.toContain("暂无派发记录");
-
-    // 重试成功：错误态消失，真零正常显示
-    h.rpc.mockResolvedValue(EMPTY);
-    const retry = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
-      (b) => b.textContent === "重试",
-    );
-    if (!retry) throw new Error("retry button not found");
-    retry.click();
-    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无派发记录"));
-    expect(document.body.textContent).not.toContain("加载用量统计失败");
-    dispose();
-  });
-
-  it("成功返回真零：显示 0 与空分布，无错误态", async () => {
-    h.rpc.mockResolvedValue(EMPTY);
-    const dispose = render(() => <UsageSection />, document.body);
-    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无派发记录"));
-    expect(document.body.textContent).not.toContain("加载用量统计失败");
-    dispose();
-  });
-});
-
 describe("UsageSection 趋势、Provider 限制与保存", () => {
+  it("配置读取失败：保持 UNKNOWN 并禁止把默认值写回后端", async () => {
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "usage.overview") return Promise.resolve(EMPTY);
+      if (method === "config.get") return Promise.reject(new Error("config offline"));
+      if (method === "provider.list") return Promise.resolve(PROVIDERS);
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <UsageSection />, document.body);
+
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "加载限制配置失败，当前值为 UNKNOWN：config offline",
+      ),
+    );
+    const save = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "保存限制",
+    );
+    expect(save?.disabled).toBe(true);
+    save?.click();
+    expect(h.rpc.mock.calls.some(([method]) => method === "config.set_limits")).toBe(false);
+    dispose();
+  });
+
   it("展示非零趋势和模型分布，并以数字参数保存限制", async () => {
     const overview = {
       total_input: 1500,
@@ -137,13 +130,13 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
     expect(document.body.textContent).toContain("1.5k");
     expect(document.body.textContent).toContain("07-28");
     expect(document.body.querySelectorAll(".ctx-bar-fill")).toHaveLength(2);
-    expect(field("全局每日 token 上限").value).toBe("10000");
+    expect(field("全局每日已结算 token 阈值").value).toBe("10000");
     expect(field("输入 USD / 1M").value).toBe("2");
 
-    input(field("全局每日 token 上限"), "20000");
+    input(field("全局每日已结算 token 阈值"), "20000");
     input(field("输入 USD / 1M"), "3");
     input(field("输出 USD / 1M"), "6");
-    input(field("每日 USD 上限"), "8");
+    input(field("每日已结算 USD 阈值"), "8");
     input(field("连续失败阈值"), "5");
     input(field("熔断冷却秒数"), "120");
     const save = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
@@ -193,6 +186,7 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
     expect(field("连续失败阈值").value).toBe("3");
     expect(field("熔断冷却秒数").value).toBe("60");
     expect(field("输入 USD / 1M").value).toBe("");
+    expect(h.rpc.mock.calls.filter(([method]) => method === "config.get")).toHaveLength(1);
 
     input(field("连续失败阈值"), "");
     input(field("熔断冷却秒数"), "");
@@ -222,17 +216,15 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
       return Promise.resolve({});
     });
     const dispose = render(() => <UsageSection />, document.body);
-    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无派发记录"));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无路由解析记录"));
     [...document.body.querySelectorAll<HTMLButtonElement>("button")]
       .find((button) => button.textContent === "保存限制")
       ?.click();
     await vi.waitFor(() =>
       expect(document.body.textContent).toContain("保存失败：disk unavailable"),
     );
-    expect(h.rpc).toHaveBeenCalledWith(
-      "config.set_limits",
-      expect.objectContaining({ provider: undefined, daily_token_budget: null }),
-    );
+    const params = h.rpc.mock.calls.find(([method]) => method === "config.set_limits")?.[1];
+    expect(params).toEqual({ daily_token_budget: null });
     dispose();
   });
 
@@ -251,7 +243,7 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
       return Promise.resolve({});
     });
     const dispose = render(() => <UsageSection />, document.body);
-    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无派发记录"));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无路由解析记录"));
     const save = () =>
       [...document.body.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent === "保存限制")
@@ -267,6 +259,36 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
       ),
     );
     expect(document.body.textContent).not.toContain("已保存并热生效");
+    dispose();
+  });
+
+  it("保存进行中禁止重复提交", async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "usage.overview") return Promise.resolve(EMPTY);
+      if (method === "config.get") return Promise.resolve({ roles: {}, limits: {} });
+      if (method === "provider.list") return Promise.resolve(PROVIDERS);
+      if (method === "config.set_limits") return pending;
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <UsageSection />, document.body);
+    const save = await vi.waitFor(() => {
+      const button = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+        (item) => item.textContent === "保存限制",
+      );
+      expect(button?.disabled).toBe(false);
+      return button!;
+    });
+
+    save.click();
+    save.click();
+    expect(h.rpc.mock.calls.filter(([method]) => method === "config.set_limits")).toHaveLength(1);
+    expect(save.disabled).toBe(true);
+    finish();
+    await vi.waitFor(() => expect(save.textContent).toBe("保存限制"));
     dispose();
   });
 });

@@ -297,7 +297,7 @@ describe("AddAccountPanel 保存", () => {
 });
 
 describe("AddAccountPanel 降级", () => {
-  it("provider 清单加载失败显示全局错误", async () => {
+  it("provider 清单加载失败持续显示 UNKNOWN、禁用依赖按钮，重试成功后恢复", async () => {
     h.list.mockRejectedValueOnce(new Error("registry unavailable"));
     const dispose = render(() => <AddAccountPanel onDone={() => {}} />, document.body);
     await vi.waitFor(() =>
@@ -306,6 +306,15 @@ describe("AddAccountPanel 降级", () => {
       ),
     );
     expect(providerOptions()).toEqual([]);
+    expect(document.body.textContent).toContain("加载 provider 清单失败：registry unavailable");
+    expect(btnByText("保存").disabled).toBe(true);
+    expect(btnByText("测试连接").disabled).toBe(true);
+
+    h.list.mockResolvedValueOnce(REGISTRY);
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(providerOptions()).toEqual(["anthropic", "xai"]));
+    expect(document.body.textContent).not.toContain("加载 provider 清单失败");
+    expect(btnByText("保存").disabled).toBe(false);
     dispose();
   });
 

@@ -1,12 +1,8 @@
-// Session 组件层集成：时间线加载恢复等待审批卡 / delta 批量上屏 / Done 对账 /
-// resync 自愈 / 发送-排队-停止 / 发送失败重发 / 审批应答。
-// lib 层（converge/send/approvals/delta-batch）逻辑各有单测，这里只验 Session 的接线与生命周期。
-import { Show } from "solid-js";
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PendingApproval, RunStats, StoredMessage } from "../lib/chat";
+import type { ModelIdentity, PendingApproval, RunStats, StoredMessage } from "../lib/chat";
 import type { ToolEvent } from "../lib/delta";
-import type { MsgItem } from "../lib/items";
+import { clickButton, flush, mountStreamingSession, sleep } from "./Session.test-components";
 
 const h = vi.hoisted(() => ({
   sessionMessages: vi.fn(async (_id: string): Promise<StoredMessage[]> => []),
@@ -20,15 +16,14 @@ const h = vi.hoisted(() => ({
   sendMessage: vi.fn(async (_sid: string, _text: string, _c: unknown[], _i: unknown[]) => ({
     queued: false,
   })),
-  // session.update 存亡广播订阅的回调按次捕获：测试手动驱动 RunGuard 帧
   sessionUpdateHandlers: [] as Array<(p: unknown) => void>,
-  // onLlmDelta 的回调按次捕获：测试手动驱动 delta/done/resync 帧
   delta: {} as {
     onText?: (text: string) => void;
     onReasoning?: (text: string) => void;
     onDone?: (stats?: RunStats, error?: string) => void;
-    onEvent?: (event: ToolEvent) => void;
-    onResync?: () => void;
+    onEvent?: ((event: ToolEvent) => void) | undefined;
+    onResync?: (() => void) | undefined;
+    onModel?: ((model: ModelIdentity) => void) | undefined;
   },
   onLlmDelta: vi.fn(
     (
@@ -38,8 +33,9 @@ const h = vi.hoisted(() => ({
       onDone: (stats?: RunStats, error?: string) => void,
       onEvent?: (event: ToolEvent) => void,
       onResync?: () => void,
+      onModel?: (model: ModelIdentity) => void,
     ) => {
-      h.delta = { onText, onReasoning, onDone, onEvent, onResync };
+      h.delta = { onText, onReasoning, onDone, onEvent, onResync, onModel };
       return () => {};
     },
   ),
@@ -62,8 +58,6 @@ vi.mock("../lib/chat", async (importOriginal) => {
   };
 });
 
-// 铺开真实 client 只桩 stream：streaming-reconcile 的 session.update 订阅需要手动驱动，
-// rpc 保持真实（测试环境无 Tauri internals，原样失败，各调用方本就有 catch）
 vi.mock("../lib/client", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../lib/client")>();
   return {
@@ -80,61 +74,23 @@ vi.mock("../lib/client", async (importOriginal) => {
   };
 });
 
-// Composer 桩出发送/停止入口；UserItem/AssistantItem 桩出动作按钮（各自有组件单测）
-vi.mock("../components/composer/TextComposer", () => ({
-  default: (props: {
-    streaming: () => boolean;
-    onSend: (t: string, c: never[], i: never[]) => void;
-    onStop: () => void;
-  }) => (
-    <div>
-      <button onClick={() => props.onSend("首条口信", [], [])}>composer send</button>
-      <button onClick={props.onStop}>composer stop</button>
-      <Show when={props.streaming()}>
-        <span>composer-streaming</span>
-      </Show>
-    </div>
-  ),
+vi.mock("../components/composer/TextComposer", async () => ({
+  default: (await import("./Session.test-components")).ComposerMock,
 }));
 
-vi.mock("../components/UserItem", () => ({
-  default: (props: { item: MsgItem; onRetry: () => void }) => (
-    <div>
-      user:{props.item.content}
-      <Show when={props.item.sendError}>
-        <button onClick={props.onRetry}>发送失败：{props.item.sendError}（点击重发）</button>
-      </Show>
-    </div>
-  ),
+vi.mock("../components/UserItem", async () => ({
+  default: (await import("./Session.test-components")).UserItemMock,
 }));
-
-vi.mock("../components/AssistantItem", () => ({
-  default: (props: { item: MsgItem }) => <div>assistant:{props.item.content}</div>,
+vi.mock("../components/AssistantItem", async () => ({
+  default: (await import("./Session.test-components")).AssistantItemMock,
 }));
 
 import Session from "./Session";
+import { flash } from "../lib/flash";
 import { setActiveSessionId } from "../lib/state";
 
-const flush = () => new Promise((r) => setTimeout(r, 0));
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-const clickButton = (text: string) => {
-  const button = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find((item) =>
-    item.textContent?.includes(text),
-  );
-  if (!button) throw new Error(`button not found: ${text}`);
-  button.click();
-};
-
 /** 进入 streaming：活跃会话 s1 就绪后点发送（sendMessage 默认 queued:false 首发成功）。 */
-async function mountStreaming() {
-  setActiveSessionId("s1");
-  const dispose = render(() => <Session />, document.body);
-  await flush();
-  clickButton("composer send");
-  await flush();
-  return dispose;
-}
+const mountStreaming = () => mountStreamingSession(Session, setActiveSessionId);
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -146,7 +102,9 @@ afterEach(() => {
   h.approvalPending.mockImplementation(async () => []);
   h.approvalRespond.mockImplementation(async () => ({ resolved: true }));
   h.sessionRunning.mockImplementation(async () => null);
+  h.sessionAbort.mockImplementation(async () => true);
   h.sendMessage.mockImplementation(async () => ({ queued: false }));
+  for (const message of flash.msgs()) flash.dismiss(message.id);
 });
 
 describe("Session 时间线加载", () => {
@@ -185,15 +143,69 @@ describe("Session 时间线加载", () => {
 });
 
 describe("Session 流式与对账", () => {
+  it("statusline 尚未返回时已同步注册 delta 订阅", () => {
+    h.statusline.mockImplementationOnce(() => new Promise(() => {}));
+    setActiveSessionId("s1");
+    const dispose = render(() => <Session />, document.body);
+    expect(h.onLlmDelta).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
   it("delta 50ms 窗口合并上屏，orb 切生成中", async () => {
     const dispose = await mountStreaming();
     expect(document.body.textContent).toContain("composer-streaming");
+    h.delta.onModel?.({ provider: "anthropic", model: "claude-sonnet-4-6" });
     h.delta.onText?.("增量甲");
     h.delta.onText?.("增量乙");
     expect(document.body.textContent).not.toContain("增量甲"); // 合并窗口内未上屏
     await sleep(70);
     expect(document.body.textContent).toContain("增量甲增量乙"); // 同气泡合并（stub 每气泡一条 assistant: 前缀）
+    expect(document.body.textContent).toContain("anthropic/claude-sonnet-4-6");
     expect(document.body.textContent).toContain("生成中");
+    dispose();
+  });
+
+  it("切换会话丢弃旧会话的待刷新 delta，新会话只使用自己的实际模型", async () => {
+    setActiveSessionId("s1");
+    const dispose = render(() => <Session />, document.body);
+    await flush();
+
+    h.delta.onModel?.({ provider: "xai", model: "grok-4" });
+    h.delta.onText?.("旧会话残片");
+    setActiveSessionId("s2");
+    await flush();
+    h.delta.onModel?.({ provider: "anthropic", model: "claude-sonnet-4-6" });
+    h.delta.onText?.("新会话正文");
+
+    await sleep(70);
+    expect(document.body.textContent).toContain("新会话正文");
+    expect(document.body.textContent).toContain("anthropic/claude-sonnet-4-6");
+    expect(document.body.textContent).not.toContain("旧会话残片");
+    expect(document.body.textContent).not.toContain("xai/grok-4");
+    dispose();
+  });
+
+  it("同会话实际模型变更时不把前一模型的待刷新 delta 重标为新模型", async () => {
+    const dispose = await mountStreaming();
+    h.delta.onModel?.({ provider: "xai", model: "grok-4" });
+    h.delta.onText?.("模型甲片段");
+    h.delta.onModel?.({ provider: "anthropic", model: "claude-sonnet-4-6" });
+    h.delta.onText?.("模型乙片段");
+
+    await sleep(70);
+    expect(document.body.textContent).toContain("模型甲片段:model:xai/grok-4");
+    expect(document.body.textContent).toContain("模型乙片段:model:anthropic/claude-sonnet-4-6");
+    dispose();
+  });
+
+  it("工具事件上屏前先刷新更早的文本 delta，不颠倒时间线顺序", async () => {
+    const dispose = await mountStreaming();
+    h.delta.onText?.("先到的文本");
+    h.delta.onEvent?.({ kind: "tool_call", name: "read", summary: "后到的工具" });
+
+    const timeline = document.body.textContent ?? "";
+    expect(timeline.indexOf("先到的文本")).toBeGreaterThanOrEqual(0);
+    expect(timeline.indexOf("先到的文本")).toBeLessThan(timeline.indexOf("后到的工具"));
     dispose();
   });
 
@@ -290,6 +302,20 @@ describe("Session 发送链路", () => {
     await flush();
     expect(h.sessionAbort).toHaveBeenCalledWith("s1");
     expect(document.body.textContent).not.toContain("排队中"); // 清队列是用户本意
+    dispose();
+  });
+
+  it("abort RPC 失败保留队列并显示错误，不伪造已停止状态", async () => {
+    h.sendMessage.mockImplementation(async () => ({ queued: true }));
+    h.sessionAbort.mockRejectedValueOnce(new Error("backend unavailable"));
+    const dispose = await mountStreaming();
+    expect(document.body.textContent).toContain("排队中 1 条");
+    clickButton("composer stop");
+    await flush();
+    expect(document.body.textContent).toContain("排队中 1 条");
+    expect(
+      flash.msgs().some((message) => message.kind === "err" && message.text.includes("停止失败")),
+    ).toBe(true);
     dispose();
   });
 

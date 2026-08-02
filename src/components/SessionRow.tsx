@@ -7,6 +7,7 @@ import { relTime } from "../lib/time";
 import { activeSessionId } from "../lib/state";
 import { flashErr } from "../lib/flash";
 import { errText } from "./err-text";
+import { createSeqGuard } from "../lib/async-guard";
 
 export default function SessionRow(props: {
   session: SessionMeta;
@@ -30,6 +31,10 @@ export default function SessionRow(props: {
   const [distillProvider, setDistillProvider] = createSignal(
     initialModel ? `${initialModel.provider}/${initialModel.model}` : "当前默认 Provider",
   );
+  const [distillModelState, setDistillModelState] = createSignal<"loading" | "ready" | "error">(
+    "loading",
+  );
+  const modelGuard = createSeqGuard();
   const [draft, setDraft] = createSignal("");
   let inputRef: HTMLInputElement | undefined;
 
@@ -57,11 +62,23 @@ export default function SessionRow(props: {
     }
   };
 
+  const loadDistillProvider = () => {
+    const request = modelGuard.next();
+    setDistillModelState("loading");
+    void currentModel(s().id)
+      .then((model) => {
+        if (!modelGuard.isCurrent(request)) return;
+        setDistillProvider(`${model.provider}/${model.model}`);
+        setDistillModelState("ready");
+      })
+      .catch(() => {
+        if (modelGuard.isCurrent(request)) setDistillModelState("error");
+      });
+  };
+
   const beginDeleteChoice = () => {
     setConfirming(true);
-    void currentModel(s().id)
-      .then((model) => setDistillProvider(`${model.provider}/${model.model}`))
-      .catch(() => {});
+    loadDistillProvider();
   };
 
   return (
@@ -167,10 +184,30 @@ export default function SessionRow(props: {
               <>
                 <span
                   class="max-w-32 truncate text-2xs text-[var(--text-faint)]"
-                  title={`沉淀会把此 Session 最近文本发送给 ${distillProvider()}，并且只写个人知识`}
+                  title={
+                    distillModelState() === "error"
+                      ? "Provider UNKNOWN，不能安全沉淀；可直接删除或重试读取"
+                      : `沉淀会把此 Session 最近文本发送给 ${distillProvider()}，并且只写个人知识`
+                  }
                 >
-                  发送到 {distillProvider()}
+                  {distillModelState() === "loading"
+                    ? "Provider 读取中…"
+                    : distillModelState() === "error"
+                      ? "Provider UNKNOWN"
+                      : `发送到 ${distillProvider()}`}
                 </span>
+                <Show when={distillModelState() === "error"}>
+                  <button
+                    class="px-1 text-[var(--accent-hover)]"
+                    title="重试读取 Provider"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      loadDistillProvider();
+                    }}
+                  >
+                    <RefreshCw size={11} />
+                  </button>
+                </Show>
                 <button
                   class="px-1 text-[var(--err)]"
                   title={s().running ? "会话正在运行，删除将终止" : "确认删除"}
@@ -183,7 +220,13 @@ export default function SessionRow(props: {
                 </button>
                 <button
                   class="px-1 text-[var(--warn)]"
-                  title={`把此 Session 最近文本发送给 ${distillProvider()}，沉淀为个人知识后删除`}
+                  classList={{ "opacity-40": distillModelState() !== "ready" }}
+                  disabled={distillModelState() !== "ready"}
+                  title={
+                    distillModelState() === "ready"
+                      ? `把此 Session 最近文本发送给 ${distillProvider()}，沉淀为个人知识后删除`
+                      : "Provider 尚未确认，不能安全沉淀"
+                  }
                   onClick={(e) => {
                     e.stopPropagation();
                     props.onDelete(true);

@@ -62,12 +62,11 @@ describe("SessionItem 分派", () => {
       onRerun: vi.fn(),
       onContinue: vi.fn(),
       onImageLoad: vi.fn(),
-      onRespondApproval: vi.fn(),
+      onRespondApproval: vi.fn(async () => {}),
     };
     const common = {
       streaming: () => false,
       live: () => true,
-      modelLabel: () => "model",
       ...callbacks,
     };
     const items: Item[] = [

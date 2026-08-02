@@ -1,5 +1,5 @@
 // 审批卡：Ask 档挂起命令的用户决定入口（允许/拒绝，决定后只读展示；超时/取消置灰色失效态）。
-import { Show } from "solid-js";
+import { Show, createSignal } from "solid-js";
 import type { ApprovalItem } from "../lib/items";
 
 const RESOLVED_TEXT: Record<NonNullable<ApprovalItem["resolved"]>, string> = {
@@ -12,8 +12,18 @@ const RESOLVED_TEXT: Record<NonNullable<ApprovalItem["resolved"]>, string> = {
 
 export default function ApprovalCard(props: {
   item: ApprovalItem;
-  onRespond: (id: string, allow: boolean) => void;
+  onRespond: (id: string, allow: boolean) => Promise<void>;
 }) {
+  const [responding, setResponding] = createSignal(false);
+  const respond = async (allow: boolean) => {
+    if (responding()) return;
+    setResponding(true);
+    try {
+      await props.onRespond(props.item.approvalId, allow);
+    } finally {
+      setResponding(false);
+    }
+  };
   // 非用户决定的 resolved（超时/取消/失效）：卡片转灰，与等待态的警示色拉开
   const invalid = () =>
     props.item.resolved === "timeout" ||
@@ -42,13 +52,15 @@ export default function ApprovalCard(props: {
         <div class="flex gap-2">
           <button
             class="pressable px-2.5 py-1 rounded text-2xs bg-[var(--accent)] text-[var(--accent-contrast)]"
-            onClick={() => props.onRespond(props.item.approvalId, true)}
+            disabled={responding()}
+            onClick={() => void respond(true)}
           >
             允许
           </button>
           <button
             class="pressable px-2.5 py-1 rounded text-2xs border border-[var(--border)] text-[var(--err)]"
-            onClick={() => props.onRespond(props.item.approvalId, false)}
+            disabled={responding()}
+            onClick={() => void respond(false)}
           >
             拒绝
           </button>

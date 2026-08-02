@@ -39,7 +39,12 @@ function btnByText(text: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  h.status.mockReset();
   h.status.mockResolvedValue([{ ...NEEDS_AUTH }]);
+  h.auth.mockReset();
+  h.auth.mockResolvedValue({ authorize_url: "https://a", opened: true });
+  h.restart.mockReset();
+  h.restart.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -48,6 +53,20 @@ afterEach(() => {
 });
 
 describe("McpSection 授权轮询", () => {
+  it("首次读取失败显示错误，不把 UNKNOWN 伪装成未配置", async () => {
+    h.status.mockRejectedValueOnce(new Error("ws closed")).mockResolvedValueOnce([]);
+    const dispose = render(() => <McpSection />, document.body);
+
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain("MCP 状态读取失败：ws closed"),
+    );
+    expect(document.body.textContent).not.toContain("未配置 MCP server");
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("未配置 MCP server"));
+    expect(document.body.textContent).not.toContain("MCP 状态读取失败");
+    dispose();
+  });
+
   it("授权失败（last_auth_error）：按钮复位并就地显错，轮询停止", async () => {
     const dispose = render(() => <McpSection />, document.body);
     await vi.waitFor(() => expect(document.body.textContent).toContain("认证"));
@@ -83,4 +102,44 @@ describe("McpSection 授权轮询", () => {
     await sleep(4500); // 卸载后：轮询不再发 status（兜底定时器同步被清）
     expect(h.status.mock.calls.length).toBe(calls);
   }, 15000);
+
+  it("授权请求在组件卸载后才返回时不创建轮询", async () => {
+    let finish!: (value: { authorize_url: string; opened: boolean }) => void;
+    h.auth.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const dispose = render(() => <McpSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("认证"));
+    btnByText("认证").click();
+    dispose();
+    finish({ authorize_url: "https://a", opened: true });
+    await sleep(20);
+    expect(h.status).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("McpSection 重启", () => {
+  it("同一 server 重启进行中禁止重复提交", async () => {
+    let finish!: () => void;
+    h.status.mockResolvedValue([{ ...NEEDS_AUTH, status: "running" }]);
+    h.restart.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const dispose = render(() => <McpSection />, document.body);
+    const restart = await vi.waitFor(() => btnByText("重启"));
+
+    restart.click();
+    restart.click();
+    expect(h.restart).toHaveBeenCalledTimes(1);
+    expect(restart.disabled).toBe(true);
+    finish();
+    await vi.waitFor(() => expect(restart.textContent).toBe("重启"));
+    dispose();
+  });
 });

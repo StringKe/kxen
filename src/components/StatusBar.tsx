@@ -5,27 +5,60 @@ import { statusline, type StatuslineReport } from "../lib/chat";
 import { displayName, fmtCtx, modelOf, modelsCatalog, type ProviderCatalog } from "../lib/models";
 import { goalStatusMeta } from "../lib/board";
 import { activeSessionId } from "../lib/state";
+import {
+  hasUnknownMetering,
+  hasUnknownStorage,
+  usageMeteringUnknownDetail,
+  usageStorageUnknownDetail,
+} from "../lib/usage";
+import { createSeqGuard } from "../lib/async-guard";
+import { formatError } from "../lib/error-text";
 
 /** 底部状态栏：固定段 + config 开关，3s 轮询 + 会话切换即时刷新。 */
 export default function StatusBar() {
-  const [report, setReport] = createSignal<StatuslineReport | null>(null);
+  const [snapshot, setSnapshot] = createSignal<{ sid: string; report: StatuslineReport } | null>(
+    null,
+  );
   const [cat, setCat] = createSignal<ProviderCatalog[]>([]);
+  const [loadErr, setLoadErr] = createSignal("");
+  const guard = createSeqGuard();
   let timer: ReturnType<typeof setInterval> | undefined;
+  let observedSid: string | undefined;
+  const report = () => {
+    const current = snapshot();
+    return current?.sid === activeSessionId() ? current.report : null;
+  };
 
   const reload = async () => {
-    const r = await statusline(activeSessionId()).catch(() => null);
-    if (r) setReport(r);
+    const sid = activeSessionId();
+    const request = guard.next();
+    try {
+      const next = await statusline(sid);
+      if (guard.isCurrent(request) && activeSessionId() === sid) {
+        setSnapshot({ sid, report: next });
+        setLoadErr("");
+      }
+    } catch (error) {
+      if (guard.isCurrent(request) && activeSessionId() === sid) setLoadErr(formatError(error));
+    }
   };
 
   onMount(() => {
-    void modelsCatalog().then(setCat);
+    void modelsCatalog()
+      .then(setCat)
+      .catch(() => {});
     timer = setInterval(() => void reload(), 3000);
   });
   onCleanup(() => timer && clearInterval(timer));
 
   // 会话切换即时换 tokens/ctx/model（否则最长 3s 显示上一会话数据）；首跑兼代 onMount 首拉
   createEffect(() => {
-    activeSessionId();
+    const sid = activeSessionId();
+    if (observedSid !== sid) {
+      observedSid = sid;
+      setSnapshot(null);
+    }
+    setLoadErr("");
     void reload();
   });
 
@@ -49,6 +82,8 @@ export default function StatusBar() {
     ({ ok: "text-[var(--ok)]", warn: "text-[var(--warn)]", dim: "text-[var(--text-dim)]" })[
       goalMeta().tone
     ];
+  const sessionMeteringUnknown = () => hasUnknownMetering(report()?.tokens);
+  const sessionStorageUnknown = () => hasUnknownStorage(report()?.tokens);
   // ctx 窗取 catalog 实测值（models.dev），不写死固定窗口文案
   const ctxWindow = () => {
     const raw = report()?.model ?? "";
@@ -85,10 +120,33 @@ export default function StatusBar() {
       </Show>
       <span class="ml-auto flex items-center gap-3 tabular-nums">
         <NotificationCenter />
+        <Show when={loadErr()}>
+          <span class="text-[var(--warn)]" title={`状态栏加载失败：${loadErr()}`}>
+            状态 UNKNOWN
+          </span>
+        </Show>
         <Show when={has("tokens")}>
-          <span title="本会话 tokens（input/output）">
+          <span
+            title={
+              sessionMeteringUnknown() || sessionStorageUnknown()
+                ? `本会话 tokens（input/output）：${[
+                    sessionMeteringUnknown() ? usageMeteringUnknownDetail(report()?.tokens) : "",
+                    sessionStorageUnknown() ? usageStorageUnknownDetail(report()?.tokens) : "",
+                  ]
+                    .filter(Boolean)
+                    .join("；")}`
+                : "本会话 tokens（input/output）"
+            }
+          >
+            {sessionMeteringUnknown() ? "≥" : ""}
             {(report()?.tokens.input ?? 0).toLocaleString("en-US")}/
             {(report()?.tokens.output ?? 0).toLocaleString("en-US")}
+            <Show when={sessionMeteringUnknown()}>
+              <span class="ml-1 text-[var(--warn)]">计量 UNKNOWN</span>
+            </Show>
+            <Show when={sessionStorageUnknown()}>
+              <span class="ml-1 text-[var(--warn)]">存储 UNKNOWN</span>
+            </Show>
           </span>
         </Show>
         <Show when={has("ctx")}>

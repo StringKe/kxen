@@ -1,8 +1,7 @@
 // SessionTree：Codex 式项目-会话树（每组 ≤5 条，组可折叠，行内置顶/重命名/删除确认/拖拽排序）。
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { ChevronDown, ChevronRight, FolderOpen, FolderPlus, PenLine, Plus } from "lucide-solid";
+import { ChevronDown, ChevronRight, FolderOpen, Plus } from "lucide-solid";
 import {
-  sessionUpdateMeta,
   workspaceAdd,
   workspaceList,
   workspaceSwitch,
@@ -10,7 +9,7 @@ import {
   type Workspace,
 } from "../lib/chat";
 import { deleteSession, newSession, refreshSessions, sessions, switchSession } from "../lib/state";
-import { createInFlight } from "../lib/async-guard";
+import { createInFlight, createSeqGuard } from "../lib/async-guard";
 import { openProjectDir } from "../lib/open-project";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
@@ -19,6 +18,8 @@ import { groupName, promotedName } from "../lib/group-name";
 import SessionRow from "./SessionRow";
 import EmptyLine from "./EmptyLine";
 import { errText } from "./err-text";
+import { reorderSessionGroup } from "../lib/session-reorder";
+import SessionTreeAddProject from "./SessionTreeAddProject";
 
 const MAX_PER_GROUP = 5;
 
@@ -38,11 +39,24 @@ export default function SessionTree() {
   const [deleting, setDeleting] = createSignal<ReadonlySet<string>>(new Set());
   /** 拖拽落点高亮：当前悬停的目标行 id（插入线）。 */
   const [dropTarget, setDropTarget] = createSignal("");
+  const [reordering, setReordering] = createSignal<ReadonlySet<string>>(new Set());
+  const [recentsErr, setRecentsErr] = createSignal("");
   const dedupeDelete = createInFlight();
   const dedupeAdd = createInFlight();
+  const recentsGuard = createSeqGuard();
   let dragId = "";
 
-  const reloadRecents = async () => setRecents(await workspaceList().catch(() => []));
+  const reloadRecents = async () => {
+    const request = recentsGuard.next();
+    try {
+      const next = await workspaceList();
+      if (!recentsGuard.isCurrent(request)) return;
+      setRecents(next);
+      setRecentsErr("");
+    } catch (error) {
+      if (recentsGuard.isCurrent(request)) setRecentsErr(formatError(error));
+    }
+  };
 
   onMount(() => {
     void reloadRecents();
@@ -127,7 +141,8 @@ export default function SessionTree() {
     setDeleting((prev) => new Set(prev).add(id));
     try {
       // in-flight 去重：确认按钮/右键菜单双触发只删一次；善后切换收口在 state.deleteSession
-      await dedupeDelete(`session.delete:${id}`, () => deleteSession(id, distill));
+      const result = await dedupeDelete(`session.delete:${id}`, () => deleteSession(id, distill));
+      if (result.warning) flashErr(`会话已删除，但后续对账未完成：${result.warning}`);
     } catch (e) {
       flashErr(`删除会话失败：${errText(e)}`);
     } finally {
@@ -169,30 +184,50 @@ export default function SessionTree() {
 
   /** 拖拽排序：落点行的位置即为新序号，整组重写 sort_order 持久化。 */
   const dropOn = async (group: Group, targetId: string) => {
-    if (!dragId || dragId === targetId) return;
-    const list = group.sessions.filter((s) => !s.pinned);
-    const from = list.findIndex((s) => s.id === dragId);
-    const to = list.findIndex((s) => s.id === targetId);
-    if (from < 0 || to < 0) return;
-    const moved = list.splice(from, 1)[0]!;
-    list.splice(to, 0, moved);
-    for (let i = 0; i < list.length; i++) {
-      // 逐条写失败就停：部分写入已乱序，继续写只会错上加错，提示后由用户重拖
-      const err = await sessionUpdateMeta(list[i]!.id, { sort_order: i + 1 }).then(
-        () => null,
-        (e) => e,
-      );
-      if (err) {
-        flashErr(`排序保存失败：${formatError(err)}`);
-        break;
+    if (!dragId || dragId === targetId || reordering().has(group.path)) return;
+    const sourceId = dragId;
+    setReordering((current) => new Set(current).add(group.path));
+    let saveError: unknown;
+    try {
+      const result = await reorderSessionGroup(group.sessions, sourceId, targetId);
+      saveError = result?.saveError;
+      if (saveError && result) {
+        flashErr(
+          result.rollbackFailures.length === 0
+            ? `排序保存失败：${formatError(saveError)}；原顺序回滚 PASS`
+            : `排序保存失败：${formatError(saveError)}；回滚 UNKNOWN：${result.rollbackFailures.join("；")}`,
+        );
       }
+      try {
+        await refreshSessions();
+      } catch (error) {
+        flashErr(
+          saveError
+            ? `排序回滚后刷新失败：${formatError(error)}`
+            : `排序已保存，但刷新会话失败：${formatError(error)}`,
+        );
+      }
+    } finally {
+      dragId = "";
+      setDropTarget("");
+      setReordering((current) => {
+        const next = new Set(current);
+        next.delete(group.path);
+        return next;
+      });
     }
-    dragId = "";
-    await refreshSessions();
   };
 
   return (
     <div class="flex-1 overflow-y-auto px-2 space-y-1">
+      <Show when={recentsErr()}>
+        <div class="mx-1 rounded border border-[var(--err)]/40 px-2 py-1 text-2xs text-[var(--err)]">
+          加载最近项目失败：{recentsErr()}
+          <button class="ml-2 hover:underline" onClick={() => void reloadRecents()}>
+            重试
+          </button>
+        </div>
+      </Show>
       <For each={groups()}>
         {(group) => {
           const isCollapsed = () => collapsed().has(group.path);
@@ -245,13 +280,13 @@ export default function SessionTree() {
                         onOpen={() => void open(s.id)}
                         onDelete={(distill) => void remove(s.id, distill)}
                         onChanged={() => void refreshSessions()}
-                        draggable
+                        draggable={!s.pinned && !reordering().has(group.path)}
                         dropTarget={dropTarget() === s.id}
                         onDragStart={() => (dragId = s.id)}
                         onDragOver={(e) => {
                           e.preventDefault();
                           // 拖到自身上不标落点
-                          if (dragId && dragId !== s.id) setDropTarget(s.id);
+                          if (!s.pinned && dragId && dragId !== s.id) setDropTarget(s.id);
                         }}
                         onDragLeave={(e) => {
                           // 子元素间移动也触发 leave：真离开本行才清高亮
@@ -260,7 +295,7 @@ export default function SessionTree() {
                         }}
                         onDrop={() => {
                           setDropTarget("");
-                          void dropOn(group, s.id);
+                          if (!s.pinned) void dropOn(group, s.id);
                         }}
                         onDragEnd={() => {
                           // 取消拖拽（Esc/落点非法）不触发 drop：dragend 兜底清状态
@@ -289,47 +324,15 @@ export default function SessionTree() {
           );
         }}
       </For>
-      <Show
-        when={adding()}
-        fallback={
-          <div class="flex items-center gap-0.5">
-            <button
-              class="flex-1 flex items-center gap-1.5 px-1.5 py-1 rounded text-xs text-[var(--text-faint)] hover:bg-[var(--bg-overlay)]/60"
-              onClick={() => void pickDir()}
-            >
-              <FolderPlus size={12} />
-              添加项目目录…
-            </button>
-            <button
-              class="p-1 rounded text-[var(--text-faint)] hover:bg-[var(--bg-overlay)]/60"
-              title="手动输入路径"
-              onClick={() => setAdding(true)}
-            >
-              <PenLine size={12} />
-            </button>
-          </div>
-        }
-      >
-        <div class="flex items-center gap-1 px-1.5 py-1">
-          <input
-            ref={(el) => setTimeout(() => el.focus(), 0)}
-            class="flex-1 bg-transparent text-xs font-mono focus:outline-none placeholder:text-[var(--text-faint)]"
-            placeholder="/绝对/路径"
-            value={newPath()}
-            onInput={(e) => setNewPath(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void addPath();
-              if (e.key === "Escape") setAdding(false);
-            }}
-          />
-          <button
-            class="text-2xs px-1.5 py-0.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)]"
-            onClick={() => void addPath()}
-          >
-            添加
-          </button>
-        </div>
-      </Show>
+      <SessionTreeAddProject
+        adding={adding()}
+        path={newPath()}
+        onPick={() => void pickDir()}
+        onStart={() => setAdding(true)}
+        onCancel={() => setAdding(false)}
+        onPath={setNewPath}
+        onAdd={() => void addPath()}
+      />
     </div>
   );
 }

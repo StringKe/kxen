@@ -1,5 +1,5 @@
 // 触发弹窗逻辑（textarea 版）：@ / # 任意位置（Zed 边界规则），/ 收窄行首（对齐后端命令契约）+ 弹窗装配。
-import { fsComplete, type CommandInfo, type CompleteEntry } from "../../lib/chat";
+import { fsComplete, type CommandInfo } from "../../lib/chat";
 
 export interface PopupState {
   kind: "at" | "slash" | "hash";
@@ -13,6 +13,7 @@ export interface PopupItem {
   label: string;
   detail?: string | undefined;
   badge?: string | undefined;
+  tone?: "error" | undefined;
   apply: () => void;
 }
 
@@ -75,7 +76,7 @@ export async function buildItems(
   actions: PopupActions,
 ): Promise<PopupItem[]> {
   if (trigger.kind === "at") {
-    const hits = await fsComplete(trigger.query, 10).catch(() => [] as CompleteEntry[]);
+    const hits = await fsComplete(trigger.query, 10);
     return hits.map((h) => ({
       label: h.path,
       badge: h.kind === "dir" ? "dir" : undefined,

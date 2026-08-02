@@ -9,12 +9,11 @@ import RoutingSection from "../components/settings/RoutingSection";
 import ScheduleSection from "../components/settings/ScheduleSection";
 import UsageSection from "../components/settings/UsageSection";
 import VoiceSection from "../components/settings/VoiceSection";
-import UpdateSection from "../components/settings/UpdateSection";
+import GeneralSection from "../components/settings/GeneralSection";
 import { client } from "../lib/client";
 import { configGet, currentModel, doctor } from "../lib/chat";
 import { flashErr, flashOk } from "../lib/flash";
 import { onDragStart } from "../lib/drag";
-import { mode, setMode } from "../lib/theme";
 
 const SECTIONS = [
   "通用",
@@ -37,24 +36,19 @@ export default function Settings() {
     remote_mcp: false,
   });
   const [readiness, setReadiness] = createSignal({
-    workspace: false,
-    provider: false,
-    routing: false,
+    workspace: null as boolean | null,
+    provider: null as boolean | null,
+    routing: null as boolean | null,
   });
   const [distillModel, setDistillModel] = createSignal("当前默认 Provider");
+  const [configLoaded, setConfigLoaded] = createSignal(false);
+  const [configErr, setConfigErr] = createSignal("");
+  const [policySaving, setPolicySaving] = createSignal(false);
+  const [experimentalSaving, setExperimentalSaving] = createSignal<ReadonlySet<string>>(new Set());
 
-  onMount(async () => {
-    // 首屏读取失败保持缺省 queue 不阻塞页面；用户改动时的保存路径才显错
-    const [cfg, report, model] = await Promise.all([
-      configGet().catch(() => null),
-      doctor().catch(() => null),
-      currentModel().catch(() => null),
-    ]);
-    if (model?.provider && model?.model) {
-      setDistillModel(`${model.provider}/${model.model}`);
-    }
-    if (cfg?.send_when_running) setSendPolicy(cfg.send_when_running);
-    if (cfg?.experimental) {
+  const applyConfig = (cfg: Awaited<ReturnType<typeof configGet>>) => {
+    if (cfg.send_when_running) setSendPolicy(cfg.send_when_running);
+    if (cfg.experimental) {
       setExperimental({
         automatic_knowledge_distillation:
           cfg.experimental.automatic_knowledge_distillation === true,
@@ -62,37 +56,92 @@ export default function Settings() {
         remote_mcp: cfg.experimental.remote_mcp === true,
       });
     }
-    const availableProviders = new Set(
-      report?.entries
-        ?.filter((entry) => ["ok", "imported"].includes(entry.status))
-        .map((entry) => entry.provider) ?? [],
+    setConfigLoaded(true);
+    setConfigErr("");
+  };
+
+  const reloadConfig = async (): Promise<boolean> => {
+    try {
+      applyConfig(await configGet());
+      return true;
+    } catch (error) {
+      setConfigLoaded(false);
+      setConfigErr(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  };
+
+  onMount(() => {
+    void Promise.allSettled([configGet(), doctor(), currentModel()]).then(
+      ([cfgResult, reportResult, modelResult]) => {
+        const cfg = cfgResult.status === "fulfilled" ? cfgResult.value : null;
+        const report = reportResult.status === "fulfilled" ? reportResult.value : null;
+        const model = modelResult.status === "fulfilled" ? modelResult.value : null;
+        if (cfg) applyConfig(cfg);
+        else {
+          setConfigLoaded(false);
+          setConfigErr(
+            cfgResult.status === "rejected"
+              ? cfgResult.reason instanceof Error
+                ? cfgResult.reason.message
+                : String(cfgResult.reason)
+              : "UNKNOWN",
+          );
+        }
+        if (model?.provider && model?.model) setDistillModel(`${model.provider}/${model.model}`);
+        const availableProviders = new Set(
+          report?.entries
+            ?.filter((entry) => ["ok", "imported"].includes(entry.status))
+            .map((entry) => entry.provider) ?? [],
+        );
+        setReadiness({
+          workspace: report ? Boolean(report.system?.lsp_root) : null,
+          provider: report ? availableProviders.size > 0 : null,
+          routing:
+            report && cfg
+              ? Object.values(cfg.roles ?? {}).some((binding) =>
+                  availableProviders.has(binding.provider),
+                )
+              : null,
+        });
+      },
     );
-    setReadiness({
-      workspace: Boolean(report?.system?.lsp_root),
-      provider: availableProviders.size > 0,
-      routing: Object.values(cfg?.roles ?? {}).some((binding) =>
-        availableProviders.has(binding.provider),
-      ),
-    });
   });
 
   const setPolicy = async (p: string) => {
+    if (!configLoaded() || policySaving() || p === sendPolicy()) return;
     const prev = sendPolicy();
     setSendPolicy(p);
-    await client.rpc("config.set_send_policy", { policy: p }).catch((e: unknown) => {
-      setSendPolicy(prev); // 乐观更新失败回滚，不留假状态
+    setPolicySaving(true);
+    try {
+      await client.rpc("config.set_send_policy", { policy: p });
+    } catch (e) {
+      if (!(await reloadConfig())) setSendPolicy(prev);
       flashErr(`保存失败：${e instanceof Error ? e.message : String(e)}`);
-    });
+    } finally {
+      setPolicySaving(false);
+    }
   };
 
   type ExperimentalKey = keyof ReturnType<typeof experimental>;
   const setExperimentalFlag = async (key: ExperimentalKey, enabled: boolean) => {
-    const prev = experimental();
-    setExperimental({ ...prev, [key]: enabled });
-    await client.rpc("config.set_experimental", { key, enabled }).catch((e: unknown) => {
-      setExperimental(prev);
+    if (!configLoaded() || experimentalSaving().has(key)) return;
+    const prev = experimental()[key];
+    setExperimental((current) => ({ ...current, [key]: enabled }));
+    setExperimentalSaving((current) => new Set(current).add(key));
+    try {
+      await client.rpc("config.set_experimental", { key, enabled });
+    } catch (e) {
+      // remote_mcp 可能已持久化、仅 runtime reload 失败；必须读回权威配置，不能盲目回滚。
+      if (!(await reloadConfig())) setExperimental((current) => ({ ...current, [key]: prev }));
       flashErr(`保存失败：${e instanceof Error ? e.message : String(e)}`);
-    });
+    } finally {
+      setExperimentalSaving((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    }
   };
 
   const exportDiag = async () => {
@@ -128,90 +177,23 @@ export default function Settings() {
         </nav>
 
         <div class="flex-1 min-w-0 space-y-4">
+          <Show when={configErr()}>
+            <div class="rounded-md border border-[var(--err)]/50 px-3 py-2 text-xs text-[var(--err)]">
+              配置读取失败，当前值为 UNKNOWN：{configErr()}
+              <button class="ml-2 hover:underline" onClick={() => void reloadConfig()}>
+                重试
+              </button>
+            </div>
+          </Show>
           <Show when={section() === "通用"}>
-            <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] p-4 space-y-2">
-              <div class="text-sm">首次运行检查</div>
-              <For
-                each={
-                  [
-                    ["workspace", "Workspace 已选择"],
-                    ["provider", "至少一个 Provider 凭证可用"],
-                    ["routing", "至少一个角色路由落到可用 Provider"],
-                  ] as const
-                }
-              >
-                {([key, label]) => (
-                  <div class="flex items-center gap-2 text-xs">
-                    <span class={readiness()[key] ? "text-[var(--ok)]" : "text-[var(--warn)]"}>
-                      {readiness()[key] ? "PASS" : "需要处理"}
-                    </span>
-                    <span class="text-[var(--text-dim)]">{label}</span>
-                    <Show when={!readiness()[key] && key === "provider"}>
-                      <button
-                        class="text-[var(--accent-hover)] hover:underline"
-                        onClick={() => setSection("提供商")}
-                      >
-                        去配置
-                      </button>
-                    </Show>
-                  </div>
-                )}
-              </For>
-              <div class="text-2xs text-[var(--text-faint)]">
-                Shell 命令逐次审批；Browser automation、Remote MCP、自动知识沉淀默认关闭。
-              </div>
-            </div>
-            <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
-              <div class="flex items-center justify-between px-4 py-3">
-                <div>
-                  <div class="text-sm">主题</div>
-                  <div class="text-xs text-[var(--text-faint)]">
-                    跟随系统或手动固定，系统切换实时生效
-                  </div>
-                </div>
-                <div class="flex gap-1">
-                  <For each={["auto", "dark", "light"] as const}>
-                    {(m) => (
-                      <button
-                        class="pressable px-2.5 py-1 rounded-md text-xs border"
-                        classList={{
-                          "border-[var(--accent)] text-[var(--accent-hover)]": mode() === m,
-                          "border-[var(--border)] text-[var(--text-dim)]": mode() !== m,
-                        }}
-                        onClick={() => setMode(m)}
-                      >
-                        {m === "auto" ? "跟随系统" : m === "dark" ? "暗色" : "亮色"}
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </div>
-              <div class="flex items-center justify-between px-4 py-3">
-                <div>
-                  <div class="text-sm">运行中发送</div>
-                  <div class="text-xs text-[var(--text-faint)]">
-                    生成中再发消息：排队等当前完成，或打断当前立即发送
-                  </div>
-                </div>
-                <div class="flex gap-1">
-                  <For each={["queue", "interrupt"] as const}>
-                    {(p) => (
-                      <button
-                        class="pressable px-2.5 py-1 rounded-md text-xs border"
-                        classList={{
-                          "border-[var(--accent)] text-[var(--accent-hover)]": sendPolicy() === p,
-                          "border-[var(--border)] text-[var(--text-dim)]": sendPolicy() !== p,
-                        }}
-                        onClick={() => void setPolicy(p)}
-                      >
-                        {p === "queue" ? "排队" : "打断"}
-                      </button>
-                    )}
-                  </For>
-                </div>
-              </div>
-              <UpdateSection />
-            </div>
+            <GeneralSection
+              readiness={readiness()}
+              sendPolicy={sendPolicy()}
+              configLoaded={configLoaded()}
+              policySaving={policySaving()}
+              onPolicy={(policy) => void setPolicy(policy)}
+              onProviders={() => setSection("提供商")}
+            />
           </Show>
 
           <Show when={section() === "提供商"}>
@@ -279,6 +261,7 @@ export default function Settings() {
                       </div>
                       <button
                         class="pressable px-2.5 py-1 rounded-md text-xs border"
+                        disabled={!configLoaded() || experimentalSaving().has(key)}
                         classList={{
                           "border-[var(--warn)] text-[var(--warn)]": experimental()[key],
                           "border-[var(--border)] text-[var(--text-dim)]": !experimental()[key],

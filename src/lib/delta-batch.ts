@@ -9,6 +9,7 @@ export function createDeltaBatcher(
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const flush = () => {
+    if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
     const c = buffers.content;
     const r = buffers.reasoning;
@@ -25,7 +26,14 @@ export function createDeltaBatcher(
     },
     /** 终态前调用：残余增量立即上屏。 */
     flushNow() {
-      if (timer) flush();
+      if (timer !== undefined) flush();
+    },
+    /** 会话离开或 run 重置时调用：丢弃不再属于当前视图的待上屏增量。 */
+    discard() {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      buffers.content = "";
+      buffers.reasoning = "";
     },
   };
 }

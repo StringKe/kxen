@@ -25,7 +25,7 @@ let cache: ProviderCatalog[] | null = null;
 
 export async function modelsCatalog(force = false): Promise<ProviderCatalog[]> {
   if (cache && !force) return cache;
-  cache = await client.rpc<ProviderCatalog[]>("models.catalog").catch(() => []);
+  cache = await client.rpc<ProviderCatalog[]>("models.catalog");
   return cache;
 }
 

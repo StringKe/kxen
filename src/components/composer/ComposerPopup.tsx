@@ -35,7 +35,10 @@ export default function ComposerPopup(props: {
             role="option"
             aria-selected={i() === props.selected ? "true" : "false"}
             class="w-full flex flex-col items-start gap-0.5 px-3 py-2 text-left hover:bg-[var(--bg-overlay)]"
-            classList={{ "bg-[var(--bg-overlay)]": i() === props.selected }}
+            classList={{
+              "bg-[var(--bg-overlay)]": i() === props.selected,
+              "text-[var(--err)]": item.tone === "error",
+            }}
             // mousedown 阻止默认：textarea 不失焦（blur 会关弹层，随后的 click 就丢了）
             onMouseDown={(e) => e.preventDefault()}
             // hover 与键盘写同一个 selected：双高亮永存（mouseenter 不冒泡，Solid 直接绑元素）

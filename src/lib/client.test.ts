@@ -1,39 +1,61 @@
-// 重连订阅恢复实测（P1-15）：先快照再重开，open 回写同一 Map 也不得持续 reopen。
+// 重连订阅恢复：本地订阅身份稳定，远端 stream id 只更新记录，不替换 Map key。
 import { describe, expect, it } from "vitest";
-import { client, createSubChunkHandler, fireResync, restoreSubscriptions } from "./client";
+import {
+  client,
+  createSubChunkHandler,
+  fireResync,
+  restoreSubscriptions,
+  rpcTimeoutMs,
+} from "./client";
+
+describe("RPC timeout 与审批窗口", () => {
+  it("可能等待 300s 全局审批的方法不沿用 30s 默认超时", () => {
+    for (const method of [
+      "config.set_experimental",
+      "mcp.auth",
+      "mcp.restart",
+      "mcp.status",
+      "provider.reprobe",
+      "worktree.remove",
+    ]) {
+      expect(rpcTimeoutMs(method)).toBeGreaterThan(360_000);
+    }
+    expect(rpcTimeoutMs("session.list")).toBe(30_000);
+    expect(rpcTimeoutMs("approval.respond")).toBe(30_000);
+  });
+});
 
 describe("restoreSubscriptions", () => {
-  it("open 回写新 key 时恰好恢复原有订阅，不形成 reopen 循环", async () => {
+  it("恢复期间 Map 有新增项时只处理启动时快照，且不清除本地 key", async () => {
     const subs = new Map<string, string[]>([
       ["sub-old-1", ["llm.delta"]],
       ["sub-old-2", ["session:s1", "llm.delta"]],
     ]);
     const opened: string[][] = [];
-    let n = 0;
-    // 模拟 openSubscription：成功并回写新 streamId（旧实现的 Map 迭代会访问到这些新 entry = 死循环根因）
     await restoreSubscriptions(subs, (topics) => {
       opened.push(topics);
-      subs.set(`sub-new-${n++}`, topics);
+      if (topics[0] === "llm.delta") subs.set("local-new", ["notification"]);
       return Promise.resolve();
     });
     expect(opened).toEqual([["llm.delta"], ["session:s1", "llm.delta"]]);
-    expect([...subs.keys()]).toEqual(["sub-new-0", "sub-new-1"]);
+    expect([...subs.keys()]).toEqual(["sub-old-1", "sub-old-2", "local-new"]);
   });
 
-  it("单个重开失败不中断其余订阅恢复", async () => {
+  it("单个重开失败仍尝试其余订阅，并向调用方汇总失败", async () => {
     const subs = new Map<string, string[]>([
       ["sub-1", ["a"]],
       ["sub-2", ["b"]],
     ]);
     const opened: string[][] = [];
-    await restoreSubscriptions(subs, (topics) => {
-      opened.push(topics);
-      if (topics[0] === "a") return Promise.reject(new Error("boom"));
-      subs.set("sub-new", topics);
-      return Promise.resolve();
-    });
+    await expect(
+      restoreSubscriptions(subs, (topics) => {
+        opened.push(topics);
+        if (topics[0] === "a") return Promise.reject(new Error("boom"));
+        return Promise.resolve();
+      }),
+    ).rejects.toThrow("1 subscription(s) failed to restore");
     expect(opened).toEqual([["a"], ["b"]]);
-    expect([...subs.keys()]).toEqual(["sub-new"]);
+    expect([...subs.keys()]).toEqual(["sub-1", "sub-2"]);
   });
 });
 

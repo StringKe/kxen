@@ -102,6 +102,7 @@ describe("Dock resync 自愈", () => {
 
 describe("Dock 后台任务操作", () => {
   it("任务行有「重启」按钮：点击调 task.restart 并重拉列表", async () => {
+    setActiveSessionId("s-task");
     h.taskList.mockResolvedValue([
       { id: "t1", command: "pnpm dev", status: "running", uptime_ms: 1000, port: 3000, tail: "" },
     ]);
@@ -114,7 +115,7 @@ describe("Dock 后台任务操作", () => {
     const before = h.taskList.mock.calls.length;
     btn?.click();
     await new Promise((r) => setTimeout(r, 0));
-    expect(h.taskRestart).toHaveBeenCalledWith("t1");
+    expect(h.taskRestart).toHaveBeenCalledWith("t1", "s-task");
     expect(h.taskList.mock.calls.length).toBe(before + 1);
     dispose();
   });

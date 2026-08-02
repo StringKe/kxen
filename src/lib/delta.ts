@@ -1,8 +1,10 @@
 // llm.delta 事件流订阅与分发：时间线增量唯一入口。
 import { createEffect, onCleanup } from "solid-js";
 import { client } from "./client";
+import type { ModelIdentity } from "./chat";
+import type { UsageCompleteness } from "./usage";
 
-export interface RunStats {
+export interface RunStats extends UsageCompleteness {
   ttft_ms: number;
   duration_ms: number;
   input_tokens: number;
@@ -35,6 +37,7 @@ export function onLlmDelta(
   onDone: (stats?: RunStats, error?: string) => void,
   onTool?: (event: ToolEvent) => void,
   onReconcile?: () => void,
+  onModel?: (model: ModelIdentity) => void,
 ): () => void {
   let off: (() => void) | undefined;
   let current: string | undefined;
@@ -79,6 +82,7 @@ export function onLlmDelta(
     index?: number;
     total?: number;
     workflow_name?: string;
+    model?: ModelIdentity;
   }
 
   function handle(event: DeltaPayload) {
@@ -88,6 +92,7 @@ export function onLlmDelta(
     // 混入主时间线 appendRaw 会多流交错成乱码，其 done/error 还会提前触发 converge 对账；
     // per-agent 视图由 RightColumn 自己的 topic 订阅按 agent 过滤，不经过这里
     if (event.agent) return;
+    if (event.model) onModel?.(event.model);
     switch (event.kind) {
       case "text":
         if (event.text) onText(event.text);

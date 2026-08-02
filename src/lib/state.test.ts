@@ -9,6 +9,10 @@ const mocks = vi.hoisted(() => ({
   sessionCreate: vi.fn(),
   rpc: vi.fn(() => Promise.resolve()),
   agentsList: vi.fn<(sid: string) => Promise<AgentActivity[]>>(() => Promise.resolve([])),
+  applyDraftModel: vi.fn<(_sid: string, _includeDraft?: boolean) => Promise<void>>(() =>
+    Promise.resolve(),
+  ),
+  resetDraftModel: vi.fn(),
   streamHandlers: new Set<(p: unknown) => void>(),
   resyncHandlers: new Set<() => void>(),
 }));
@@ -33,7 +37,10 @@ vi.mock("./client", () => ({
   },
 }));
 vi.mock("./team", () => ({ agentsList: mocks.agentsList }));
-vi.mock("./session-model", () => ({ applyDraftModel: vi.fn(() => Promise.resolve()) }));
+vi.mock("./session-model", () => ({
+  applyDraftModel: mocks.applyDraftModel,
+  resetDraftModel: mocks.resetDraftModel,
+}));
 vi.mock("./drafts", () => ({ migrateNewDraft: vi.fn() }));
 
 import {
@@ -58,8 +65,11 @@ function meta(id: string, directory: string): SessionMeta {
 
 beforeEach(() => {
   mocks.sessionDelete.mockClear();
+  mocks.rpc.mockReset().mockResolvedValue(undefined);
   mocks.sessionList.mockReset().mockResolvedValue([]);
   mocks.agentsList.mockReset().mockResolvedValue([]);
+  mocks.applyDraftModel.mockReset().mockResolvedValue();
+  mocks.resetDraftModel.mockClear();
   mocks.streamHandlers.clear();
   mocks.resyncHandlers.clear();
   setSessions([]);
@@ -107,6 +117,28 @@ describe("deleteSession 善后切换", () => {
     mocks.sessionDelete.mockRejectedValueOnce(new Error("io boom"));
     await expect(deleteSession("a")).rejects.toThrow("io boom");
   });
+
+  it("删除已提交但列表刷新失败：本地移除死 id，返回对账警告而非谎报删除失败", async () => {
+    setSessions([meta("a", "/p"), meta("b", "/p")]);
+    setActiveSessionId("a");
+    mocks.sessionList.mockRejectedValue(new Error("list offline"));
+
+    const result = await deleteSession("a");
+    expect(result.warning).toContain("会话列表刷新失败");
+    expect(sessions().map((session) => session.id)).toEqual(["b"]);
+    expect(activeSessionId()).toBe("b");
+  });
+
+  it("删除已提交但后续激活失败：activeSessionId 留空，不悬挂到已删除会话", async () => {
+    setSessions([meta("a", "/p"), meta("b", "/p")]);
+    setActiveSessionId("a");
+    mocks.sessionList.mockResolvedValue([meta("b", "/p")]);
+    mocks.rpc.mockRejectedValue(new Error("activate failed"));
+
+    const result = await deleteSession("a");
+    expect(result.warning).toContain("后续会话切换失败");
+    expect(activeSessionId()).toBe("");
+  });
 });
 
 describe("ensureActiveSession 并发去重", () => {
@@ -128,6 +160,20 @@ describe("ensureActiveSession 并发去重", () => {
     expect(b).toBe("s-new");
     expect(mocks.sessionCreate).toHaveBeenCalledTimes(1);
     expect(activeSessionId()).toBe("s-new");
+  });
+
+  it("草稿模型写入失败时仍激活唯一新会话，但向发送链抛错；下次发送先重试模型", async () => {
+    mocks.sessionCreate.mockReset().mockResolvedValue(meta("s-new", "/p"));
+    mocks.sessionList.mockResolvedValue([meta("s-new", "/p")]);
+    mocks.applyDraftModel.mockRejectedValueOnce(new Error("set model failed"));
+
+    await expect(ensureActiveSession()).rejects.toThrow("set model failed");
+    expect(activeSessionId()).toBe("s-new");
+    expect(mocks.sessionCreate).toHaveBeenCalledTimes(1);
+
+    await expect(ensureActiveSession()).resolves.toBe("s-new");
+    expect(mocks.sessionCreate).toHaveBeenCalledTimes(1);
+    expect(mocks.applyDraftModel).toHaveBeenLastCalledWith("s-new", false);
   });
 });
 

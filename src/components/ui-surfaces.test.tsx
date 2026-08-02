@@ -156,8 +156,8 @@ describe("基础交互组件", () => {
 });
 
 describe("状态卡片", () => {
-  it("ApprovalCard 处理允许、拒绝和全部终态", () => {
-    const respond = vi.fn();
+  it("ApprovalCard 处理允许、拒绝和全部终态", async () => {
+    const respond = vi.fn(async () => {});
     let dispose = render(
       () => (
         <ApprovalCard
@@ -168,7 +168,14 @@ describe("状态卡片", () => {
       document.body,
     );
     clickButton("允许");
+    await vi.waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect([...document.querySelectorAll("button")].every((button) => !button.disabled)).toBe(
+        true,
+      ),
+    );
     clickButton("拒绝");
+    await vi.waitFor(() => expect(respond).toHaveBeenCalledTimes(2));
     expect(respond.mock.calls).toEqual([
       ["a1", true],
       ["a1", false],
@@ -200,6 +207,37 @@ describe("状态卡片", () => {
       expect(document.body.textContent).toContain(label);
       dispose();
     }
+  });
+
+  it("ApprovalCard 应答期间两按钮禁用，同一 id 不会并发双应答", async () => {
+    let finish: (() => void) | undefined;
+    const respond = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const dispose = render(
+      () => (
+        <ApprovalCard
+          item={{ kind: "approval", approvalId: "a-race", command: "deploy", reason: "上线" }}
+          onRespond={respond}
+        />
+      ),
+      document.body,
+    );
+    clickButton("允许");
+    clickButton("拒绝");
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(respond).toHaveBeenCalledWith("a-race", true);
+    expect([...document.querySelectorAll("button")].every((button) => button.disabled)).toBe(true);
+    finish?.();
+    await vi.waitFor(() =>
+      expect([...document.querySelectorAll("button")].every((button) => !button.disabled)).toBe(
+        true,
+      ),
+    );
+    dispose();
   });
 
   it("ToolCard 覆盖等待、成功、错误和中断状态", () => {

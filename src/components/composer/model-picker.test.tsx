@@ -1,7 +1,7 @@
 // ModelPicker：跟随全局默认 / pick 乐观更新失败回滚 / 搜索框自动聚焦 / 方向键导航 / roleMsg 落 popover。
 import { render } from "solid-js/web";
 import "../../styles.css";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { userEvent } from "@vitest/browser/context";
 import ModelPicker from "./ModelPicker";
 import { setActiveSessionId, setSessions } from "../../lib/state";
@@ -10,16 +10,20 @@ const smMock = vi.hoisted(() => ({
   sessionSetModel: vi.fn(() => Promise.resolve()),
   sessionFollowGlobalModel: vi.fn(() => Promise.resolve()),
   applyDraftModel: vi.fn(() => Promise.resolve()),
+  resetDraftModel: vi.fn(),
 }));
 vi.mock("../../lib/session-model", () => smMock);
 
-const chatMock = vi.hoisted(() => ({ configSetRole: vi.fn(() => Promise.resolve()) }));
+const chatMock = vi.hoisted(() => ({
+  configSetRole: vi.fn(() => Promise.resolve()),
+  currentModel: vi.fn(async () => ({ provider: "xai", model: "grok-1" })),
+}));
 vi.mock("../../lib/chat", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../lib/chat")>();
   return {
     ...orig,
     // 生效模型固定 grok-1：pick 别的行才有「变化 -> 回滚」可观察
-    currentModel: async () => ({ provider: "xai", model: "grok-1" }),
+    currentModel: chatMock.currentModel,
     configSetRole: chatMock.configSetRole,
   };
 });
@@ -27,42 +31,47 @@ vi.mock("../../lib/chat", async (importOriginal) => {
 const flashMock = vi.hoisted(() => ({ flashErr: vi.fn(), flashOk: vi.fn() }));
 vi.mock("../../lib/flash", () => flashMock);
 
+const modelsMock = vi.hoisted(() => ({
+  catalog: [
+    {
+      provider: "xai",
+      provider_name: "xAI",
+      fetched_at: 0,
+      source: "test",
+      models: [
+        {
+          id: "grok-1",
+          name: "Grok 1",
+          family: "grok",
+          reasoning: false,
+          tool_call: true,
+          attachment: false,
+          modalities_in: ["text"],
+          context: 128000,
+          output: 4096,
+        },
+        {
+          id: "grok-2",
+          name: "Grok 2",
+          family: "grok",
+          reasoning: true,
+          tool_call: true,
+          attachment: false,
+          modalities_in: ["text"],
+          context: 256000,
+          output: 8192,
+        },
+      ],
+    },
+  ],
+  modelsCatalog: vi.fn(),
+}));
+
 vi.mock("../../lib/models", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../lib/models")>();
   return {
     ...orig,
-    modelsCatalog: async () => [
-      {
-        provider: "xai",
-        provider_name: "xAI",
-        fetched_at: 0,
-        source: "test",
-        models: [
-          {
-            id: "grok-1",
-            name: "Grok 1",
-            family: "grok",
-            reasoning: false,
-            tool_call: true,
-            attachment: false,
-            modalities_in: ["text"],
-            context: 128000,
-            output: 4096,
-          },
-          {
-            id: "grok-2",
-            name: "Grok 2",
-            family: "grok",
-            reasoning: true,
-            tool_call: true,
-            attachment: false,
-            modalities_in: ["text"],
-            context: 256000,
-            output: 8192,
-          },
-        ],
-      },
-    ],
+    modelsCatalog: (force?: boolean) => modelsMock.modelsCatalog(force),
   };
 });
 
@@ -70,12 +79,19 @@ const SESSION = { id: "s1", title: "", directory: "", created_at: 0, updated_at:
 
 const disposers: Array<() => void> = [];
 
+beforeEach(() => {
+  modelsMock.modelsCatalog.mockResolvedValue(modelsMock.catalog);
+  chatMock.currentModel.mockResolvedValue({ provider: "xai", model: "grok-1" });
+});
+
 afterEach(() => {
   for (const d of disposers.splice(0)) d();
   smMock.sessionSetModel.mockClear();
   smMock.sessionFollowGlobalModel.mockClear();
   chatMock.configSetRole.mockClear();
+  chatMock.currentModel.mockReset();
   flashMock.flashErr.mockClear();
+  modelsMock.modelsCatalog.mockReset();
   setActiveSessionId("");
   setSessions([]);
   document.body.innerHTML = "";
@@ -140,6 +156,44 @@ describe("ModelPicker 跟随全局默认 (webkit)", () => {
     setSessions([{ ...SESSION }]);
     await openPicker();
     expect(document.activeElement).toBe(document.querySelector(".composer-popup input"));
+  });
+
+  it("模型目录首载失败显示重试，不误报为无匹配模型", async () => {
+    modelsMock.modelsCatalog.mockRejectedValueOnce(new Error("catalog offline"));
+    setActiveSessionId("s1");
+    setSessions([{ ...SESSION }]);
+    await openPicker();
+    expect(document.querySelector(".composer-popup")!.textContent).toContain(
+      "加载模型目录失败：catalog offline",
+    );
+    expect(document.querySelector(".composer-popup")!.textContent).not.toContain("无匹配模型");
+
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试",
+    );
+    await userEvent.click(retry!);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(row("Grok 1")).toBeTruthy();
+    expect(modelsMock.modelsCatalog).toHaveBeenLastCalledWith(true);
+  });
+
+  it("生效模型读取失败显式 UNKNOWN，重试成功后恢复真实模型", async () => {
+    chatMock.currentModel.mockRejectedValue(new Error("routing offline"));
+    setActiveSessionId("s1");
+    setSessions([{ ...SESSION }]);
+    await openPicker();
+    expect(document.querySelector(".model-pill")?.textContent).toContain("模型 UNKNOWN");
+    expect(document.querySelector(".composer-popup")?.textContent).toContain(
+      "读取生效模型失败：routing offline",
+    );
+
+    chatMock.currentModel.mockResolvedValue({ provider: "xai", model: "grok-1" });
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试生效模型",
+    );
+    await userEvent.click(retry!);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(document.querySelector(".model-pill")?.textContent).toContain("Grok 1");
   });
 
   it("方向键导航高亮 + Enter 选中", async () => {

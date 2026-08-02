@@ -13,9 +13,9 @@ import { agentsDismiss, agentsStop } from "../lib/team";
 import { flashErr } from "../lib/flash";
 import { errText } from "./err-text";
 
-/** running 态（可停止）：working/idle。awaiting_plan_approval 在等人动作，不算可停。 */
+/** 尚未终结的 agent 均可停止；等待 plan 审批时也必须允许用户取消该 run。 */
 export function isAgentRunning(status: string): boolean {
-  return status === "working" || status === "idle";
+  return status === "working" || status === "idle" || status === "awaiting_plan_approval";
 }
 
 /** 终态（可关闭移出名单）：done/failed/shutdown。 */

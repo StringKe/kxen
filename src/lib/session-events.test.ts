@@ -1,7 +1,7 @@
 // workflow phase 上屏文案（块三）：有 index/total 用 `phase i/N · title`（修双冒号），无则 `phase: xxx`
 import { createSignal } from "solid-js";
 import { describe, expect, it } from "vitest";
-import { applyStreamEvent } from "./session-events";
+import { appendRawItem, applyStreamEvent } from "./session-events";
 import type { Item } from "./items";
 import type { OrbState } from "./orb";
 
@@ -11,6 +11,39 @@ function setup() {
   const deps = { setItems, setOrbPhase, scroll: () => {} };
   return { deps, items, last: () => items().at(-1) };
 }
+
+describe("appendRawItem 实际模型", () => {
+  it("创建和合并流式 Assistant 时保留事件携带的模型", () => {
+    const model = { provider: "xai", model: "grok-4" };
+    const first = appendRawItem([], "content", "a", model);
+    const second = appendRawItem(first, "content", "b", model);
+    expect(second).toEqual([
+      { kind: "msg", role: "assistant", content: "ab", reasoning: undefined, model },
+    ]);
+  });
+
+  it("新 run 不覆盖或重标最后一条已持久化 Assistant", () => {
+    const history: Item[] = [
+      {
+        kind: "msg",
+        role: "assistant",
+        content: "历史",
+        messageId: "a1",
+        model: { provider: "xai", model: "grok-4" },
+      },
+    ];
+    const next = appendRawItem(history, "content", "新响应", {
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
+    expect(next).toHaveLength(2);
+    expect(next[0]).toEqual(history[0]);
+    expect(next[1]).toMatchObject({
+      content: "新响应",
+      model: { provider: "anthropic", model: "claude-sonnet-4-6" },
+    });
+  });
+});
 
 describe("applyStreamEvent phase 分支", () => {
   it("有 index/total 产出结构化进度项（进度条渲染）", () => {

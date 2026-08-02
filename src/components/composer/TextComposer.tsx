@@ -5,7 +5,7 @@ import { Send, Square } from "lucide-solid";
 import { commandList, type CommandInfo, type ContextItem } from "../../lib/chat";
 import { activeSessionId } from "../../lib/state";
 import { clearDraft, getDraft, setDraft, stripTruncMark } from "../../lib/drafts";
-import { createInFlight } from "../../lib/async-guard";
+import { createInFlight, createSeqGuard } from "../../lib/async-guard";
 import { flashErr } from "../../lib/flash";
 import { errText } from "../err-text";
 import { COMPOSER_INSERT_EVENT, COMPOSER_INTERRUPT_EVENT } from "../../lib/composer-bus";
@@ -43,6 +43,7 @@ export default function TextComposer(props: {
   const [popup, setPopup] = createSignal<(PopupState & Trigger) | null>(null);
   const [popupPos, setPopupPos] = createSignal<{ left: number; bottom: number } | null>(null);
   const [commands, setCommands] = createSignal<CommandInfo[]>([]);
+  const [commandsErr, setCommandsErr] = createSignal("");
   const [rowChips, setRowChips] = createSignal<RowChip[]>([]);
   const [recording, setRecording] = createSignal(false),
     [activeVoice, setActiveVoice] = createSignal("");
@@ -55,6 +56,19 @@ export default function TextComposer(props: {
   let imeLockUntil = 0; // Safari compositionend 先于 commit keydown（WebKit #165231），50ms 锁窗吞尾随 Enter
   const images = new Map<string, { media_type: string; data: string }>();
   const pastes = createPasteStore();
+  const commandsGuard = createSeqGuard();
+
+  const reloadCommands = async () => {
+    const request = commandsGuard.next();
+    try {
+      const next = await commandList();
+      if (!commandsGuard.isCurrent(request)) return;
+      setCommands(next);
+      setCommandsErr("");
+    } catch (error) {
+      if (commandsGuard.isCurrent(request)) setCommandsErr(errText(error));
+    }
+  };
 
   const { estimate, estimateCls } = createTokenEstimate(text, () => activeSessionId());
   const cardCls = () => ({ recording: recording(), "drag-over": dragOver() });
@@ -106,9 +120,6 @@ export default function TextComposer(props: {
   }
 
   onMount(() => {
-    void commandList()
-      .then(setCommands)
-      .catch(() => setCommands([]));
     const onInsert = (e: Event) => {
       insertAtCaret((e as CustomEvent<string>).detail);
       ta?.focus();
@@ -124,12 +135,16 @@ export default function TextComposer(props: {
 
   createEffect(() => {
     props.focusTick();
+    activeSessionId();
+    void reloadCommands();
     // 切会话：停掉在录/启动中的语音，终稿 discard——base 属旧会话，落进新会话输入框是串台；
     // 旧会话已上屏的 partial 不走终稿，草稿已随 setValue 持续落盘，不丢
     void voiceCtl.stop("discard");
     // 每会话草稿：切走前已持续落盘，切回恢复；row chip 不跨会话保留
     const d = getDraft(activeSessionId());
     setRowChips([]);
+    images.clear();
+    pastes.clear();
     setPopup(null);
     setValue(stripTruncMark(d));
     ta?.focus();
@@ -169,6 +184,8 @@ export default function TextComposer(props: {
     ta: () => ta,
     text,
     commands,
+    commandsError: commandsErr,
+    retryCommands: reloadCommands,
     removeTriggerText,
     pushChip,
     insertAtCaret,
@@ -176,8 +193,17 @@ export default function TextComposer(props: {
     updatePopupPos,
   });
   onCleanup(triggerCheck.dispose);
+  createEffect(() => {
+    commands();
+    commandsErr();
+    triggerCheck.run();
+  });
 
-  const { attachFiles, attachPaths } = createAttachments({ images, pushChip });
+  const { attachFiles, attachPaths } = createAttachments({
+    images,
+    pushChip,
+    scope: activeSessionId,
+  });
 
   function onPaste(e: ClipboardEvent) {
     const { files, text, manual, large } = planPaste(e);

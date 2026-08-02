@@ -11,15 +11,39 @@ type Send = (
   images: Array<{ media_type: string; data: string }>,
 ) => Promise<boolean>;
 
+async function activateFork(id: string, action: string): Promise<boolean> {
+  let refreshError: unknown;
+  try {
+    await refreshSessions();
+  } catch (error) {
+    refreshError = error;
+  }
+  try {
+    await switchSession(id);
+  } catch (error) {
+    flashErr(
+      `${action}已创建（${id}），但切换失败：${formatError(error)}${
+        refreshError ? `；列表刷新也失败：${formatError(refreshError)}` : ""
+      }`,
+    );
+    return false;
+  }
+  if (refreshError) {
+    flashErr(`${action}已创建并切入，但会话列表刷新失败：${formatError(refreshError)}`);
+  }
+  return true;
+}
+
 /** 从指定消息分叉：新会话带前缀历史并切入。 */
 export async function forkAt(messageId: string): Promise<void> {
+  let forked: Awaited<ReturnType<typeof sessionFork>>;
   try {
-    const forked = await sessionFork(activeSessionId(), messageId);
-    await refreshSessions();
-    await switchSession(forked.id);
+    forked = await sessionFork(activeSessionId(), messageId);
   } catch (e) {
     flashErr(`分叉失败：${formatError(e)}`);
+    return;
   }
+  await activateFork(forked.id, "分叉");
 }
 
 /** 重新生成：把该 assistant 之前最近一条 user 消息重发一次（图片与 @ 引用随原消息带回）。
@@ -51,8 +75,7 @@ export async function editResend(
     if (m?.kind === "msg" && m.messageId) {
       try {
         const forked = await sessionFork(activeSessionId(), m.messageId);
-        await refreshSessions();
-        await switchSession(forked.id);
+        if (!(await activateFork(forked.id, "编辑分支"))) return;
         await send(text, context, images);
         return;
       } catch (e) {

@@ -70,24 +70,33 @@ export default function DoctorSection() {
                   <section>
                     <div class="overline">MCP Servers</div>
                     <Show
-                      when={s().mcp.length > 0}
-                      fallback={<div class="text-xs text-[var(--text-faint)]">未配置</div>}
+                      when={s().mcp_ready}
+                      fallback={
+                        <div class="text-xs text-[var(--text-faint)]">
+                          当前 Workspace 的 MCP runtime 尚未加载，状态 UNKNOWN
+                        </div>
+                      }
                     >
-                      <div class="space-y-1">
-                        <For each={s().mcp}>
-                          {(m) => (
-                            <div class="flex items-center gap-2 text-xs">
-                              <span class={`shrink-0 ${tone(m.status)}`}>
-                                {STATUS_TEXT[m.status] ?? m.status}
-                              </span>
-                              <span class="text-[var(--text)]">{m.name}</span>
-                              <span class="text-2xs text-[var(--text-faint)]">
-                                {m.transport} · {m.tools} 工具 · {m.resources} 资源
-                              </span>
-                            </div>
-                          )}
-                        </For>
-                      </div>
+                      <Show
+                        when={s().mcp.length > 0}
+                        fallback={<div class="text-xs text-[var(--text-faint)]">未配置</div>}
+                      >
+                        <div class="space-y-1">
+                          <For each={s().mcp}>
+                            {(m) => (
+                              <div class="flex items-center gap-2 text-xs">
+                                <span class={`shrink-0 ${tone(m.status)}`}>
+                                  {STATUS_TEXT[m.status] ?? m.status}
+                                </span>
+                                <span class="text-[var(--text)]">{m.name}</span>
+                                <span class="text-2xs text-[var(--text-faint)]">
+                                  {m.transport} · {m.tools} 工具 · {m.resources} 资源
+                                </span>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
                     </Show>
                   </section>
 
@@ -117,7 +126,9 @@ export default function DoctorSection() {
                   </section>
 
                   <section>
-                    <div class="overline">MRM 模型调度（累计派发 {s().mrm_dispatches}）</div>
+                    <div class="overline">
+                      MRM 模型调度（当前进程最近路由解析记录 {s().mrm_dispatches} 条）
+                    </div>
                     <pre class="text-2xs font-mono whitespace-pre-wrap text-[var(--text-dim)] bg-[var(--bg-overlay)]/40 rounded p-2">
                       {s().mrm_describe}
                     </pre>

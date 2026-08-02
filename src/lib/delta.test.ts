@@ -2,6 +2,7 @@
 // 混入 appendRaw 多流交错成乱码，其 done/error 还会提前触发 converge 对账。
 import { createRoot, createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
+import type { ModelIdentity } from "./chat";
 
 const handlers = vi.hoisted(() => new Set<(payload: unknown) => void>());
 const resyncCbs = vi.hoisted(() => new Set<() => void>());
@@ -37,10 +38,11 @@ interface Rec {
   dones: Array<{ stats: RunStats | undefined; error: string | undefined }>;
   tools: ToolEvent[];
   reconciles: number[];
+  models: ModelIdentity[];
 }
 
 async function setup(session = "s1"): Promise<Rec & { dispose: () => void }> {
-  const rec: Rec = { texts: [], reasonings: [], dones: [], tools: [], reconciles: [] };
+  const rec: Rec = { texts: [], reasonings: [], dones: [], tools: [], reconciles: [], models: [] };
   let dispose: () => void = () => {};
   createRoot((d) => {
     dispose = d;
@@ -52,6 +54,7 @@ async function setup(session = "s1"): Promise<Rec & { dispose: () => void }> {
       (stats, error) => rec.dones.push({ stats, error }),
       (e) => rec.tools.push(e),
       () => rec.reconciles.push(1),
+      (model) => rec.models.push(model),
     );
   });
   // createEffect 里的订阅异步生效，等一轮宏任务再发帧
@@ -68,6 +71,25 @@ describe("onLlmDelta 主流与 agent 流隔离", () => {
     emit({ kind: "reasoning", session_id: "s1", text: "推" });
     expect(rec.texts).toEqual(["主"]);
     expect(rec.reasonings).toEqual(["推"]);
+    rec.dispose();
+  });
+
+  it("主流帧先透传实际模型，agent 帧的模型不污染主时间线", async () => {
+    const rec = await setup();
+    emit({
+      kind: "text",
+      session_id: "s1",
+      text: "主",
+      model: { provider: "anthropic", model: "claude-sonnet-4-6" },
+    });
+    emit({
+      kind: "text",
+      session_id: "s1",
+      text: "子",
+      agent: "review-1",
+      model: { provider: "xai", model: "grok-4" },
+    });
+    expect(rec.models).toEqual([{ provider: "anthropic", model: "claude-sonnet-4-6" }]);
     rec.dispose();
   });
 

@@ -12,6 +12,7 @@ import { toItems, type Item, type MsgItem } from "./items";
 import { activeSessionId } from "./state";
 import { flashErr } from "./flash";
 import { formatError } from "./error-text";
+import { createSeqGuard } from "./async-guard";
 
 export function createConverge(deps: {
   setItems: (items: Item[]) => void;
@@ -20,14 +21,16 @@ export function createConverge(deps: {
 }) {
   // 上一轮展示的队列表（含窗口保留项）：pop 窗口判定的对照组，按 sid 隔离防跨会话串
   let prev: { sid: string; texts: string[] } = { sid: "", texts: [] };
+  const guard = createSeqGuard();
 
   const converge = (
     sid: string,
     tail?: { stats?: RunStats | undefined; error?: string | undefined },
   ) => {
+    const request = guard.next();
     void Promise.all([sessionMessages(sid), sessionPendingList(sid), approvalPending(sid)])
       .then(([messages, q, pend]) => {
-        if (activeSessionId() !== sid) return;
+        if (activeSessionId() !== sid || !guard.isCurrent(request)) return;
         const loaded = toItems(messages);
         const last = loaded.at(-1);
         if ((tail?.stats || tail?.error) && last?.kind === "msg" && last.role === "assistant") {
@@ -56,6 +59,7 @@ export function createConverge(deps: {
         deps.scroll();
       })
       .catch((e) => {
+        if (activeSessionId() !== sid || !guard.isCurrent(request)) return;
         // 快照/队列 RPC 失败：时间线保持现状（不清空不闪屏），挂错误反馈防 unhandled rejection
         flashErr(`对账失败：${formatError(e)}`);
       });
@@ -63,6 +67,7 @@ export function createConverge(deps: {
 
   /** 用户显式动作（abort/清空）作废窗口保留：消失是用户本意，不许被保留逻辑捞回成幽灵气泡。 */
   const resetHold = () => {
+    guard.next();
     prev = { sid: "", texts: [] };
   };
 

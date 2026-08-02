@@ -55,18 +55,21 @@ describe("CodingRulesBlock", () => {
     dispose();
   });
 
-  it("hides on load failure and preserves state on toggle failure", async () => {
+  it("load failure shows UNKNOWN with retry, and toggle failure preserves state", async () => {
     h.get.mockRejectedValueOnce(new Error("unavailable"));
-    const hiddenDispose = render(() => <CodingRulesBlock />, document.body);
-    await vi.waitFor(() => expect(h.get).toHaveBeenCalled());
-    expect(document.body.textContent).not.toContain("内置编码规则");
-    hiddenDispose();
-
-    document.body.innerHTML = "";
-    h.get.mockResolvedValueOnce(rules);
-    h.set.mockRejectedValueOnce("write failed");
     const dispose = render(() => <CodingRulesBlock />, document.body);
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "内置编码规则读取失败，状态 UNKNOWN：unavailable",
+      ),
+    );
+    const retry = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试",
+    );
+    retry?.click();
     await vi.waitFor(() => expect(document.body.textContent).toContain("内置编码规则"));
+
+    h.set.mockRejectedValueOnce("write failed");
     document.body.querySelector<HTMLButtonElement>("button[title^='停用']")?.click();
     await vi.waitFor(() =>
       expect(flash.msgs().some((message) => message.text.includes("write failed"))).toBe(true),

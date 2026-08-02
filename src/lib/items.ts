@@ -1,5 +1,5 @@
 // 存储消息 -> 时间线条目（工具调用/推理/文本/图片按序还原）。
-import type { ContextItem, RunStats, StoredMessage } from "./chat";
+import type { ContextItem, ModelIdentity, RunStats, StoredMessage } from "./chat";
 
 export interface MsgItem {
   kind: "msg";
@@ -9,6 +9,8 @@ export interface MsgItem {
   images?: { media_type: string; data: string }[] | undefined;
   stats?: RunStats | undefined;
   error?: string | undefined;
+  /** Assistant 生成时的实际路由模型；旧消息缺省，不允许用当前 picker 值回填。 */
+  model?: ModelIdentity | undefined;
   messageId?: string | undefined;
   /** 通知类 user 消息的来源小标（[teammate x] / [task notification] 前缀，与后端落盘文本同口径） */
   source?: string | undefined;
@@ -73,7 +75,7 @@ export function toItems(messages: StoredMessage[]): Item[] {
     for (const p of m.parts) {
       if (p.type === "text" && p.text) {
         const last = items.at(-1);
-        if (last?.kind === "msg" && last.role === m.role) {
+        if (last?.kind === "msg" && last.role === m.role && last.messageId === m.id) {
           items[items.length - 1] = {
             ...last,
             content: `${last.content}\n${p.text}`,
@@ -86,6 +88,7 @@ export function toItems(messages: StoredMessage[]): Item[] {
             content: p.text,
             messageId: m.id,
             source: m.role === "user" ? userSource(p.text) : undefined,
+            ...(m.role === "assistant" && m.model ? { model: m.model } : {}),
           });
         }
       } else if (p.type === "reasoning" && p.text && m.role === "assistant") {
@@ -93,14 +96,21 @@ export function toItems(messages: StoredMessage[]): Item[] {
       } else if (p.type === "image" && p.media_type && p.data !== undefined) {
         const img = { media_type: p.media_type, data: p.data };
         const last = items.at(-1);
-        if (last?.kind === "msg" && last.role === m.role) {
+        if (last?.kind === "msg" && last.role === m.role && last.messageId === m.id) {
           items[items.length - 1] = {
             ...last,
             images: [...(last.images ?? []), img],
             messageId: m.id,
           };
         } else {
-          items.push({ kind: "msg", role: m.role, content: "", images: [img], messageId: m.id });
+          items.push({
+            kind: "msg",
+            role: m.role,
+            content: "",
+            images: [img],
+            messageId: m.id,
+            ...(m.role === "assistant" && m.model ? { model: m.model } : {}),
+          });
         }
       } else if (p.type === "tool_call" && p.name) {
         items.push({
@@ -135,7 +145,14 @@ export function toItems(messages: StoredMessage[]): Item[] {
       }
       // 纯思考无正文的极端情况也要补一条气泡，reasoning 不许静默丢
       if (!attached)
-        items.push({ kind: "msg", role: "assistant", content: "", reasoning, messageId: m.id });
+        items.push({
+          kind: "msg",
+          role: "assistant",
+          content: "",
+          reasoning,
+          messageId: m.id,
+          ...(m.model ? { model: m.model } : {}),
+        });
     }
   }
   return items;

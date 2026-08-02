@@ -13,6 +13,7 @@ import { baseName } from "../lib/group-name";
 import { relTime } from "../lib/time";
 import { onDragStart } from "../lib/drag";
 import EmptyLine from "../components/EmptyLine";
+import { createSeqGuard } from "../lib/async-guard";
 
 const TONE_CLASS: Record<GoalTone, string> = {
   ok: "text-[var(--ok)]",
@@ -24,16 +25,19 @@ export default function Workspaces() {
   const [cards, setCards] = createSignal<WorkspaceOverview[]>([]);
   const [loadErr, setLoadErr] = createSignal("");
   const [loaded, setLoaded] = createSignal(false);
+  const reloadGuard = createSeqGuard();
   let unlisten: (() => void) | undefined;
   let offResync: (() => void) | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
 
   const reload = async () => {
+    const request = reloadGuard.next();
     // 失败保留旧值但记错误态：首载失败（后端没连上）必须与真空（还没有工作区）区分
     const list = await workspacesOverview().catch((e: unknown) => {
-      setLoadErr(formatError(e));
+      if (reloadGuard.isCurrent(request)) setLoadErr(formatError(e));
       return null;
     });
+    if (!reloadGuard.isCurrent(request)) return;
     if (list) {
       setCards(list);
       setLoadErr("");
@@ -41,8 +45,8 @@ export default function Workspaces() {
     setLoaded(true);
   };
 
-  onMount(async () => {
-    await reload();
+  onMount(() => {
+    void reload();
     unlisten = onTopic(["goal.update", "task.update"], () => void reload());
     // goal.update/task.update 丢帧后 topic 流不自愈：resync 信号按真源重拉（同 Dock 模式）
     offResync = client.onResync(() => void reload());
@@ -98,9 +102,12 @@ export default function Workspaces() {
         <Show when={!loaded()}>
           <div class="text-xs text-[var(--text-faint)]">加载中…</div>
         </Show>
-        <Show when={loaded() && loadErr() && cards().length === 0}>
-          <div class="max-w-md rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 p-8 flex items-center gap-3">
-            <span class="text-xs text-[var(--err)]">加载工作区失败：{loadErr()}</span>
+        <Show when={loaded() && loadErr()}>
+          <div class="mb-3 max-w-md rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 px-3 py-2 flex items-center gap-3">
+            <span class="text-xs text-[var(--err)]">
+              {cards().length > 0 ? "刷新工作区失败，正在显示上次结果" : "加载工作区失败"}：
+              {loadErr()}
+            </span>
             <button
               class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-xs text-[var(--text-dim)]"
               onClick={() => void reload()}

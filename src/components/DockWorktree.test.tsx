@@ -227,6 +227,19 @@ describe("DockWorktree 首载失败", () => {
     expect(document.body.textContent).not.toContain("加载 worktree 列表失败");
     dispose();
   });
+
+  it("dirty status 失败与 clean 区分：保留旧列表并阻止直接删除", async () => {
+    h.status.mockRejectedValueOnce(new Error("git status failed"));
+    const dispose = render(() => <DockWorktree />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("加载 worktree 列表失败"));
+    expect(document.body.textContent).not.toContain("kxen/wt1");
+    expect(h.remove).not.toHaveBeenCalled();
+
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("kxen/wt1"));
+    expect(document.body.textContent).not.toContain("加载 worktree 列表失败");
+    dispose();
+  });
 });
 
 describe("DockWorktree 创建并进入", () => {

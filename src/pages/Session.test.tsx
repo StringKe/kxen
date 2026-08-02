@@ -23,7 +23,7 @@ const h = vi.hoisted(() => ({
     async (_id: string): Promise<import("../lib/chat").PendingApproval[]> => [],
   ),
   statusline: vi.fn(async () => null),
-  onLlmDelta: vi.fn(async () => () => {}),
+  onLlmDelta: vi.fn(() => () => {}),
 }));
 
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -78,6 +78,40 @@ describe("Session 路由卸载重挂载", () => {
     setActiveSessionId("s2"); // 首发落库后激活
     await flush();
     expect(h.sessionMessages).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("已落库会话切换时立即撤下旧时间线，慢响应期间不可操作旧消息", async () => {
+    setActiveSessionId("s1");
+    const dispose = render(() => <Session />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("历史消息一");
+
+    let resolveSecond!: (messages: StoredMessage[]) => void;
+    h.sessionMessages.mockImplementationOnce(
+      () =>
+        new Promise<StoredMessage[]>((resolve) => {
+          resolveSecond = resolve;
+        }),
+    );
+    setActiveSessionId("s2");
+    await flush();
+
+    expect(document.body.textContent).not.toContain("历史消息一");
+    expect(document.body.textContent).toContain("加载会话中");
+
+    resolveSecond([
+      {
+        id: "m2",
+        session_id: "s2",
+        role: "user",
+        parts: [{ type: "text", text: "会话二消息" }],
+        created_at: 2,
+      },
+    ]);
+    await flush();
+    expect(document.body.textContent).toContain("会话二消息");
+    expect(document.body.textContent).not.toContain("历史消息一");
     dispose();
   });
 });

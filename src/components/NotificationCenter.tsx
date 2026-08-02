@@ -10,6 +10,7 @@ import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
 import { sessions, switchSession } from "../lib/state";
 import { errText } from "./err-text";
+import { createSeqGuard } from "../lib/async-guard";
 
 interface Notice {
   at: number;
@@ -22,6 +23,8 @@ const READ_KEY = "kxen-notif-read-at";
 export default function NotificationCenter() {
   const { open, setOpen, toggle } = createExclusiveDisclosure();
   const [items, setItems] = createSignal<Notice[]>([]);
+  const [loadErr, setLoadErr] = createSignal("");
+  const guard = createSeqGuard();
   let root: HTMLDivElement | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   onClickOutside(
@@ -33,8 +36,15 @@ export default function NotificationCenter() {
   const unread = () => items().filter((n) => n.at > readAt()).length;
 
   const reload = async () => {
-    const list = await client.rpc<Notice[]>("notifications.list").catch(() => []);
-    setItems(list);
+    const request = guard.next();
+    try {
+      const list = await client.rpc<Notice[]>("notifications.list");
+      if (!guard.isCurrent(request)) return;
+      setItems(list);
+      setLoadErr("");
+    } catch (error) {
+      if (guard.isCurrent(request)) setLoadErr(formatError(error));
+    }
   };
 
   onMount(() => {
@@ -49,6 +59,8 @@ export default function NotificationCenter() {
   const offNotice = client
     .stream<{ text: string; session_id?: string | null }>("notification")
     .on((p) => {
+      // 事件比已发起的 list 快照新；作废在途快照，下一轮轮询再按服务端持久化真源收敛。
+      guard.next();
       setItems((prev) => [
         { at: Date.now(), text: p.text, session_id: p.session_id ?? null },
         ...prev,
@@ -78,8 +90,10 @@ export default function NotificationCenter() {
       flashErr(`清空通知失败：${formatError(e)}`);
       return;
     }
+    guard.next();
+    setItems([]);
+    setLoadErr("");
     localStorage.setItem(READ_KEY, String(Date.now()));
-    await reload();
   };
 
   // 跳来源会话：通知到达后会话可能已被删除，悬空切换会让主区变空白
@@ -136,7 +150,22 @@ export default function NotificationCenter() {
               </button>
             </div>
           </div>
-          <For each={items()} fallback={<EmptyLine text="暂无通知" />}>
+          <Show when={loadErr()}>
+            <div class="px-3 py-2 text-2xs text-[var(--err)] flex items-center gap-2">
+              <span>加载通知失败：{loadErr()}</span>
+              <button class="hover:underline" onClick={() => void reload()}>
+                重试
+              </button>
+            </div>
+          </Show>
+          <For
+            each={items()}
+            fallback={
+              <Show when={!loadErr()}>
+                <EmptyLine text="暂无通知" />
+              </Show>
+            }
+          >
             {(n) => (
               <div class="px-3 py-2 border-b border-[var(--border)] last:border-0">
                 <div class="text-2xs text-[var(--text-faint)]">{relTime(n.at)}</div>

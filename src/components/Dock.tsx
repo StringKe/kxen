@@ -4,39 +4,30 @@ import {
   goalList,
   goalTransit,
   onTopic,
-  taskKill,
   taskList,
-  taskRestart,
   type GoalAction,
   type GoalInfo,
   type TaskInfo,
 } from "../lib/chat";
 import { createAgentDiff, fetchAgentDiffFile, type AgentDiffStatus } from "../lib/agent-diff";
 import { client } from "../lib/client";
-import { createAction } from "../lib/async-guard";
+import { createAction, createSeqGuard } from "../lib/async-guard";
 import { activeSessionId } from "../lib/state";
 import { flashErr } from "../lib/flash";
 import { errText } from "./err-text";
 import Markdown from "./Markdown";
 import DockWorktree from "./DockWorktree";
 import DockGoal from "./DockGoal";
+import DockTasks, { type DockLoadState } from "./DockTasks";
 import DockRepoDiff from "./DockRepoDiff";
 import DockSection from "./DockSection";
-import { FileDiff, SquareTerminal } from "lucide-solid";
-
-const TASK_STATUS: Record<string, string> = {
-  running: "text-[var(--ok)]",
-  exited: "text-[var(--text-dim)]",
-  killed: "text-[var(--warn)]",
-  failed: "text-[var(--err)]",
-};
-
-/** 展开日志 tail 的任务 id（dock 单例，模块级信号即可）。 */
-const [openTask, setOpenTask] = createSignal("");
+import { FileDiff, Target } from "lucide-solid";
 
 /** 右 dock：会话上下文（目标 / 改动 / 后台任务）。 */
 function DockSections(props: {
   goal: GoalInfo | null;
+  goalLoad: DockLoadState;
+  reloadGoal: () => void;
   act: (action: GoalAction) => Promise<boolean>;
   acting: () => boolean;
   diffStatus: () => AgentDiffStatus;
@@ -44,9 +35,9 @@ function DockSections(props: {
   openDiff: { path: string; text: string } | null;
   toggleDiff: (path: string) => void;
   tasks: TaskInfo[];
+  tasksLoad: DockLoadState;
   reloadTasks: () => void;
 }) {
-  const reloadTasks = props.reloadTasks;
   const diffStatus = props.diffStatus;
   const diffEntries = () => {
     const s = diffStatus();
@@ -58,19 +49,38 @@ function DockSections(props: {
   };
   const openDiff = () => props.openDiff;
   const toggleDiff = props.toggleDiff;
-  const tasks = () => props.tasks;
-  // 任务操作失败不吞（裸 then 的失败是 unhandled rejection 且用户无感知）：原因走 flashErr
-  const restartTask = (id: string) =>
-    void taskRestart(id)
-      .then(reloadTasks)
-      .catch((e: unknown) => flashErr(`重启任务失败：${errText(e)}`));
-  const killTask = (id: string) =>
-    void taskKill(id)
-      .then(reloadTasks)
-      .catch((e: unknown) => flashErr(`终止任务失败：${errText(e)}`));
   return (
     <>
-      <DockGoal goal={props.goal} act={props.act} acting={props.acting} />
+      <Show
+        when={props.goalLoad.state === "ok" || props.goalLoad.state === "stale"}
+        fallback={
+          <DockSection title="目标" icon={Target}>
+            <Show
+              when={props.goalLoad.state === "err"}
+              fallback={<div class="text-xs text-[var(--text-faint)]">加载中…</div>}
+            >
+              <div class="text-xs text-[var(--err)]">
+                加载目标失败：
+                {props.goalLoad.state === "err" ? props.goalLoad.message : "UNKNOWN"}
+                <button
+                  class="ml-2 text-[var(--accent-hover)] hover:underline"
+                  onClick={props.reloadGoal}
+                >
+                  重试
+                </button>
+              </div>
+            </Show>
+          </DockSection>
+        }
+      >
+        <DockGoal
+          goal={props.goal}
+          act={props.act}
+          acting={props.acting}
+          refreshError={props.goalLoad.state === "stale" ? props.goalLoad.message : undefined}
+          reload={props.reloadGoal}
+        />
+      </Show>
 
       <DockSection title="会话改动" icon={FileDiff}>
         <Show
@@ -139,73 +149,18 @@ function DockSections(props: {
         </Show>
       </DockSection>
 
-      <DockSection title="后台任务" icon={SquareTerminal}>
-        <Show
-          when={tasks().length > 0}
-          fallback={<div class="text-xs text-[var(--text-faint)]">无后台任务</div>}
-        >
-          <div class="space-y-1.5">
-            <For each={tasks()}>
-              {(t) => (
-                <div class="text-xs space-y-0.5">
-                  <div class="flex items-center gap-1.5">
-                    <span class={`text-2xs font-medium ${TASK_STATUS[t.status] ?? ""}`}>
-                      {t.status}
-                    </span>
-                    <Show when={t.port}>
-                      <a
-                        class="text-2xs text-[var(--accent-hover)]"
-                        href={`http://localhost:${t.port}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        :{t.port}
-                      </a>
-                    </Show>
-                    <span class="ml-auto flex gap-1">
-                      <button
-                        class="pressable px-1.5 py-0 rounded text-2xs border border-[var(--border)] text-[var(--text-dim)]"
-                        onClick={() => restartTask(t.id)}
-                      >
-                        重启
-                      </button>
-                      <Show when={t.status === "running"}>
-                        <button
-                          class="pressable px-1.5 py-0 rounded text-2xs border border-[var(--border)] text-[var(--err)]"
-                          onClick={() => killTask(t.id)}
-                        >
-                          终止
-                        </button>
-                      </Show>
-                    </span>
-                  </div>
-                  <div
-                    class="font-mono text-2xs text-[var(--text-dim)] truncate cursor-pointer hover:text-[var(--text)]"
-                    title={t.command}
-                    onClick={() => setOpenTask(openTask() === t.id ? "" : t.id)}
-                  >
-                    {t.command}
-                  </div>
-                  <Show when={openTask() === t.id && t.tail}>
-                    <pre class="max-h-32 overflow-auto rounded border border-[var(--border)] bg-[var(--bg)] p-1.5 text-2xs font-mono text-[var(--text-dim)] whitespace-pre-wrap">
-                      {t.tail}
-                    </pre>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
-        </Show>
-      </DockSection>
+      <DockTasks tasks={props.tasks} load={props.tasksLoad} reload={props.reloadTasks} />
     </>
   );
 }
 
 export default function Dock() {
   const [goal, setGoal] = createSignal<GoalInfo | null>(null);
+  const [goalLoad, setGoalLoad] = createSignal<DockLoadState>({ state: "loading" });
   // 会话改动三态数据源（loading/err/真空可区分，实现见 lib/agent-diff.ts）
   const agentDiff = createAgentDiff(activeSessionId);
   const [tasks, setTasks] = createSignal<TaskInfo[]>([]);
+  const [tasksLoad, setTasksLoad] = createSignal<DockLoadState>({ state: "loading" });
   const [openDiff, setOpenDiff] = createSignal<{ path: string; text: string } | null>(null);
   let unlisten: (() => void) | undefined;
   let offResync: (() => void) | undefined;
@@ -213,37 +168,64 @@ export default function Dock() {
 
   // goalAction：act 期间禁用按钮（连点产生并发 transit 裸 rejection 的根因），失败走 flashErr
   const goalAction = createAction();
+  const goalGuard = createSeqGuard();
+  const taskGuard = createSeqGuard();
 
   // 焦点带会话口径（与 StatusBar 一致）；焦点为空回落最近更新的 goal，complete/canceled 终态也有呈现
   const reloadGoal = async () => {
     const sid = activeSessionId();
+    const request = goalGuard.next();
     try {
       const focused = await goalFocus(sid || undefined);
       const next = focused ?? (await goalList())[0] ?? null;
       // await 期间切了会话：旧口径的结果不得落地
-      if (activeSessionId() === sid) setGoal(next);
-    } catch {
-      // 事件/轮询驱动：本轮失败保留旧值，下一轮重拉
+      if (activeSessionId() === sid && goalGuard.isCurrent(request)) {
+        setGoal(next);
+        setGoalLoad({ state: "ok" });
+      }
+    } catch (error) {
+      if (activeSessionId() !== sid || !goalGuard.isCurrent(request)) return;
+      const previous = goalLoad();
+      setGoalLoad({
+        state: previous.state === "ok" || previous.state === "stale" ? "stale" : "err",
+        message: errText(error),
+      });
     }
   };
   const reloadDiff = agentDiff.reload;
   const reloadTasks = async () => {
+    const sid = activeSessionId();
+    const request = taskGuard.next();
     try {
-      setTasks(await taskList());
-    } catch {
-      // 事件/轮询驱动：本轮失败保留旧值，下一轮重拉（同 reloadGoal 模式）
+      const next = await taskList(sid);
+      if (activeSessionId() === sid && taskGuard.isCurrent(request)) {
+        setTasks(next);
+        setTasksLoad({ state: "ok" });
+      }
+    } catch (error) {
+      if (activeSessionId() !== sid || !taskGuard.isCurrent(request)) return;
+      const previous = tasksLoad();
+      setTasksLoad({
+        state: previous.state === "ok" || previous.state === "stale" ? "stale" : "err",
+        message: errText(error),
+      });
     }
   };
 
   // 切换会话立即重拉会话口径数据：否则上一会话的 goal/diff 会残留到下个事件或轮询
   createEffect(() => {
     activeSessionId();
+    setGoal(null);
+    setGoalLoad({ state: "loading" });
+    setTasks([]);
+    setTasksLoad({ state: "loading" });
+    setOpenDiff(null);
     void reloadGoal();
     void reloadDiff();
+    void reloadTasks();
   });
 
   onMount(async () => {
-    await reloadTasks();
     unlisten = await onTopic(["goal.update", "task.update"], () => {
       void reloadGoal();
       void reloadTasks();
@@ -298,6 +280,8 @@ export default function Dock() {
     <aside class="w-full h-full overflow-y-auto">
       <DockSections
         goal={goal()}
+        goalLoad={goalLoad()}
+        reloadGoal={() => void reloadGoal()}
         act={act}
         acting={goalAction.pending}
         diffStatus={agentDiff.status}
@@ -305,6 +289,7 @@ export default function Dock() {
         openDiff={openDiff()}
         toggleDiff={toggleDiff}
         tasks={tasks()}
+        tasksLoad={tasksLoad()}
         reloadTasks={() => void reloadTasks()}
       />
       <DockRepoDiff />

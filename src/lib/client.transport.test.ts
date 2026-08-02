@@ -16,26 +16,39 @@ vi.mock("@tauri-apps/plugin-websocket", () => ({
 }));
 
 interface SocketHarness {
-  listener: ((event: { data: unknown }) => void) | undefined;
+  listener: ((event: SocketEvent) => void) | undefined;
   send: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
   socket: {
-    addListener: (listener: (event: { data: unknown }) => void) => void;
+    addListener: (listener: (event: SocketEvent) => void) => () => void;
     send: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
   };
 }
+
+type SocketEvent =
+  | { type: "Text"; data: string }
+  | { type: "Binary"; data: number[] }
+  | { type: "Close"; data: { code: number; reason: string } | null };
 
 function socketHarness(): SocketHarness {
   const harness: SocketHarness = {
     listener: undefined,
     send: vi.fn(() => Promise.resolve()),
+    disconnect: vi.fn(() => Promise.resolve()),
     socket: {
       addListener(listener) {
         harness.listener = listener;
+        return () => {
+          harness.listener = undefined;
+        };
       },
       send: vi.fn(),
+      disconnect: vi.fn(),
     },
   };
   harness.socket.send = harness.send;
+  harness.socket.disconnect = harness.disconnect;
   return harness;
 }
 
@@ -46,11 +59,19 @@ async function flush(): Promise<void> {
 function sentFrame(socket: SocketHarness, index = -1) {
   const call = index < 0 ? socket.send.mock.calls.at(index) : socket.send.mock.calls[index];
   if (!call) throw new Error(`missing sent frame ${index}`);
-  return JSON.parse(String(call[0])) as { id: string; method: string; params: unknown };
+  return JSON.parse(String(call[0])) as {
+    id: string;
+    method: string;
+    params: unknown;
+    options?: { stream?: boolean };
+  };
 }
 
 function emit(socket: SocketHarness, value: unknown): void {
-  socket.listener?.({ data: typeof value === "string" ? value : JSON.stringify(value) });
+  socket.listener?.({
+    type: "Text",
+    data: typeof value === "string" ? value : JSON.stringify(value),
+  });
 }
 
 beforeEach(() => {
@@ -67,25 +88,33 @@ afterEach(() => {
 
 describe("client transport", () => {
   it("handles endpoint retry, RPC frames, streams, send failures, and timeout", async () => {
+    vi.useFakeTimers();
     const socket = socketHarness();
-    h.invoke.mockRejectedValueOnce(new Error("not ready")).mockResolvedValue({
-      port: 3131,
-      token: "secret token",
-    });
-    h.connect.mockResolvedValue(socket.socket);
+    h.invoke
+      .mockResolvedValueOnce({ port: 0, token: "boot" })
+      .mockRejectedValueOnce(new Error("not ready"))
+      .mockResolvedValueOnce({ port: 3131, token: "old token" })
+      .mockResolvedValue({ port: 4242, token: "secret token" });
+    h.connect.mockRejectedValueOnce(new Error("dial failed")).mockResolvedValue(socket.socket);
     const { client } = await import("./client");
     const resync = vi.fn();
     const offResync = client.onResync(resync);
 
+    await expect(client.rpc("before-ready")).rejects.toThrow("websocket server is not ready");
+    expect(h.connect).not.toHaveBeenCalled();
     await expect(client.rpc("not-ready")).rejects.toThrow("not ready");
+    await expect(client.rpc("failed-dial")).rejects.toThrow("dial failed");
     const result = client.rpc<string>("echo", { value: 1 });
     await flush();
-    expect(h.invoke).toHaveBeenCalledWith("ws_port");
-    expect(h.connect).toHaveBeenCalledWith("ws://127.0.0.1:3131/?token=secret%20token");
+    expect(h.invoke).toHaveBeenCalledTimes(4);
+    expect(h.connect.mock.calls.map(([url]) => url)).toEqual([
+      "ws://127.0.0.1:3131/?token=old%20token",
+      "ws://127.0.0.1:4242/?token=secret%20token",
+    ]);
     const resultFrame = sentFrame(socket);
     expect(resultFrame).toMatchObject({ method: "echo", params: { value: 1 } });
 
-    socket.listener?.({ data: new Uint8Array([1]) });
+    socket.listener?.({ type: "Binary", data: [1] });
     emit(socket, "{not json");
     emit(socket, { id: "unknown", result: "ignored" });
     emit(socket, { stream: { id: "sys.resync", seq: 1 }, result: null });
@@ -103,7 +132,7 @@ describe("client transport", () => {
     const { RpcError } = await import("./client");
     await expect(failure).rejects.toBeInstanceOf(RpcError);
     await expect(failure).rejects.toMatchObject({ code: -32603, data: { h: 1 } });
-    expect(h.connect).toHaveBeenCalledOnce();
+    expect(h.connect).toHaveBeenCalledTimes(2);
 
     offResync();
     emit(socket, { stream: { id: "sys.resync", seq: 2 }, result: null });
@@ -121,6 +150,7 @@ describe("client transport", () => {
     expect(subscribe).toMatchObject({
       method: "rpc.subscribe",
       params: { topics: ["task.update", "llm.delta"] },
+      options: { stream: true },
     });
     emit(socket, { id: subscribe.id, result: { stream_id: "sub-1" } });
     await flush();
@@ -162,7 +192,6 @@ describe("client transport", () => {
     socket.send.mockRejectedValueOnce("closed");
     await expect(client.rpc("send-string-error")).rejects.toThrow("closed");
 
-    vi.useFakeTimers();
     socket.send.mockResolvedValue(undefined);
     const timeout = client.rpc("slow");
     const timeoutAssertion = expect(timeout).rejects.toThrow("rpc timeout: slow");

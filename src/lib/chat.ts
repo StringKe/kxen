@@ -1,5 +1,6 @@
 import { client } from "./client";
 import type { McpServerStatus } from "./mcp";
+import type { UsageCompleteness } from "./usage";
 export interface DoctorEntry {
   provider: string;
   display: string;
@@ -14,6 +15,8 @@ export interface LspHealth {
 
 /** 子系统健康汇总（MCP/LSP/MRM/event bus），仅 RPC 路径带（reprobe 纯凭证路径为 null）。 */
 export interface SystemHealth {
+  /** false 表示当前 Workspace 的 MCP runtime 尚未完成首次加载，此时空列表不是“未配置”。 */
+  mcp_ready: boolean;
   mcp: McpServerStatus[];
   lsp_root: string;
   lsp: LspHealth[];
@@ -39,13 +42,18 @@ export interface ChatMessage {
   error?: string;
 }
 
+/** 一次实际 Provider 路由的模型身份。消息上的值是生成时快照，不随当前配置变化。 */
+export interface ModelIdentity {
+  provider: string;
+  model: string;
+  account?: string | null;
+}
+
 export async function doctor(): Promise<DoctorReport> {
   return client.rpc<DoctorReport>("doctor");
 }
 
-export async function currentModel(
-  sessionId?: string,
-): Promise<{ provider: string; model: string }> {
+export async function currentModel(sessionId?: string): Promise<ModelIdentity> {
   return client.rpc("current_model", sessionId ? { session_id: sessionId } : {});
 }
 
@@ -103,16 +111,17 @@ export interface PendingApproval {
   session_id: string;
 }
 
-/** 等待中的审批（broker 300s 窗口内仍在等应答）：会话重载时恢复等待卡。
- *  RPC 失败按空列表降级（与 sessionPendingList 同口径）——恢复是增强，不能阻断时间线加载。 */
-export async function approvalPending(sessionId: string): Promise<PendingApproval[]> {
-  return client
-    .rpc<PendingApproval[]>("approval.pending", { session_id: sessionId })
-    .catch(() => []);
+/** 等待中的审批（broker 300s 窗口内仍在等应答）。
+ *  传 sessionId 恢复该 Session；省略时只恢复 Layout 全局审批，两者不会重复。 */
+export async function approvalPending(sessionId?: string): Promise<PendingApproval[]> {
+  return client.rpc<PendingApproval[]>(
+    "approval.pending",
+    sessionId ? { session_id: sessionId } : {},
+  );
 }
 
 export async function sessionPendingList(sessionId: string): Promise<string[]> {
-  return client.rpc<string[]>("session.pending_list", { id: sessionId }).catch(() => []);
+  return client.rpc<string[]>("session.pending_list", { id: sessionId });
 }
 
 export async function sessionPendingClear(sessionId: string): Promise<void> {
@@ -125,9 +134,15 @@ export interface StatuslineReport {
   git_branch: string;
   goal?: { id: string; status: string } | null;
   tasks_running: number;
-  tokens: { input: number; output: number };
+  tokens: SessionUsage;
   ctx_pct: number;
   model: string;
+}
+
+/** 会话 token 累计；计量不完整时 input/output 是已知下限。 */
+export interface SessionUsage extends UsageCompleteness {
+  input: number;
+  output: number;
 }
 
 export async function statusline(sessionId: string): Promise<StatuslineReport> {
@@ -187,7 +202,7 @@ export interface SessionMeta {
   pinned?: boolean;
   sort_order?: number | null;
   /** 会话级模型覆盖（缺省 = 跟随全局默认） */
-  model?: { provider: string; model: string; account?: string | null } | null;
+  model?: ModelIdentity | null;
   running?: boolean;
 }
 
@@ -217,6 +232,8 @@ export interface StoredMessage {
   session_id: string;
   role: "user" | "assistant" | "system";
   parts: StoredPart[];
+  /** 生成本条 Assistant 的实际路由模型；旧 JSONL 和非 Assistant 消息缺省。 */
+  model?: ModelIdentity | null;
   created_at: number;
 }
 

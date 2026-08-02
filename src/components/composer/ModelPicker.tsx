@@ -1,7 +1,7 @@
 // ModelPicker：catalog 驱动（models.dev 快照）——显示名 + id + ctx + 能力徽章 + 搜索 + 方向键导航 + 角色分配。
 import { createEffect, createSignal, For, onMount, Show } from "solid-js";
 import { Check, ChevronDown, Search } from "lucide-solid";
-import { configSetRole, currentModel } from "../../lib/chat";
+import { configSetRole } from "../../lib/chat";
 import { sessionFollowGlobalModel, sessionSetModel } from "../../lib/session-model";
 import { activeSessionId, sessions } from "../../lib/state";
 import { createExclusiveDisclosure, onClickOutside } from "../../lib/dismiss";
@@ -14,6 +14,8 @@ import {
   type ModelInfo,
   type ProviderCatalog,
 } from "../../lib/models";
+import ModelStatusErrors from "./ModelStatusErrors";
+import { createModelStatus } from "./model-status";
 
 const ROLE_ASSIGN: Array<{ role: string; label: string }> = [
   { role: "chat", label: "设为主会话模型" },
@@ -31,12 +33,15 @@ interface Row {
 }
 
 export default function ModelPicker() {
-  const [cur, setCur] = createSignal({ provider: "", model: "" });
-  const [globalDef, setGlobalDef] = createSignal({ provider: "", model: "" });
+  const { cur, setCur, curErr, globalDef, globalErr, reloadCurrent, reloadGlobal } =
+    createModelStatus();
   const [cat, setCat] = createSignal<ProviderCatalog[]>([]);
+  const [catLoading, setCatLoading] = createSignal(true);
+  const [catErr, setCatErr] = createSignal("");
   const { open, setOpen, toggle } = createExclusiveDisclosure();
   const [query, setQuery] = createSignal("");
   const [roleMsg, setRoleMsg] = createSignal("");
+  const [modelSaving, setModelSaving] = createSignal(false);
   // 键盘导航选中位：-1 = 未导航（Enter 落首行）；与 filtered() 同步失效（query 变即复位）
   const [nav, setNav] = createSignal(-1);
   // 本地选择优先于 sessions 列表推导（set_model 不触发列表刷新，meta 是旧值）
@@ -49,21 +54,23 @@ export default function ModelPicker() {
     () => setOpen(false),
   );
 
+  const reloadCatalog = async (force = false) => {
+    setCatLoading(true);
+    try {
+      setCat(await modelsCatalog(force));
+      setCatErr("");
+    } catch (error) {
+      setCatErr(errText(error));
+    } finally {
+      setCatLoading(false);
+    }
+  };
   onMount(() => {
-    void modelsCatalog()
-      .then(setCat)
-      .catch(() => setCat([])); // catalog 内部已兜底 []，这里再兜一层 Promise 拒绝
-    void currentModel()
-      .then((m) => setGlobalDef({ provider: m.provider, model: m.model }))
-      .catch(() => setGlobalDef({ provider: "", model: "" }));
+    void reloadCatalog();
   });
-  // 生效模型随活跃会话重取（session 覆盖 > 全局默认）
   createEffect(() => {
     activeSessionId();
     setFollowOverride(null);
-    void currentModel(activeSessionId() || undefined)
-      .then((m) => setCur({ provider: m.provider, model: m.model }))
-      .catch(() => setCur({ provider: "", model: "" }));
   });
   // 打开弹层自动聚焦搜索框（挂上即输入），同时复位键盘导航
   createEffect(() => {
@@ -93,42 +100,60 @@ export default function ModelPicker() {
 
   const curInfo = () => modelOf(cat(), cur().provider, cur().model);
   const curLabel = () =>
-    curInfo()?.name ?? (cur().model ? `${cur().provider}/${cur().model}` : "模型");
+    curErr()
+      ? "模型 UNKNOWN"
+      : (curInfo()?.name ?? (cur().model ? `${cur().provider}/${cur().model}` : "模型"));
   const globalLabel = () =>
-    modelOf(cat(), globalDef().provider, globalDef().model)?.name ??
-    (globalDef().model || "未设置");
+    globalErr()
+      ? "UNKNOWN"
+      : (modelOf(cat(), globalDef().provider, globalDef().model)?.name ??
+        (globalDef().model || "未设置"));
   // 跟随态：本地选择优先；否则按 session meta 有无覆盖推导（草稿态无 meta = 跟随）
   const following = () =>
     followOverride() ?? !sessions().find((s) => s.id === activeSessionId())?.model;
 
   // 切模型只写当前 session 的 metadata（草稿态暂存，落库后回写）；全局默认在设置页改
   const pick = (r: Row) => {
+    if (modelSaving()) return;
+    const sid = activeSessionId();
     const prev = cur();
     const prevFollow = followOverride();
     // 乐观更新：写失败回滚显示，pill 不能亮着一个没生效的模型
     setCur({ provider: r.provider, model: r.model.id });
     setFollowOverride(false);
     setOpen(false);
-    sessionSetModel(activeSessionId(), r.provider, r.model.id).catch((e: unknown) => {
-      setCur(prev);
-      setFollowOverride(prevFollow);
-      flashErr(`切换模型失败：${errText(e)}`);
-    });
+    setModelSaving(true);
+    void sessionSetModel(sid, r.provider, r.model.id)
+      .catch((e: unknown) => {
+        if (activeSessionId() !== sid) return;
+        setCur(prev);
+        setFollowOverride(prevFollow);
+        flashErr(`切换模型失败：${errText(e)}`);
+      })
+      .finally(() => setModelSaving(false));
   };
 
   // 跟随全局默认：清除 session 覆盖（后端 provider/model 同缺 = 清除），生效模型回到全局默认
   const followGlobal = () => {
+    if (modelSaving()) return;
     const sid = activeSessionId();
     const prevFollow = followOverride();
     setFollowOverride(true);
     setOpen(false);
-    sessionFollowGlobalModel(sid)
-      .then(() => currentModel(sid || undefined))
-      .then((m) => setCur({ provider: m.provider, model: m.model }))
+    setModelSaving(true);
+    void sessionFollowGlobalModel(sid)
+      .then(async () => {
+        if (activeSessionId() !== sid) return;
+        const error = await reloadCurrent(sid, true);
+        if (error && activeSessionId() === sid)
+          flashErr(`已跟随全局默认，但读取生效模型失败：${error}`);
+      })
       .catch((e: unknown) => {
+        if (activeSessionId() !== sid) return;
         setFollowOverride(prevFollow); // 清除没写成：跟随态回滚，免得显示与后端脱节
         flashErr(`跟随全局默认失败：${errText(e)}`);
-      });
+      })
+      .finally(() => setModelSaving(false));
   };
 
   const assignRole = (role: string, label: string) => {
@@ -161,6 +186,7 @@ export default function ModelPicker() {
     <div class="relative" ref={(el) => (root = el)}>
       <button
         class="pressable model-pill"
+        disabled={modelSaving()}
         aria-expanded={open()}
         aria-haspopup="listbox"
         onClick={toggle}
@@ -192,6 +218,12 @@ export default function ModelPicker() {
               onKeyDown={onSearchKey}
             />
           </div>
+          <ModelStatusErrors
+            currentError={curErr()}
+            globalError={globalErr()}
+            onRetryCurrent={() => void reloadCurrent(activeSessionId())}
+            onRetryGlobal={() => void reloadGlobal()}
+          />
           <div class="max-h-72 overflow-y-auto py-1" ref={(el) => (listEl = el)}>
             <div
               class="model-row"
@@ -212,44 +244,61 @@ export default function ModelPicker() {
               </div>
             </div>
             <div class="mx-2 my-1 border-t border-[var(--border)]" />
-            <For each={filtered()}>
-              {(r, i) => (
-                <div
-                  class="model-row"
-                  data-nav={i()}
-                  classList={{
-                    "model-row-active": r.model.id === cur().model && r.provider === cur().provider,
-                    "bg-[var(--bg-overlay)]": i() === nav(),
-                  }}
-                  onClick={() => pick(r)}
-                  onContextMenu={(e) => e.preventDefault()}
+            <Show when={catLoading()}>
+              <div class="px-3 py-2 text-2xs text-[var(--text-faint)]">加载模型目录中…</div>
+            </Show>
+            <Show when={catErr()}>
+              <div class="px-3 py-2 text-2xs text-[var(--err)]">
+                加载模型目录失败：{catErr()}
+                <button
+                  class="ml-2 text-[var(--accent-hover)] hover:underline"
+                  onClick={() => void reloadCatalog(true)}
                 >
-                  <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-1.5">
-                      <span class="text-xs font-medium truncate">{r.model.name}</span>
-                      <Show when={r.model.reasoning}>
-                        <span class="text-2xs px-1 rounded border border-[var(--border)] text-[var(--text-faint)]">
-                          推理
-                        </span>
-                      </Show>
-                      <Show when={r.model.modalities_in.some((m) => m !== "text")}>
-                        <span class="text-2xs px-1 rounded border border-[var(--border)] text-[var(--text-faint)]">
-                          {r.model.modalities_in.filter((m) => m !== "text").join("/")}
-                        </span>
-                      </Show>
-                      <Show when={r.model.id === cur().model && r.provider === cur().provider}>
-                        <Check size={12} class="text-[var(--accent-hover)]" />
-                      </Show>
-                    </div>
-                    <div class="text-2xs text-[var(--text-faint)] truncate">
-                      {r.providerName} · {r.model.id} · ctx {fmtCtx(r.model.context)}
+                  重试
+                </button>
+              </div>
+            </Show>
+            <Show when={!catLoading() && !catErr()}>
+              <For each={filtered()}>
+                {(r, i) => (
+                  <div
+                    class="model-row"
+                    data-nav={i()}
+                    classList={{
+                      "model-row-active":
+                        r.model.id === cur().model && r.provider === cur().provider,
+                      "bg-[var(--bg-overlay)]": i() === nav(),
+                    }}
+                    onClick={() => pick(r)}
+                    onContextMenu={(e) => e.preventDefault()}
+                  >
+                    <div class="flex-1 min-w-0">
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-xs font-medium truncate">{r.model.name}</span>
+                        <Show when={r.model.reasoning}>
+                          <span class="text-2xs px-1 rounded border border-[var(--border)] text-[var(--text-faint)]">
+                            推理
+                          </span>
+                        </Show>
+                        <Show when={r.model.modalities_in.some((m) => m !== "text")}>
+                          <span class="text-2xs px-1 rounded border border-[var(--border)] text-[var(--text-faint)]">
+                            {r.model.modalities_in.filter((m) => m !== "text").join("/")}
+                          </span>
+                        </Show>
+                        <Show when={r.model.id === cur().model && r.provider === cur().provider}>
+                          <Check size={12} class="text-[var(--accent-hover)]" />
+                        </Show>
+                      </div>
+                      <div class="text-2xs text-[var(--text-faint)] truncate">
+                        {r.providerName} · {r.model.id} · ctx {fmtCtx(r.model.context)}
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
-            </For>
-            <Show when={filtered().length === 0}>
-              <div class="px-3 py-2 text-2xs text-[var(--text-faint)]">无匹配模型</div>
+                )}
+              </For>
+              <Show when={filtered().length === 0}>
+                <div class="px-3 py-2 text-2xs text-[var(--text-faint)]">无匹配模型</div>
+              </Show>
             </Show>
           </div>
           <div class="border-t border-[var(--border)] px-2.5 py-1.5">

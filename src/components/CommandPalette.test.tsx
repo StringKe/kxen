@@ -59,6 +59,7 @@ vi.mock("../lib/models", async (importOriginal) => {
 vi.mock("../lib/session-model", () => ({
   sessionSetModel: mocks.setModel,
   applyDraftModel: async () => {},
+  resetDraftModel: () => {},
 }));
 
 const cmdK = () =>

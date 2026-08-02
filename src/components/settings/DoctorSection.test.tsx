@@ -25,6 +25,7 @@ function report(): DoctorReport {
       { provider: "kimi", display: "Kimi", status: "missing", detail: "" },
     ],
     system: {
+      mcp_ready: true,
       mcp: [
         {
           name: "fs",
@@ -65,7 +66,7 @@ describe("DoctorSection", () => {
       "fs",
       "rust",
       "global limit: 8",
-      "累计派发 3",
+      "当前进程最近路由解析记录 3 条",
       "异常：无订阅者",
     ]) {
       expect(text).toContain(expected);
@@ -77,6 +78,21 @@ describe("DoctorSection", () => {
     h.doctor.mockRejectedValue(new Error("backend down"));
     const dispose = render(() => <DoctorSection />, document.body);
     await vi.waitFor(() => expect(document.body.textContent).toContain("诊断数据加载失败"));
+    dispose();
+  });
+
+  it("MCP runtime 尚未加载时显示 UNKNOWN，不误报未配置", async () => {
+    const value = report();
+    value.system!.mcp_ready = false;
+    value.system!.mcp = [];
+    h.doctor.mockResolvedValue(value);
+    const dispose = render(() => <DoctorSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("MCP runtime 尚未加载"));
+    expect(document.body.textContent).toContain("UNKNOWN");
+    const mcpSection = [...document.body.querySelectorAll("section")].find((section) =>
+      section.textContent?.includes("MCP Servers"),
+    );
+    expect(mcpSection?.textContent).not.toContain("未配置");
     dispose();
   });
 });

@@ -3,9 +3,10 @@ import { createSignal } from "solid-js";
 import { client } from "./client";
 import { agentsList, type AgentActivity } from "./team";
 import { sessionCreate, sessionDelete, sessionList, type SessionMeta } from "./chat";
-import { applyDraftModel } from "./session-model";
-import { createInFlight } from "./async-guard";
+import { applyDraftModel, resetDraftModel } from "./session-model";
+import { createInFlight, createSeqGuard } from "./async-guard";
 import { migrateNewDraft } from "./drafts";
+import { formatError } from "./error-text";
 
 export const [sessions, setSessions] = createSignal<SessionMeta[]>([]);
 export const [activeSessionId, setActiveSessionId] = createSignal<string>("");
@@ -17,6 +18,8 @@ export const [agents, setAgents] = createSignal<AgentActivity[]>([]);
 export const [agentsLoadFailed, setAgentsLoadFailed] = createSignal(false);
 /** PrimaryContent 选中项："" / "main" = 主会话，否则为 agent run 名（AgentRunCards 卡与右栏概览卡共用）。 */
 export const [activeAgentFocus, setActiveAgentFocus] = createSignal<string>("");
+const sessionsGuard = createSeqGuard();
+const agentsGuard = createSeqGuard();
 
 /** 当前选中是否为主会话。 */
 export function isMainFocus(): boolean {
@@ -38,7 +41,9 @@ export async function initSessions(): Promise<void> {
 }
 
 export async function refreshSessions(): Promise<void> {
+  const request = sessionsGuard.next();
   const next = await sessionList();
+  if (!sessionsGuard.isCurrent(request)) return;
   setSessions((prev) => mergeKeyed(prev, next, (s) => s.id, sameSession));
 }
 
@@ -97,6 +102,7 @@ export function navigate(path: string): void {
 }
 
 export async function newSession(): Promise<void> {
+  resetDraftModel();
   // 草稿态：不立即落库；首次发送消息时才创建会话（对齐 Cursor/Claude/ChatGPT）
   setActiveSessionId("");
   setActiveAgentFocus("");
@@ -111,14 +117,24 @@ const ensureInflight = createInFlight();
 /** 草稿态首条消息：先落库成会话再激活。返回活跃会话 id。 */
 export async function ensureActiveSession(): Promise<string> {
   const existing = activeSessionId();
-  if (existing) return existing;
+  if (existing) {
+    // 草稿模型写失败后选择已归属到这个 session；重试发送前必须先补写，仍失败就继续阻断发送。
+    await applyDraftModel(existing, false);
+    return existing;
+  }
   return ensureInflight("create", async () => {
     const created = await sessionCreate();
-    await applyDraftModel(created.id);
+    let modelError: unknown;
+    try {
+      await applyDraftModel(created.id);
+    } catch (error) {
+      modelError = error;
+    }
     await refreshSessions();
     // 先迁移草稿键再激活：激活触发的 composer 恢复要读到迁移后的内容
     migrateNewDraft(created.id);
     await switchSession(created.id);
+    if (modelError) throw modelError;
     return created.id;
   });
 }
@@ -127,6 +143,7 @@ let desiredSessionId = "";
 let activationTail: Promise<void> = Promise.resolve();
 
 export async function switchSession(id: string): Promise<void> {
+  if (!activeSessionId()) resetDraftModel();
   desiredSessionId = id;
   const activation = activationTail.then(async () => {
     await client.rpc("session.activate", { id });
@@ -145,22 +162,37 @@ export async function switchSession(id: string): Promise<void> {
 
 /** 删除会话并善后（SessionTree 行删除与 Cmd+W 共用）：错误上抛由调用方提示；
  *  删的是活跃会话则切同目录下一条，同目录无则切列表首条，全无回草稿态——activeSessionId 不得悬死。 */
-export async function deleteSession(id: string, distill = false): Promise<void> {
+export async function deleteSession(id: string, distill = false): Promise<{ warning?: string }> {
   const wasActive = activeSessionId() === id;
   const dir = sessions().find((s) => s.id === id)?.directory;
   if (distill) await sessionDelete(id, true);
   else await sessionDelete(id);
-  await refreshSessions();
-  if (!wasActive) return;
+  // 删除已经提交后，后续刷新/切换失败不能把 UI 留在死 id，也不能再对用户谎称“删除失败”。
+  setSessions((current) => current.filter((session) => session.id !== id));
+  if (wasActive) setActiveSessionId("");
+  const warnings: string[] = [];
+  try {
+    await refreshSessions();
+  } catch (error) {
+    warnings.push(`会话列表刷新失败：${formatError(error)}`);
+  }
+  if (!wasActive) return warnings[0] ? { warning: warnings[0] } : {};
   const next = sessions().find((s) => s.directory === dir) ?? sessions()[0];
-  if (next) await switchSession(next.id);
-  else await newSession();
+  if (next) {
+    try {
+      await switchSession(next.id);
+    } catch (error) {
+      warnings.push(`后续会话切换失败：${formatError(error)}`);
+    }
+  } else await newSession();
+  return warnings.length > 0 ? { warning: warnings.join("；") } : {};
 }
 
 /** 刷新子代理名单（3s 轮询 + 事件驱动调用方）：mergeKeyed 保引用，无变化不触发下游重算。
  *  失败保留旧名单只置失败标记：把 RPC 失败合并成空列会把运行中的卡抹掉、与真空同形。 */
 export async function refreshAgents(): Promise<void> {
   const sid = activeSessionId();
+  const request = agentsGuard.next();
   if (!sid) {
     setAgents([]);
     setAgentsLoadFailed(false);
@@ -168,7 +200,7 @@ export async function refreshAgents(): Promise<void> {
   }
   const next = await agentsList(sid).catch(() => null);
   // await 期间切了会话：旧会话的晚到响应不得覆盖新名单
-  if (activeSessionId() !== sid) return;
+  if (activeSessionId() !== sid || !agentsGuard.isCurrent(request)) return;
   if (!next) {
     setAgentsLoadFailed(true);
     return;

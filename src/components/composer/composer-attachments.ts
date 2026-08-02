@@ -11,22 +11,40 @@ import type { RowChip } from "./RowChips";
 export interface AttachDeps {
   images: Map<string, { media_type: string; data: string }>;
   pushChip: (chip: Omit<RowChip, "id">) => void;
+  /** 当前 composer 的会话作用域；异步读取晚到时不得把旧会话附件插进新会话。 */
+  scope: () => string;
 }
 
 export function createAttachments(deps: AttachDeps) {
-  const { images, pushChip } = deps;
+  const { images, pushChip, scope } = deps;
 
   /** 普通文件附件：File 只有 basename，反查 workspace 索引存相对路径（子目录可读、同名不串）。 */
   async function attachOneFile(file: File) {
-    const candidates = await fsResolveName(file.name).catch(() => []);
+    const startedIn = scope();
+    let candidates;
+    try {
+      candidates = await fsResolveName(file.name);
+    } catch (e) {
+      if (scope() === startedIn)
+        pushChip({
+          kind: "err",
+          ref: file.name,
+          label: file.name,
+          title: `文件定位失败：${errText(e)}`,
+        });
+      return;
+    }
+    if (scope() !== startedIn) return;
     const rel = resolveAttachPath(file.name, file.size, candidates) ?? file.name;
     pushChip({ kind: "file", ref: rel, label: file.name, title: rel });
   }
 
   /** 粘贴/拖入的图片 File：canvas 压到长边 1568 再 base64（Retina 截图原样 5-10MB 直发扛不住）。 */
   function attachImageFile(file: File) {
+    const startedIn = scope();
     void fileToImageDataUrl(file)
       .then((dataUrl) => {
+        if (scope() !== startedIn) return;
         images.set(dataUrl, { media_type: file.type, data: dataUrl.split(",")[1] ?? "" });
         pushChip({
           kind: "image",
@@ -36,6 +54,7 @@ export function createAttachments(deps: AttachDeps) {
         });
       })
       .catch((e: unknown) => {
+        if (scope() !== startedIn) return;
         pushChip({
           kind: "err",
           ref: file.name,
@@ -64,8 +83,12 @@ export function createAttachments(deps: AttachDeps) {
       return null;
     });
     if (!sid) return;
+    // ensureActiveSession 可能把草稿态落库；以落库后的 sid 作为本次附件动作真源。
+    if (scope() !== sid) return;
     for (const path of paths) {
+      if (scope() !== sid) return;
       const r = await resolvePickedPath(sid, path);
+      if (scope() !== sid) return;
       if (!r.ok) {
         pushChip({ kind: "err", ref: path, label: baseName(path), title: r.reason });
         continue;

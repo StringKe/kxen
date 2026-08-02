@@ -23,6 +23,8 @@ export default function DockGoal(props: {
   goal: GoalInfo | null;
   act: (action: GoalAction) => Promise<boolean>;
   acting: () => boolean;
+  refreshError?: string | undefined;
+  reload?: (() => void) | undefined;
 }) {
   const goal = () => props.goal;
   const act = props.act;
@@ -53,6 +55,14 @@ export default function DockGoal(props: {
   };
   return (
     <DockSection title="目标" icon={Target}>
+      <Show when={props.refreshError}>
+        <div class="mb-2 text-xs text-[var(--err)]">
+          刷新目标失败，正在显示上次结果：{props.refreshError}
+          <button class="ml-2 text-[var(--accent-hover)] hover:underline" onClick={props.reload}>
+            重试
+          </button>
+        </div>
+      </Show>
       <Show
         when={goal()}
         fallback={

@@ -12,21 +12,34 @@ import {
   type ScheduleJob,
 } from "../../lib/schedule";
 import { activeSessionId } from "../../lib/state";
+import { createSeqGuard } from "../../lib/async-guard";
 
 export default function ScheduleSection() {
   const [jobs, setJobs] = createSignal<ScheduleJob[]>([]);
+  const [loaded, setLoaded] = createSignal(false);
+  const [loadErr, setLoadErr] = createSignal("");
   const [cron, setCron] = createSignal("0 9 * * *");
   const [prompt, setPrompt] = createSignal("");
   const [once, setOnce] = createSignal(false);
   const [adding, setAdding] = createSignal(false);
   // 待确认删除的 job id：删除统一走行内确认条（对齐会话删除/worktree 的二次确认模式）
   const [confirmDel, setConfirmDel] = createSignal("");
+  const reloadGuard = createSeqGuard();
   const reload = async () => {
-    const list = await scheduleList().catch((e: unknown) => {
-      flashErr(`加载定时任务失败：${errText(e)}`); // 失败保留旧数据，不伪装空清单
-      return null;
-    });
-    if (list) setJobs(list);
+    const request = reloadGuard.next();
+    try {
+      const list = await scheduleList();
+      if (!reloadGuard.isCurrent(request)) return;
+      setJobs(list);
+      setLoadErr("");
+      setLoaded(true);
+    } catch (error) {
+      if (!reloadGuard.isCurrent(request)) return;
+      const message = errText(error);
+      setLoadErr(message);
+      setLoaded(true);
+      flashErr(`加载定时任务失败：${message}`); // 保留旧数据，同时在区块内持续标记 stale
+    }
   };
   onMount(() => void reload());
 
@@ -109,14 +122,24 @@ export default function ScheduleSection() {
         </label>
       </div>
       <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] divide-y divide-[var(--border)]">
-        <Show
-          when={jobs().length > 0}
-          fallback={
-            <div class="px-4 py-3 text-xs text-[var(--text-faint)]">
-              暂无定时任务（由 agent 的 schedule 工具创建）
-            </div>
-          }
-        >
+        <Show when={!loaded()}>
+          <div class="px-4 py-3 text-xs text-[var(--text-faint)]">加载中…</div>
+        </Show>
+        <Show when={loaded() && loadErr()}>
+          <div class="px-4 py-3 flex items-center gap-2 text-xs text-[var(--err)]">
+            <span>
+              {jobs().length > 0 ? "刷新定时任务失败，正在显示上次结果" : "加载定时任务失败"}：
+              {loadErr()}
+            </span>
+            <button
+              class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-dim)]"
+              onClick={() => void reload()}
+            >
+              重试
+            </button>
+          </div>
+        </Show>
+        <Show when={jobs().length > 0}>
           <For each={jobs()}>
             {(job) => (
               <div class="px-4 py-3">
@@ -185,6 +208,11 @@ export default function ScheduleSection() {
               </div>
             )}
           </For>
+        </Show>
+        <Show when={loaded() && !loadErr() && jobs().length === 0}>
+          <div class="px-4 py-3 text-xs text-[var(--text-faint)]">
+            暂无定时任务，可在上方直接创建，也可由 agent 的 schedule 工具创建
+          </div>
         </Show>
       </div>
     </div>

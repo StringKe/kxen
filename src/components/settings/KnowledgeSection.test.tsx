@@ -70,7 +70,9 @@ function buttonByText(text: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  h.list.mockReset();
   h.list.mockResolvedValue(entries);
+  h.preview.mockReset();
   h.preview.mockResolvedValue({ block: "injected knowledge" });
 });
 
@@ -185,14 +187,28 @@ describe("KnowledgeSection 生命周期", () => {
     dispose();
   });
 
-  it("双源加载失败独立降级为空态", async () => {
+  it("双源加载失败显示 UNKNOWN，不伪装成空知识库", async () => {
     h.list.mockRejectedValueOnce(new Error("list failed"));
     h.preview.mockRejectedValueOnce(new Error("preview failed"));
     const dispose = render(() => <KnowledgeSection />, document.body);
-    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无项目知识"));
-    expect(document.body.textContent).toContain("暂无个人知识");
+    await vi.waitFor(() => expect(document.body.textContent).toContain("知识列表读取失败"));
+    expect(document.body.textContent).toContain("知识条目统计 UNKNOWN");
+    expect(document.body.textContent).not.toContain("暂无项目知识");
+    expect(document.body.textContent).not.toContain("暂无个人知识");
     buttonByText("注入预览").click();
-    await vi.waitFor(() => expect(document.body.textContent).toContain("（无注入知识）"));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("注入预览 UNKNOWN"));
+    expect(document.body.textContent).toContain("preview failed");
+    dispose();
+  });
+
+  it("刷新失败保留最后一次成功列表", async () => {
+    const dispose = render(() => <KnowledgeSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("共享规则"));
+    h.list.mockRejectedValueOnce(new Error("refresh failed"));
+
+    document.body.querySelector<HTMLButtonElement>("button[title='停用（注入即刻跳过）']")?.click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("refresh failed"));
+    expect(document.body.textContent).toContain("共享规则");
     dispose();
   });
 });

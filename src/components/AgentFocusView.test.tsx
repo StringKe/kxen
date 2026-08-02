@@ -205,4 +205,23 @@ describe("AgentFocusView", () => {
     expect(body()).not.toContain("加载中…");
     dispose();
   });
+
+  it("resync 失败保留 last-good 并标记 stale，下一次成功清除", async () => {
+    setAgents([run("w", "working")]);
+    mocks.transcript.mockResolvedValueOnce([{ kind: "text", text: "last-good" }]);
+    const { dispose, body } = mount("w");
+    await tick();
+    mocks.transcript.mockRejectedValueOnce(new Error("resync timeout"));
+    fireResync();
+    await tick();
+    expect(body()).toContain("last-good");
+    expect(body()).toContain("刷新失败，正在显示上次结果，点击重试");
+
+    mocks.transcript.mockResolvedValueOnce([{ kind: "text", text: "recovered" }]);
+    fireResync();
+    await tick();
+    expect(body()).toContain("recovered");
+    expect(body()).not.toContain("刷新失败");
+    dispose();
+  });
 });

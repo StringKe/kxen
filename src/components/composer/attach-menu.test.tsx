@@ -3,23 +3,28 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { userEvent } from "@vitest/browser/context";
 import AttachMenu from "./AttachMenu";
+import { flash } from "../../lib/flash";
 import "../../styles.css";
 
 const dialogMock = vi.hoisted(() => ({
   result: null as unknown,
+  error: null as Error | null,
   calls: [] as Array<Record<string, unknown>>,
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (opts: Record<string, unknown>) => {
     dialogMock.calls.push(opts);
+    if (dialogMock.error) return Promise.reject(dialogMock.error);
     return Promise.resolve(dialogMock.result);
   },
 }));
 
 afterEach(() => {
   dialogMock.result = null;
+  dialogMock.error = null;
   dialogMock.calls.length = 0;
   document.body.innerHTML = "";
+  for (const message of flash.msgs()) flash.dismiss(message.id);
 });
 
 async function openMenuAndClick(label: string, onPaths: (paths: string[]) => void) {
@@ -67,6 +72,20 @@ describe("AttachMenu (webkit)", () => {
     let called = 0;
     const dispose = await openMenuAndClick("选择文件", () => called++);
     expect(called).toBe(0);
+    dispose();
+  });
+
+  it("目录选择器失败显示错误，不伪装成用户取消", async () => {
+    dialogMock.error = new Error("dialog unavailable");
+    let called = 0;
+    const dispose = await openMenuAndClick("选择文件", () => called++);
+
+    expect(called).toBe(0);
+    expect(
+      flash
+        .msgs()
+        .some((message) => message.kind === "err" && message.text.includes("dialog unavailable")),
+    ).toBe(true);
     dispose();
   });
 

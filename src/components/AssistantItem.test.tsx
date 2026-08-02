@@ -26,7 +26,6 @@ function setup(item: MsgItem, live: boolean, streaming = true) {
         item={item}
         streaming={() => streaming}
         live={() => live}
-        modelLabel={() => "m"}
         onFork={() => {}}
         onRerun={() => {}}
         onContinue={() => {}}
@@ -64,5 +63,42 @@ describe("rewind 入口", () => {
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 10, clientY: 10 }));
     const rewind = menu()?.items.find((i) => i.label === "回退到此处");
     expect(rewind?.disabled).toBe(true);
+  });
+});
+
+describe("实际模型署名", () => {
+  const stats = {
+    ttft_ms: 100,
+    duration_ms: 200,
+    input_tokens: 10,
+    output_tokens: 20,
+    tokens_per_sec: 100,
+  };
+
+  it("按消息自身持久化的 provider/model 展示", () => {
+    setup(
+      reasoningItem({
+        model: { provider: "anthropic", model: "claude-sonnet-4-6" },
+      }),
+      false,
+    );
+    expect(document.body.textContent).toContain("anthropic/claude-sonnet-4-6");
+  });
+
+  it("旧消息无 model 时不按当前 picker 伪造署名", () => {
+    setup(reasoningItem({ stats }), false);
+    expect(document.body.textContent).toContain("in 10 / out 20");
+    expect(document.body.textContent).not.toContain("anthropic/");
+  });
+
+  it("用量不完整时把已知 tokens 标为下限并显示 UNKNOWN", () => {
+    setup(
+      reasoningItem({
+        stats: { ...stats, unmetered_calls: 1, usage_complete: false },
+      }),
+      false,
+    );
+    expect(document.body.textContent).toContain("in ≥10 / out ≥20");
+    expect(document.body.textContent).toContain("UNKNOWN");
   });
 });

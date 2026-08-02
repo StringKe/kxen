@@ -11,7 +11,6 @@ export default function SessionItem(props: {
   item: Item;
   streaming: Accessor<boolean>;
   live: Accessor<boolean>;
-  modelLabel: Accessor<string>;
   onForkId: (messageId: string) => void;
   onEditResend: (text: string) => void;
   onRewindId: (messageId: string) => void;
@@ -19,19 +18,14 @@ export default function SessionItem(props: {
   onRerun: () => void;
   onContinue: () => void;
   onImageLoad: () => void;
-  onRespondApproval: (id: string, allow: boolean) => void;
+  onRespondApproval: (id: string, allow: boolean) => Promise<void>;
 }) {
   const item = props.item;
   if (item.kind === "tool") {
     return <ToolCard name={item.name} call={item.call} args={item.args} result={item.result} />;
   }
   if (item.kind === "approval") {
-    return (
-      <ApprovalCard
-        item={item}
-        onRespond={(id, allow) => void props.onRespondApproval(id, allow)}
-      />
-    );
+    return <ApprovalCard item={item} onRespond={props.onRespondApproval} />;
   }
   if (item.kind === "phase") {
     if (item.index != null && item.total != null) {
@@ -85,7 +79,6 @@ export default function SessionItem(props: {
       item={item}
       streaming={props.streaming}
       live={props.live}
-      modelLabel={props.modelLabel}
       onFork={() => item.messageId && props.onForkId(item.messageId)}
       onRerun={props.onRerun}
       onContinue={props.onContinue}

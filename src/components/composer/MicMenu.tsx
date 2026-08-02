@@ -20,13 +20,25 @@ const DISABLED = new Set(["unconfigured", "unavailable"]);
 export default function MicMenu(props: { onEngine: (id: string) => void }) {
   const { open, setOpen, toggle } = createExclusiveDisclosure();
   const [overview, setOverview] = createSignal<VoiceOverview | null>(null);
+  const [loading, setLoading] = createSignal(true);
+  const [loadErr, setLoadErr] = createSignal("");
   let root: HTMLDivElement | undefined;
   onClickOutside(
     () => root,
     () => setOpen(false),
   );
 
-  const reload = async () => setOverview(await voiceEngines().catch(() => null));
+  const reload = async () => {
+    setLoading(true);
+    try {
+      setOverview(await voiceEngines());
+      setLoadErr("");
+    } catch (error) {
+      setLoadErr(errText(error));
+    } finally {
+      setLoading(false);
+    }
+  };
   onMount(() => void reload());
 
   const pick = async (id: string) => {
@@ -56,6 +68,22 @@ export default function MicMenu(props: { onEngine: (id: string) => void }) {
       <Show when={open()}>
         <div class="composer-popup absolute bottom-full right-0 mb-1.5 w-52 max-w-[calc(100vw-16px)] rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] overflow-hidden z-20">
           <div class="popup-section">语音引擎</div>
+          <Show when={loading() && !overview()}>
+            <div class="popup-row text-[var(--text-faint)]">加载中…</div>
+          </Show>
+          <Show when={loadErr()}>
+            <div class="popup-row gap-2 text-[var(--err)]">
+              <span class="min-w-0 flex-1 truncate" title={loadErr()}>
+                加载语音引擎失败：{loadErr()}
+              </span>
+              <button
+                class="text-[var(--accent-hover)] hover:underline"
+                onClick={() => void reload()}
+              >
+                重试
+              </button>
+            </div>
+          </Show>
           <For each={overview()?.engines ?? []}>
             {(e) => (
               <button
@@ -78,7 +106,7 @@ export default function MicMenu(props: { onEngine: (id: string) => void }) {
               </button>
             )}
           </For>
-          <Show when={(overview()?.engines ?? []).length === 0}>
+          <Show when={overview() && overview()!.engines.length === 0 && !loadErr()}>
             <div class="popup-row text-[var(--text-faint)]">无可用语音引擎</div>
           </Show>
         </div>

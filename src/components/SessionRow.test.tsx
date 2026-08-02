@@ -128,6 +128,47 @@ describe("SessionRow 失败路径", () => {
     expect(disclosure?.getAttribute("title")).toContain("只写个人知识");
     dispose();
   });
+
+  it("Provider 读取失败时显式 UNKNOWN 并禁用沉淀删除，重试成功后才放行", async () => {
+    h.currentModel.mockRejectedValueOnce(new Error("routing unavailable"));
+    const onDelete = vi.fn();
+    const dispose = render(
+      () => (
+        <SessionRow
+          session={S}
+          deleting={false}
+          onOpen={() => {}}
+          onDelete={onDelete}
+          onChanged={() => {}}
+          draggable={false}
+          dropTarget={false}
+          onDragStart={() => {}}
+          onDragOver={() => {}}
+          onDragLeave={() => {}}
+          onDrop={() => {}}
+          onDragEnd={() => {}}
+        />
+      ),
+      document.body,
+    );
+    document.body
+      .querySelector<HTMLButtonElement>("button[title*='删除会话（再点一次确认）']")
+      ?.click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Provider UNKNOWN"));
+    const distill = document.body.querySelector<HTMLButtonElement>("button[title*='不能安全沉淀']");
+    expect(distill?.disabled).toBe(true);
+    distill?.click();
+    expect(onDelete).not.toHaveBeenCalled();
+
+    h.currentModel.mockResolvedValueOnce({ provider: "xai", model: "grok-4" });
+    document.body.querySelector<HTMLButtonElement>("button[title='重试读取 Provider']")?.click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("发送到 xai/grok-4"));
+    expect(
+      document.body.querySelector<HTMLButtonElement>("button[title*='沉淀为个人知识后删除']")
+        ?.disabled,
+    ).toBe(false);
+    dispose();
+  });
 });
 
 describe("SessionRow 完整交互", () => {

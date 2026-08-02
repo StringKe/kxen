@@ -15,30 +15,9 @@ import {
   type TestDispatchResult,
 } from "../../lib/provider";
 import { fmtCtx, modelsCatalog, type ProviderCatalog } from "../../lib/models";
-
-const ROLE_LABELS: Record<string, string> = {
-  chat: "主会话",
-  thinking: "思考分析",
-  planning: "任务规划",
-  execution: "高速执行",
-  review: "审查验证",
-  research: "调研搜索",
-};
-
-interface Slot {
-  provider: string;
-  available: number;
-  limit: number;
-}
-
-function parseSlots(describe: string): Slot[] {
-  const out: Slot[] = [];
-  for (const line of describe.split("\n")) {
-    const m = line.match(/^(\S+):\s*(\d+)\/(\d+) available$/);
-    if (m) out.push({ provider: m[1]!, available: Number(m[2]), limit: Number(m[3]) });
-  }
-  return out;
-}
+import { errText } from "../err-text";
+import { parseSlots, ROLE_LABELS, type Slot } from "./routing";
+import { RoutingHistory, RoutingTelemetry } from "./RoutingTelemetry";
 
 export default function RoutingSection() {
   const [roles, setRoles] = createSignal<Record<string, RoleBindingView>>({});
@@ -51,29 +30,80 @@ export default function RoutingSection() {
   const [testing, setTesting] = createSignal("");
   const [testResult, setTestResult] = createSignal<Record<string, TestDispatchResult>>({});
   const [saved, setSaved] = createSignal("");
+  const [rolesLoaded, setRolesLoaded] = createSignal(false);
+  const [rolesErr, setRolesErr] = createSignal("");
+  const [sourceWarnings, setSourceWarnings] = createSignal("");
+  const [actionErr, setActionErr] = createSignal("");
+  const [savingRole, setSavingRole] = createSignal("");
   // model 被编辑过的角色：非法值（空/含空白）的行内提示只对编辑过的行显示，缺省空绑定不吵
   const [modelTouched, setModelTouched] = createSignal<Record<string, boolean>>({});
+  let reloadSeq = 0;
+  let telemetrySeq = 0;
 
   const reload = async () => {
-    // 首屏五源独立降级：单源失败只缺对应区块，不拖垮整页；用户操作路径各自显错
-    const [cfg, stats, accs, catalog, list] = await Promise.all([
-      configGet().catch(() => null),
-      mrmStats().catch(() => null),
-      providerAccounts().catch(() => []),
-      modelsCatalog().catch(() => []),
-      providerList().catch(() => [] as ProviderInfo[]),
+    const seq = ++reloadSeq;
+    const [cfg, stats, accs, catalog, list] = await Promise.allSettled([
+      configGet(),
+      mrmStats(),
+      providerAccounts(),
+      modelsCatalog(),
+      providerList(),
     ]);
-    if (cfg?.roles) setRoles(cfg.roles);
-    if (stats) {
+    if (seq !== reloadSeq) return;
+
+    if (cfg.status === "fulfilled") {
+      setRoles(cfg.value.roles ?? {});
+      setRolesLoaded(true);
+      setRolesErr("");
+    } else {
+      setRolesLoaded(false);
+      setRolesErr(errText(cfg.reason));
+    }
+    if (stats.status === "fulfilled") {
+      setSlots(parseSlots(stats.value.describe));
+      setHistory(stats.value.history.slice(0, 10));
+      setHealth(stats.value.health ?? []);
+    }
+    if (accs.status === "fulfilled") setAccounts(accs.value);
+    if (catalog.status === "fulfilled") setCat(catalog.value);
+    if (list.status === "fulfilled") setProviders(list.value as ProviderInfo[]);
+
+    const warnings = [
+      stats.status === "rejected" ? `MRM 状态：${errText(stats.reason)}` : "",
+      accs.status === "rejected" ? `账号列表：${errText(accs.reason)}` : "",
+      catalog.status === "rejected" ? `模型目录：${errText(catalog.reason)}` : "",
+      list.status === "rejected" ? `Provider 列表：${errText(list.reason)}` : "",
+    ].filter(Boolean);
+    setSourceWarnings(warnings.join("；"));
+  };
+  onMount(() => void reload());
+
+  const refreshRoles = async (): Promise<boolean> => {
+    try {
+      const cfg = await configGet();
+      setRoles(cfg.roles ?? {});
+      setRolesLoaded(true);
+      setRolesErr("");
+      return true;
+    } catch (error) {
+      setRolesLoaded(false);
+      setRolesErr(errText(error));
+      return false;
+    }
+  };
+
+  const reloadTelemetry = async () => {
+    const seq = ++telemetrySeq;
+    try {
+      const stats = await mrmStats();
+      if (seq !== telemetrySeq) return;
       setSlots(parseSlots(stats.describe));
       setHistory(stats.history.slice(0, 10));
       setHealth(stats.health ?? []);
+    } catch (error) {
+      if (seq === telemetrySeq) setActionErr(`刷新 MRM 状态失败：${errText(error)}`);
     }
-    setAccounts(accs);
-    setCat(catalog);
-    setProviders(list);
   };
-  onMount(() => void reload());
 
   const flash = (msg: string) => {
     setSaved(msg);
@@ -86,6 +116,7 @@ export default function RoutingSection() {
   // provider 变更时仅清 account（账号归属 provider，留旧账号会绑错）；fallback 是角色间降级关系，
   // 与 provider 无关，必须保留。想清除的字段显式传 ""（None/缺省在后端是「沿用旧值」语义）。
   const update = async (role: string, patch: Partial<RoleBindingView>) => {
+    if (!rolesLoaded() || savingRole()) return;
     const cur = roles()[role] ?? {
       provider: "anthropic",
       model: "",
@@ -95,18 +126,28 @@ export default function RoutingSection() {
     const next = { ...cur, ...patch };
     if (patch.provider !== undefined && patch.provider !== cur.provider) next.account = null;
     // 输入受控需要即时回显：先落地本地态；非法 model（空/含空白）不下发，行内提示接管
-    setRoles((prev) => ({
-      ...prev,
-      [role]: {
-        provider: next.provider,
-        model: next.model,
-        account: next.account ?? null,
-        fallback: next.fallback ?? null,
-      },
-    }));
+    const normalized = {
+      provider: next.provider,
+      model: next.model,
+      account: next.account ?? null,
+      fallback: next.fallback ?? null,
+    };
+    setRoles((prev) => ({ ...prev, [role]: normalized }));
     if (!next.model.trim() || /\s/.test(next.model)) return;
-    await configSetRole(role, next.provider, next.model, next.fallback ?? "", next.account ?? "");
-    flash(`${ROLE_LABELS[role] ?? role} 已保存并热生效`);
+    setSavingRole(role);
+    setActionErr("");
+    try {
+      await configSetRole(role, next.provider, next.model, next.fallback ?? "", next.account ?? "");
+      flash(`${ROLE_LABELS[role] ?? role} 已保存并热生效`);
+    } catch (error) {
+      // RPC 可能在配置持久化后才失败，先读回权威配置；读回也失败时标记 UNKNOWN 并禁止继续写。
+      if (!(await refreshRoles())) {
+        setRoles((prev) => (prev[role] === normalized ? { ...prev, [role]: cur } : prev));
+      }
+      setActionErr(`${ROLE_LABELS[role] ?? role} 保存失败：${errText(error)}`);
+    } finally {
+      setSavingRole("");
+    }
   };
 
   // a<->b 互指降级会循环空转：提示引导用户自拆环，不硬拦（配置是显式选择，拦截反而挡合法中间态）
@@ -120,7 +161,9 @@ export default function RoutingSection() {
     try {
       const r = await testDispatch(role);
       setTestResult((prev) => ({ ...prev, [role]: r }));
-      await reload();
+      await reloadTelemetry();
+    } catch (error) {
+      setActionErr(`${ROLE_LABELS[role] ?? role} 试派发失败：${errText(error)}`);
     } finally {
       setTesting("");
     }
@@ -137,63 +180,22 @@ export default function RoutingSection() {
       <Show when={saved()}>
         <div class="text-xs text-[var(--ok)]">{saved()}</div>
       </Show>
-
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] px-4 py-3">
-        <div class="text-xs text-[var(--text-faint)] mb-2">并发槽位</div>
-        <div class="space-y-1.5">
-          <For
-            each={slots()}
-            fallback={<div class="text-xs text-[var(--text-faint)]">无运行中派发</div>}
-          >
-            {(s) => (
-              <div class="flex items-center gap-2 text-xs">
-                <span class="w-24 text-[var(--text-dim)]">{s.provider}</span>
-                <span class="ctx-bar flex-1">
-                  <span class="ctx-bar-fill" style={`width:${(s.available / s.limit) * 100}%`} />
-                </span>
-                <span class="tabular-nums text-[var(--text-faint)]">
-                  {s.available}/{s.limit}
-                </span>
-              </div>
-            )}
-          </For>
+      <Show when={rolesErr()}>
+        <div class="text-xs text-[var(--err)]">
+          路由配置读取失败，当前值为 UNKNOWN：{rolesErr()}
+          <button class="ml-2 hover:underline" onClick={() => void reload()}>
+            重试
+          </button>
         </div>
-      </div>
+      </Show>
+      <Show when={sourceWarnings()}>
+        <div class="text-xs text-[var(--warn)]">部分状态加载失败：{sourceWarnings()}</div>
+      </Show>
+      <Show when={actionErr()}>
+        <div class="text-xs text-[var(--err)]">{actionErr()}</div>
+      </Show>
 
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)] px-4 py-3">
-        <div class="text-xs text-[var(--text-faint)] mb-2">Provider 健康与今日预算</div>
-        <div class="space-y-1.5">
-          <For
-            each={health()}
-            fallback={
-              <div class="text-xs text-[var(--text-faint)]">暂无 Provider 用量或熔断记录</div>
-            }
-          >
-            {(item) => (
-              <div class="flex items-center gap-3 text-xs">
-                <span class="w-24 truncate text-[var(--text-dim)]">{item.provider}</span>
-                <span class={item.circuit_open ? "text-[var(--err)]" : "text-[var(--ok)]"}>
-                  {item.circuit_open
-                    ? `熔断 ${item.cooldown_remaining_seconds}s`
-                    : `连续失败 ${item.consecutive_failures}`}
-                </span>
-                <span class="text-[var(--text-faint)] tabular-nums">
-                  今日 {item.today_input + item.today_output} tokens
-                </span>
-                <span class="ml-auto text-[var(--text-faint)] tabular-nums">
-                  {item.estimated_cost_usd == null
-                    ? "金额 UNKNOWN"
-                    : `$${item.estimated_cost_usd.toFixed(4)}${
-                        item.daily_cost_budget_usd == null
-                          ? ""
-                          : ` / $${item.daily_cost_budget_usd.toFixed(4)}`
-                      }`}
-                </span>
-              </div>
-            )}
-          </For>
-        </div>
-      </div>
+      <RoutingTelemetry slots={slots()} health={health()} />
 
       <div class="list-card">
         <For each={Object.keys(ROLE_LABELS)}>
@@ -210,11 +212,12 @@ export default function RoutingSection() {
                   <select
                     class="form-select"
                     value={binding().provider}
+                    disabled={!rolesLoaded() || Boolean(savingRole())}
                     onChange={(e) => {
                       const provider = e.currentTarget.value;
                       void update(role, {
                         provider,
-                        model: binding().model || defaultModelOf(provider),
+                        model: defaultModelOf(provider) || binding().model,
                       });
                     }}
                   >
@@ -224,8 +227,9 @@ export default function RoutingSection() {
                   </select>
                   <select
                     class="form-select"
-                    title="账号：轮转 = 槽满自动换下一个账号"
+                    title="账号：未固定时按默认账号和命名账号选择；凭证不可用或账号 RPM 受限时尝试其他账号"
                     value={binding().account ?? ""}
+                    disabled={!rolesLoaded() || Boolean(savingRole())}
                     onChange={(e) => void update(role, { account: e.currentTarget.value || null })}
                   >
                     <option value="">账号轮转</option>
@@ -238,6 +242,7 @@ export default function RoutingSection() {
                     class="flex-1 bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs font-mono"
                     value={binding().model}
                     placeholder="model id（可下拉搜索）"
+                    disabled={!rolesLoaded() || Boolean(savingRole())}
                     onChange={(e) => {
                       setModelTouched((p) => ({ ...p, [role]: true }));
                       void update(role, { model: e.currentTarget.value });
@@ -254,6 +259,7 @@ export default function RoutingSection() {
                     class="form-select"
                     title="降级目标角色：本角色槽位满时降级到该角色"
                     value={binding().fallback ?? ""}
+                    disabled={!rolesLoaded() || Boolean(savingRole())}
                     onChange={(e) => void update(role, { fallback: e.currentTarget.value || null })}
                   >
                     <option value="">无降级</option>
@@ -286,7 +292,7 @@ export default function RoutingSection() {
                   </Show>
                   <button
                     class="pressable flex items-center gap-1 px-2 py-1 rounded text-2xs border border-[var(--border)]"
-                    disabled={testing() === role}
+                    disabled={!rolesLoaded() || Boolean(testing()) || Boolean(savingRole())}
                     onClick={() => void tryDispatch(role)}
                     title="真实派发一个 PONG 子代理验证路由"
                   >
@@ -310,32 +316,7 @@ export default function RoutingSection() {
         </For>
       </div>
 
-      <div class="rounded-lg border border-[var(--border)] bg-[var(--bg-raised)]">
-        <div class="px-4 py-2 border-b border-[var(--border)] text-xs text-[var(--text-faint)]">
-          最近派发
-        </div>
-        <div class="divide-y divide-[var(--border)]">
-          <For
-            each={history()}
-            fallback={<div class="px-4 py-3 text-xs text-[var(--text-faint)]">暂无派发记录</div>}
-          >
-            {(h) => (
-              <div class="px-4 py-2 flex items-center gap-3 text-xs">
-                <span class="w-20 text-[var(--text-dim)]">{h.role}</span>
-                <span class="font-mono flex-1 truncate">
-                  {h.provider}/{h.model}
-                </span>
-                <Show when={h.degraded_from}>
-                  <span class="text-2xs text-[var(--warn)]">降级</span>
-                </Show>
-                <span class="text-2xs text-[var(--text-faint)] tabular-nums">
-                  {new Date(h.at).toLocaleTimeString("zh-CN", { hour12: false })}
-                </span>
-              </div>
-            )}
-          </For>
-        </div>
-      </div>
+      <RoutingHistory history={history()} />
     </>
   );
 }

@@ -26,8 +26,9 @@ vi.mock("./image-scale", () => ({
 function harness() {
   const chips: Omit<RowChip, "id">[] = [];
   const images = new Map<string, { media_type: string; data: string }>();
-  const api = createAttachments({ images, pushChip: (c) => chips.push(c) });
-  return { chips, images, ...api };
+  let scope = "s1";
+  const api = createAttachments({ images, pushChip: (c) => chips.push(c), scope: () => scope });
+  return { chips, images, setScope: (next: string) => (scope = next), ...api };
 }
 
 afterEach(() => {
@@ -99,5 +100,19 @@ describe("attachFiles 图片失败 err chip", () => {
       media_type: "image/png",
       data: "QUJD",
     });
+  });
+
+  it("图片读取期间切换会话：迟到结果不插入新会话", async () => {
+    let resolve!: (value: string) => void;
+    vi.mocked(fileToImageDataUrl).mockImplementation(
+      () => new Promise<string>((done) => (resolve = done)),
+    );
+    const { chips, images, setScope, attachFiles } = harness();
+    attachFiles([new File([new Uint8Array([1])], "late.png", { type: "image/png" })]);
+    setScope("s2");
+    resolve("data:image/png;base64,TEFURQ==");
+    await Promise.resolve();
+    expect(chips).toEqual([]);
+    expect(images.size).toBe(0);
   });
 });

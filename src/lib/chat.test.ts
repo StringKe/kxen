@@ -124,11 +124,11 @@ describe("chat RPC wrappers", () => {
     ]);
   });
 
-  it("uses safe fallbacks for recovery helpers", async () => {
+  it("propagates authoritative recovery-list failures and keeps running probe tri-state", async () => {
     h.rpc.mockRejectedValueOnce(new Error("approval unavailable"));
-    await expect(approvalPending("s1")).resolves.toEqual([]);
+    await expect(approvalPending("s1")).rejects.toThrow("approval unavailable");
     h.rpc.mockRejectedValueOnce(new Error("pending unavailable"));
-    await expect(sessionPendingList("s1")).resolves.toEqual([]);
+    await expect(sessionPendingList("s1")).rejects.toThrow("pending unavailable");
     h.rpc.mockRejectedValueOnce(new Error("list unavailable"));
     await expect(sessionRunning("s1")).resolves.toBeNull();
 

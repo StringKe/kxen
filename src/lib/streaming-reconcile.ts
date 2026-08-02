@@ -7,6 +7,7 @@
 //   session.update（RunGuard 存亡广播）兜底一轮真源核对收回。
 import { client } from "./client";
 import { sessionRunning } from "./chat";
+import { createSeqGuard } from "./async-guard";
 
 /** RPC 失败（running=null=未知）时的兜底：done 路径持终态帧（帧在 = 本 run 已终）按终态收回；
  *  事件/resync 路径保守保留，等下轮事件/resync 再核。 */
@@ -17,9 +18,11 @@ export function createStreamingReconcile(deps: {
   streamingSid: () => string;
   setStreamingSid: (sid: string) => void;
 }) {
+  const guard = createSeqGuard();
   const reconcile = (sid: string, onUnknown: UnknownPolicy) => {
+    const request = guard.next();
     void sessionRunning(sid).then((running) => {
-      if (deps.activeSessionId() !== sid) return;
+      if (deps.activeSessionId() !== sid || !guard.isCurrent(request)) return;
       if (running === true) {
         if (deps.streamingSid() !== sid) deps.setStreamingSid(sid);
       } else if (running === false || onUnknown === "clear") {

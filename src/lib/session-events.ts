@@ -1,20 +1,35 @@
 import type { Setter } from "solid-js";
 import { applyApprovalEvent, applyApprovalResolved } from "./approvals";
+import type { ModelIdentity } from "./chat";
 import type { ToolEvent } from "./delta";
 import type { Item } from "./items";
 import type { OrbState } from "./orb";
 
 // 流式 delta 合并到尾部 assistant 气泡的纯 reducer（Session 页与测试共用）
-export function appendRawItem(prev: Item[], field: "content" | "reasoning", text: string): Item[] {
+export function appendRawItem(
+  prev: Item[],
+  field: "content" | "reasoning",
+  text: string,
+  model?: ModelIdentity,
+): Item[] {
   const last = prev.at(-1);
-  if (last?.kind === "msg" && last.role === "assistant") {
-    return [...prev.slice(0, -1), { ...last, [field]: (last[field] ?? "") + text }];
+  const sameModel =
+    last?.kind === "msg" &&
+    last.model?.provider === model?.provider &&
+    last.model?.model === model?.model &&
+    (last.model?.account ?? null) === (model?.account ?? null);
+  if (last?.kind === "msg" && last.role === "assistant" && !last.messageId && sameModel) {
+    return [
+      ...prev.slice(0, -1),
+      { ...last, [field]: (last[field] ?? "") + text, ...(model ? { model } : {}) },
+    ];
   }
   const msg = {
     kind: "msg" as const,
     role: "assistant" as const,
     content: field === "content" ? text : "",
     reasoning: field === "reasoning" ? text : undefined,
+    ...(model ? { model } : {}),
   };
   return [...prev, msg];
 }

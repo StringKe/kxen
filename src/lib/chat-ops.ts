@@ -25,9 +25,7 @@ export async function worktreeRemove(
 }
 
 export async function worktreeStatus(path: string): Promise<{ path: string; status: string }[]> {
-  return client
-    .rpc<{ path: string; status: string }[]>("worktree.status", { path })
-    .catch(() => []);
+  return client.rpc<{ path: string; status: string }[]>("worktree.status", { path });
 }
 
 // ---------------- workspace ----------------
@@ -147,7 +145,18 @@ export async function goalFocus(sessionId?: string): Promise<GoalInfo | null> {
 }
 
 export async function goalTransit(id: string, action: GoalAction): Promise<GoalInfo> {
-  return client.rpc<GoalInfo>(`goal.${action}`, { id });
+  switch (action) {
+    case "activate":
+      return client.rpc<GoalInfo>("goal.activate", { id });
+    case "pause":
+      return client.rpc<GoalInfo>("goal.pause", { id });
+    case "resume":
+      return client.rpc<GoalInfo>("goal.resume", { id });
+    case "cancel":
+      return client.rpc<GoalInfo>("goal.cancel", { id });
+    case "adjust":
+      return client.rpc<GoalInfo>("goal.adjust", { id });
+  }
 }
 
 export async function goalCreate(
@@ -173,16 +182,16 @@ export interface TaskInfo {
   tail: string;
 }
 
-export async function taskList(): Promise<TaskInfo[]> {
-  return client.rpc<TaskInfo[]>("task.list");
+export async function taskList(sessionId: string): Promise<TaskInfo[]> {
+  return client.rpc<TaskInfo[]>("task.list", { session_id: sessionId });
 }
 
-export async function taskKill(id: string): Promise<boolean> {
-  return client.rpc<boolean>("task.kill", { id });
+export async function taskKill(id: string, sessionId: string): Promise<boolean> {
+  return client.rpc<boolean>("task.kill", { id, session_id: sessionId });
 }
 
-export async function taskRestart(id: string): Promise<{ task_id: string }> {
-  return client.rpc<{ task_id: string }>("task.restart", { id });
+export async function taskRestart(id: string, sessionId: string): Promise<{ task_id: string }> {
+  return client.rpc<{ task_id: string }>("task.restart", { id, session_id: sessionId });
 }
 
 // ---------------- 事件订阅（goal.update / task.update） ----------------

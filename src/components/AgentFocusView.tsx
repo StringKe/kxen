@@ -61,6 +61,10 @@ export default function AgentFocusView(props: { name: string }) {
     off = onTopic(sid ? ["llm.delta", `session:${sid}`] : ["llm.delta"], (_topic, payload) => {
       const p = payload as TranscriptEntry & { agent?: string; session_id?: string };
       if (p.agent !== props.name || p.session_id !== activeSessionId()) return;
+      // live 帧比先前发起的 snapshot 新，先让旧 snapshot 失效，避免稍后倒灌覆盖。
+      guard.next();
+      setLoadFailed(false);
+      setLoading(false);
       setEntries((prev) => {
         const last = prev.at(-1);
         if ((p.kind === "text" || p.kind === "reasoning") && last?.kind === p.kind) {
@@ -76,9 +80,13 @@ export default function AgentFocusView(props: { name: string }) {
     const id = guard.next();
     agentsTranscript(activeSessionId(), props.name)
       .then((t) => {
-        if (guard.isCurrent(id)) setEntries(mergeDeltas(t));
+        if (!guard.isCurrent(id)) return;
+        setEntries(mergeDeltas(t));
+        setLoadFailed(false);
       })
-      .catch(() => {}); // 失败不清现有转录：等下轮 resync 或手动重试
+      .catch(() => {
+        if (guard.isCurrent(id)) setLoadFailed(true);
+      }); // 失败保留现有转录，但必须显式标记 stale
   });
   onCleanup(() => {
     off?.();
@@ -156,7 +164,7 @@ export default function AgentFocusView(props: { name: string }) {
             class="text-2xs text-[var(--err)] hover:underline"
             onClick={() => setRetryTick((n) => n + 1)}
           >
-            加载失败，点击重试
+            {entries().length > 0 ? "刷新失败，正在显示上次结果，点击重试" : "加载失败，点击重试"}
           </button>
         </Show>
         <Show when={!loadFailed() && loading()}>

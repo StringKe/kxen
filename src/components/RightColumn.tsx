@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Show, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
 import { ChevronRight } from "lucide-solid";
 import { onTopic } from "../lib/chat";
 import { client } from "../lib/client";
@@ -6,6 +6,7 @@ import { agentsTranscript, type TranscriptEntry } from "../lib/team";
 import { statusDot } from "../lib/variants";
 import { kindBadge, statusText, statusTone } from "../lib/agent-display";
 import { formatError } from "../lib/error-text";
+import { createSeqGuard } from "../lib/async-guard";
 import {
   activeAgentFocus,
   activeSessionId,
@@ -24,9 +25,11 @@ export default function RightColumn() {
   return (
     <div class="w-full h-full flex flex-col bg-[var(--bg-raised)]">
       {/* 名单加载失败与真空区分：失败给重试条（3s 轮询仍在跑，成功自动复位） */}
-      <Show when={agents().length === 0 && agentsLoadFailed()}>
+      <Show when={agentsLoadFailed()}>
         <div class="shrink-0 border-b border-[var(--border)] px-3 py-2 flex items-center gap-2">
-          <span class="text-2xs text-[var(--err)]">加载 agent 名单失败</span>
+          <span class="text-2xs text-[var(--err)]">
+            {agents().length > 0 ? "刷新 agent 名单失败，正在显示上次结果" : "加载 agent 名单失败"}
+          </span>
           <button
             class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-2xs text-[var(--text-dim)]"
             onClick={() => void refreshAgents()}
@@ -82,33 +85,50 @@ function AgentPane(props: {
 }) {
   const activity = () => agents().find((a) => a.name === props.name);
   const [preview, setPreview] = createSignal<{ text: string; kind: "text" | "error" | "tool" }>();
+  const [previewErr, setPreviewErr] = createSignal("");
+  const previewGuard = createSeqGuard();
   let off: (() => void) | undefined;
   let current: string | undefined;
 
-  const loadPreview = async () => {
-    const t = await agentsTranscript(activeSessionId(), props.name).catch(
-      () => [] as TranscriptEntry[],
-    );
-    const last = [...t].reverse().find((e) => previewEntry(e));
-    const entry = last && previewEntry(last);
-    if (entry) setPreview({ text: entry.text.slice(-120), kind: entry.kind });
+  const loadPreview = async (sid: string, name: string) => {
+    const request = previewGuard.next();
+    try {
+      const transcript = await agentsTranscript(sid, name);
+      if (!previewGuard.isCurrent(request) || activeSessionId() !== sid || props.name !== name)
+        return;
+      const last = [...transcript].reverse().find((entry) => previewEntry(entry));
+      const entry = last && previewEntry(last);
+      setPreview(entry ? { text: entry.text.slice(-120), kind: entry.kind } : undefined);
+      setPreviewErr("");
+    } catch (error) {
+      if (previewGuard.isCurrent(request) && activeSessionId() === sid && props.name === name) {
+        setPreviewErr(formatError(error));
+      }
+    }
   };
 
-  onMount(() => void loadPreview());
-
   // resync（bus lag / 断线重连）：preview 增量可能有缺口，重拉转录对账（与其它面板一致）
-  const offResync = client.onResync(() => void loadPreview());
+  const offResync = client.onResync(() => void loadPreview(activeSessionId(), props.name));
 
   // 订阅自带 session topic：stream ACL 只把带 session_id 的帧发给 session:<id> 订阅者，
   // 裸订 llm.delta 是靠 Session 常驻订阅隐式放行（Session 一变这里静默断流）。切换会话退旧订新。
   createEffect(() => {
     const sid = activeSessionId();
-    if (sid === current) return;
-    current = sid;
+    const name = props.name;
+    const key = `${sid}\u0000${name}`;
+    if (key === current) return;
+    current = key;
+    previewGuard.next();
+    setPreview(undefined);
+    setPreviewErr("");
     off?.();
+    void loadPreview(sid, name);
     off = onTopic(sid ? ["llm.delta", `session:${sid}`] : ["llm.delta"], (_topic, payload) => {
       const p = payload as TranscriptEntry & { agent?: string; session_id?: string };
       if (p.agent !== props.name || p.session_id !== activeSessionId()) return;
+      // 已收到更新的 live 真值，任何更早发起的 snapshot 都不得倒灌覆盖。
+      previewGuard.next();
+      setPreviewErr("");
       if (p.kind === "text" && p.text) {
         // 流式 text 逐帧追加；前一条是 error/tool 快照时从干净起点续
         setPreview((prev) => ({
@@ -162,6 +182,11 @@ function AgentPane(props: {
               {p().text}
             </div>
           )}
+        </Show>
+        <Show when={previewErr()}>
+          <div class="text-2xs truncate mt-1 text-[var(--err)]" title={previewErr()}>
+            {preview() ? "预览刷新失败，正在显示上次结果" : `预览加载失败：${previewErr()}`}
+          </div>
         </Show>
       </button>
       <AgentRunActionButtons

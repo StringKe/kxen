@@ -52,17 +52,25 @@ export function createAgentDiff(getSessionId: () => string) {
   const [status, setStatus] = createSignal<AgentDiffStatus>({ state: "loading" });
   const seq = createSeqGuard();
   let loaded = false;
+  let scope: string | undefined;
   const reload = async () => {
     const sid = getSessionId();
+    if (sid !== scope) {
+      scope = sid;
+      loaded = false;
+      seq.next();
+      setStatus({ state: "loading" });
+    }
     if (!sid) {
       setStatus({ state: "ok", entries: [] });
+      loaded = true;
       return;
     }
     if (!loaded) setStatus({ state: "loading" });
     const id = seq.next();
     const next = await fetchAgentDiffStatus(sid);
     // 轮询与手动重试可能并发：慢响应不得覆盖新帧
-    if (!seq.isCurrent(id)) return;
+    if (!seq.isCurrent(id) || getSessionId() !== sid) return;
     loaded = true;
     setStatus(next);
   };

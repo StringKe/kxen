@@ -8,11 +8,17 @@ import { formatError } from "./error-text";
 
 /** 弹出原生目录选择器，选中则添加并切入该目录。返回是否成功切入（取消/失败均 false，失败已 flash）。 */
 export async function openProjectDir(): Promise<boolean> {
-  const selected = await openDialog({
-    directory: true,
-    multiple: false,
-    title: "选择项目目录",
-  }).catch(() => null);
+  let selected: string | string[] | null;
+  try {
+    selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "选择项目目录",
+    });
+  } catch (error) {
+    flashErr(`打开目录选择器失败：${formatError(error)}`);
+    return false;
+  }
   if (typeof selected !== "string" || !selected) return false;
   try {
     await workspaceAdd(selected);

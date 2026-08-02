@@ -9,7 +9,7 @@ export const GUIDES: Record<string, string[]> = {
   xai: ["1. 终端运行 `grok` 触发登录刷新", "2. 点「重新导入」"],
   "kimi-for-coding": ["1. 终端运行 `kimi` 触发凭证刷新", "2. 点「重新导入」"],
   openrouter: [
-    "1. 到 openrouter.ai/keys 创建 API Key",
+    "1. 到 https://openrouter.ai/keys 创建 API Key",
     "2. 点「添加账号」选 openrouter 粘贴（kind 选 apikey）",
   ],
   ollama: [

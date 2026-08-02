@@ -1,7 +1,7 @@
 // MicMenu 实测：unconfigured/unavailable 禁用态与原因、pick 成功才切换、失败报错、空列表空态。
 import { render } from "solid-js/web";
 import "../../styles.css";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { userEvent } from "@vitest/browser/context";
 import MicMenu from "./MicMenu";
 
@@ -11,15 +11,11 @@ const voiceMock = vi.hoisted(() => ({
     { id: "openai", label: "OpenAI", status: "unconfigured", detail: "未配置 OPENAI_API_KEY" },
     { id: "groq", label: "Groq", status: "unavailable", detail: "服务不可达" },
   ],
+  voiceEngines: vi.fn(),
   setVoiceEngine: vi.fn((_id: string, _fb: string[]) => Promise.resolve()),
 }));
 vi.mock("../../lib/voice", () => ({
-  voiceEngines: async () => ({
-    engine: "apple",
-    fallback: [],
-    locale: "zh-CN",
-    engines: voiceMock.engines,
-  }),
+  voiceEngines: () => voiceMock.voiceEngines(),
   setVoiceEngine: voiceMock.setVoiceEngine,
 }));
 
@@ -29,10 +25,20 @@ vi.mock("../../lib/flash", () => flashMock);
 const ENGINES_BACKUP = structuredClone(voiceMock.engines);
 const disposers: Array<() => void> = [];
 
+beforeEach(() => {
+  voiceMock.voiceEngines.mockImplementation(async () => ({
+    engine: "apple",
+    fallback: [],
+    locale: "zh-CN",
+    engines: voiceMock.engines,
+  }));
+});
+
 afterEach(() => {
   for (const d of disposers.splice(0)) d();
   voiceMock.engines = structuredClone(ENGINES_BACKUP);
   voiceMock.setVoiceEngine.mockClear();
+  voiceMock.voiceEngines.mockReset();
   flashMock.flashErr.mockClear();
   document.body.innerHTML = "";
 });
@@ -87,6 +93,23 @@ describe("MicMenu (webkit)", () => {
     voiceMock.engines = [];
     await openMenu();
     expect(document.querySelector(".composer-popup")!.textContent).toContain("无可用语音引擎");
+  });
+
+  it("首载失败显示 UNKNOWN 和重试，不误报为无可用引擎", async () => {
+    voiceMock.voiceEngines.mockRejectedValueOnce(new Error("voice offline"));
+    await openMenu();
+    expect(document.querySelector(".composer-popup")!.textContent).toContain(
+      "加载语音引擎失败：voice offline",
+    );
+    expect(document.querySelector(".composer-popup")!.textContent).not.toContain("无可用语音引擎");
+
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试",
+    );
+    await userEvent.click(retry!);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(document.querySelector(".composer-popup")!.textContent).toContain("Apple 本地");
+    expect(document.querySelector(".composer-popup")!.textContent).not.toContain("voice offline");
   });
 
   it("右下角打开时完整留在 1280×800 viewport 内", async () => {

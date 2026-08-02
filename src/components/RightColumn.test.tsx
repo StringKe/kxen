@@ -54,6 +54,12 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 const emit = (payload: unknown) => mocks.handler?.("", payload);
 const previewEl = () => document.querySelector(".font-mono") as HTMLElement | null;
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => (resolve = res));
+  return { promise, resolve };
+}
+
 beforeEach(() => {
   mocks.transcript.mockReset().mockResolvedValue([]);
   mocks.stop.mockReset().mockResolvedValue(true);
@@ -108,6 +114,47 @@ describe("RightColumn 概览卡", () => {
     dispose();
   });
 
+  it("首载失败不伪装成无 preview，resync 失败保留 last-good 并在恢复后清除告警", async () => {
+    mocks.transcript.mockRejectedValueOnce(new Error("transcript offline"));
+    setAgents([run("w", "working")]);
+    const dispose = render(() => <RightColumn />, document.body);
+    await tick();
+    expect(document.body.textContent).toContain("预览加载失败：transcript offline");
+
+    mocks.transcript.mockResolvedValueOnce([{ kind: "text", text: "last-good" }]);
+    fireResync();
+    await tick();
+    expect(previewEl()?.textContent).toBe("last-good");
+    expect(document.body.textContent).not.toContain("预览加载失败");
+
+    mocks.transcript.mockRejectedValueOnce(new Error("resync timeout"));
+    fireResync();
+    await tick();
+    expect(previewEl()?.textContent).toBe("last-good");
+    expect(document.body.textContent).toContain("预览刷新失败，正在显示上次结果");
+
+    mocks.transcript.mockResolvedValueOnce([{ kind: "text", text: "recovered" }]);
+    fireResync();
+    await tick();
+    expect(previewEl()?.textContent).toBe("recovered");
+    expect(document.body.textContent).not.toContain("预览刷新失败");
+    dispose();
+  });
+
+  it("live 帧使更早发起的 snapshot 失效，慢响应不得倒灌覆盖", async () => {
+    const snapshot = deferred<TranscriptEntry[]>();
+    mocks.transcript.mockReturnValueOnce(snapshot.promise);
+    setAgents([run("w", "working")]);
+    const dispose = render(() => <RightColumn />, document.body);
+    await tick();
+    emit({ agent: "w", session_id: "s1", kind: "text", text: "live-new" });
+    expect(previewEl()?.textContent).toBe("live-new");
+    snapshot.resolve([{ kind: "text", text: "snapshot-old" }]);
+    await tick();
+    expect(previewEl()?.textContent).toBe("live-new");
+    dispose();
+  });
+
   it("live：text 追加 / tool 替换 / error 红字替换，他 agent 他会话帧忽略", async () => {
     setAgents([run("w", "working")]);
     const dispose = render(() => <RightColumn />, document.body);
@@ -152,7 +199,7 @@ describe("RightColumn 名单加载失败", () => {
     dispose();
   });
 
-  it("失败保留旧名单时不出重试条（有数据可看，轮询自愈）", async () => {
+  it("失败保留旧名单并显式标记 stale，可手动重试自愈", async () => {
     mocks.list.mockResolvedValue([run("w", "working")]);
     await refreshAgents();
     mocks.list.mockRejectedValue(new Error("ws down"));
@@ -161,7 +208,14 @@ describe("RightColumn 名单加载失败", () => {
     const dispose = render(() => <RightColumn />, document.body);
     await tick();
     expect(document.body.textContent).toContain("w"); // 旧名单不被失败抹掉
-    expect(document.body.textContent).not.toContain("加载 agent 名单失败");
+    expect(document.body.textContent).toContain("刷新 agent 名单失败，正在显示上次结果");
+    mocks.list.mockResolvedValue([run("w", "done")]);
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试",
+    );
+    retry?.click();
+    await tick();
+    expect(document.body.textContent).not.toContain("刷新 agent 名单失败");
     dispose();
   });
 });

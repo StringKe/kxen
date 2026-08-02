@@ -16,7 +16,10 @@ vi.mock("./chat", () => ({
 }));
 vi.mock("./client", () => ({ client: { rpc: mocks.rpc } }));
 vi.mock("./team", () => ({ agentsList: mocks.agentsList }));
-vi.mock("./session-model", () => ({ applyDraftModel: vi.fn(() => Promise.resolve()) }));
+vi.mock("./session-model", () => ({
+  applyDraftModel: vi.fn(() => Promise.resolve()),
+  resetDraftModel: vi.fn(),
+}));
 vi.mock("./drafts", () => ({ migrateNewDraft: vi.fn() }));
 
 import { mountShortcuts } from "./shortcuts";

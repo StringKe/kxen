@@ -1,6 +1,4 @@
-// 添加账号面板：三类入口（订阅 OAuth / API Key / 自定义类型提供商），先选型再填字段。
-// provider 与区域下拉来自后端 provider.list（registry 是唯一真相源，前端不硬编码）。
-// 表单状态在 add-account-form.ts（模块级）：切设置分区卸载面板不清空半填表单。
+// 添加账号面板：registry 驱动三类入口；表单状态在 add-account-form.ts，卸载不清半填内容。
 import { createSignal, For, onMount, Show } from "solid-js";
 import {
   addCustomProvider,
@@ -12,6 +10,8 @@ import {
 import { flashErr } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
 import { errText } from "../err-text";
+import { createSeqGuard } from "../../lib/async-guard";
+import ProviderRegistryStatus from "./ProviderRegistryStatus";
 import {
   ACCOUNT_NAME_BAD,
   baseUrl,
@@ -52,33 +52,44 @@ const KINDS: { id: AccountKind; label: string; detail: string }[] = [
 ];
 
 const CAPS = ["text", "vision", "audio"];
-
 export default function AddAccountPanel(props: { onDone: (msg: string) => void }) {
   const [providers, setProviders] = createSignal<ProviderInfo[]>([]);
+  const [providerLoaded, setProviderLoaded] = createSignal(false);
+  const [providerError, setProviderError] = createSignal("");
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [testing, setTesting] = createSignal(false);
   const [testMsg, setTestMsg] = createSignal<{ ok: boolean; text: string } | null>(null);
+  const providerGuard = createSeqGuard();
 
-  // tab 过滤 provider 清单：oauth tab 只列订阅厂商，apikey tab 只列官方平台 key 厂商；
-  // local_free（ollama）无凭证概念，两个 tab 都不列
+  // oauth/api key 分别只列对应厂商；local_free 无凭证概念，不进入账号面板。
   const visible = () =>
     providers().filter((p) => (kind() === "oauth" ? p.auth === "oauth" : p.auth === "api_key"));
 
-  onMount(async () => {
-    const list = await providerList().catch((e: unknown) => {
-      flashErr(`加载 provider 清单失败：${errText(e)}`);
-      return [] as ProviderInfo[];
-    });
-    setProviders(list);
-    if (kind() !== "custom" && !visible().some((p) => p.key === provider())) {
-      setProvider(visible()[0]?.key ?? "");
+  const loadProviders = async () => {
+    const request = providerGuard.next();
+    try {
+      const list = await providerList();
+      if (!providerGuard.isCurrent(request)) return;
+      setProviders(list);
+      setProviderError("");
+      setProviderLoaded(true);
+      if (kind() !== "custom" && !visible().some((p) => p.key === provider())) {
+        setProvider(visible()[0]?.key ?? "");
+      }
+    } catch (error) {
+      if (!providerGuard.isCurrent(request)) return;
+      const message = errText(error);
+      setProviderError(message);
+      setProviderLoaded(true);
+      flashErr(`加载 provider 清单失败：${message}`);
     }
-  });
+  };
+  onMount(() => void loadProviders());
 
   const spec = () => providers().find((p) => p.key === provider());
   const regions = () => spec()?.regions ?? [];
-  // 多区域厂商才带 region；单区域/空选择交给后端缺省
+  const providerReady = () => kind() === "custom" || (providerLoaded() && visible().length > 0);
   const chosenRegion = () => (regions().length > 1 && region() ? region() : undefined);
 
   const toggleCap = (c: string) =>
@@ -96,8 +107,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
     return true;
   };
 
-  // 保存前的连接实测：复用 provider.verify 链路（候选凭证只进后端内存克隆，不落 auth.json）。
-  // custom 无此按钮：自定义端点要 config.toml 落盘后才能解析，保存后用列表行内「实测」验证。
+  // 候选凭证仅进后端内存克隆；custom 要落盘后再从列表实测。
   const testConn = async () => {
     const { access, refresh, expires } = parseAccountToken(kind(), token());
     if (!access) {
@@ -205,6 +215,12 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
       <div class="text-2xs text-[var(--text-faint)]">
         {KINDS.find((k) => k.id === kind())?.detail}
       </div>
+      <ProviderRegistryStatus
+        loaded={providerLoaded()}
+        error={providerError()}
+        stale={providers().length > 0}
+        onRetry={() => void loadProviders()}
+      />
 
       <Show when={kind() !== "custom"}>
         <div class="flex gap-2">
@@ -313,7 +329,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
       <div class="flex gap-2">
         <button
           class="pressable px-3 py-1 rounded-md text-xs border border-[var(--border)] disabled:opacity-40"
-          disabled={busy() || testing()}
+          disabled={busy() || testing() || !providerReady()}
           onClick={() => void submit()}
         >
           {busy() ? "保存中…" : "保存"}
@@ -321,7 +337,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
         <Show when={kind() !== "custom"}>
           <button
             class="pressable px-3 py-1 rounded-md text-xs border border-[var(--border)] disabled:opacity-40"
-            disabled={busy() || testing()}
+            disabled={busy() || testing() || !providerReady()}
             title="用候选凭证发一次真实最小调用（不保存凭证）"
             onClick={() => void testConn()}
           >

@@ -48,9 +48,9 @@ describe("RPC wrappers", () => {
     await chatOps.goalFocus();
     await chatOps.goalFocus("s1");
     await chatOps.goalTransit("g1", "adjust");
-    await chatOps.taskList();
-    await chatOps.taskKill("t1");
-    await chatOps.taskRestart("t1");
+    await chatOps.taskList("s1");
+    await chatOps.taskKill("t1", "s1");
+    await chatOps.taskRestart("t1", "s1");
 
     const handler = vi.fn();
     const off = vi.fn();
@@ -79,11 +79,14 @@ describe("RPC wrappers", () => {
     expect(h.rpc).toHaveBeenCalledWith("goal.focus", {});
     expect(h.rpc).toHaveBeenCalledWith("goal.focus", { session_id: "s1" });
     expect(h.rpc).toHaveBeenCalledWith("goal.adjust", { id: "g1" });
+    expect(h.rpc).toHaveBeenCalledWith("task.list", { session_id: "s1" });
+    expect(h.rpc).toHaveBeenCalledWith("task.kill", { id: "t1", session_id: "s1" });
+    expect(h.rpc).toHaveBeenCalledWith("task.restart", { id: "t1", session_id: "s1" });
   });
 
-  it("diff 降级路径返回稳定空值", async () => {
+  it("worktree status 失败向调用方暴露，不伪装成 clean", async () => {
     h.fail.add("worktree.status");
-    expect(await chatOps.worktreeStatus("/repo")).toEqual([]);
+    await expect(chatOps.worktreeStatus("/repo")).rejects.toThrow("worktree.status failed");
   });
 
   it("provider wrappers 覆盖可选账号、候选凭证和 region", async () => {

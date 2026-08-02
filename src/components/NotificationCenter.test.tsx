@@ -77,6 +77,22 @@ describe("NotificationCenter topic 订阅", () => {
       vi.useRealTimers();
     }
   });
+
+  it("在途旧 list 快照不会抹掉更晚到达的 notification 事件", async () => {
+    let resolveList!: (value: unknown[]) => void;
+    h.rpc.mockImplementation((method: string) =>
+      method === "notifications.list"
+        ? new Promise<unknown[]>((resolve) => (resolveList = resolve))
+        : Promise.resolve([]),
+    );
+    const dispose = render(() => <NotificationCenter />, document.body);
+    await Promise.resolve();
+    for (const cb of h.notice) cb({ text: "新通知" });
+    resolveList([]);
+    await Promise.resolve();
+    expect(document.querySelector('button[title="通知中心"]')?.textContent).toContain("1");
+    dispose();
+  });
 });
 
 describe("NotificationCenter 轮询生命周期", () => {

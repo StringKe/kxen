@@ -12,7 +12,7 @@ import {
   type WorktreeInfo,
 } from "../lib/chat";
 import { newSession } from "../lib/state";
-import { createAction } from "../lib/async-guard";
+import { createAction, createSeqGuard } from "../lib/async-guard";
 import { flashErr, flashOk } from "../lib/flash";
 import EmptyLine from "./EmptyLine";
 import { errText } from "./err-text";
@@ -45,23 +45,30 @@ export default function DockWorktree() {
   const [loadFailed, setLoadFailed] = createSignal(false);
   const removeAction = createAction();
   const switchAction = createAction();
+  const reloadGuard = createSeqGuard();
 
   const reload = async () => {
+    const request = reloadGuard.next();
     const [list, sl] = await Promise.all([
       worktreeList().catch(() => null),
       statusline("").catch(() => null),
     ]);
-    if (sl) setActive(sl.workdir);
-    if (!list) {
+    if (!reloadGuard.isCurrent(request)) return;
+    if (!list || !sl) {
       setLoadFailed(true); // 失败保留旧数据，不伪装真空
       return;
     }
+    setActive(sl.workdir);
+    const rows = await Promise.all(
+      list.map(async (t) => ({ ...t, dirty: (await worktreeStatus(t.path)).length })),
+    ).catch(() => null);
+    if (!reloadGuard.isCurrent(request)) return;
+    if (!rows) {
+      setLoadFailed(true);
+      return;
+    }
     setLoadFailed(false);
-    setTrees(
-      await Promise.all(
-        list.map(async (t) => ({ ...t, dirty: (await worktreeStatus(t.path)).length })),
-      ),
-    );
+    setTrees(rows);
   };
   // 脏计数随 agent 跑工具/外部 git 操作变化：onMount 单拉会定格，5s 轮询自愈
   let timer: ReturnType<typeof setInterval> | undefined;

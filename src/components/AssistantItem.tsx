@@ -7,6 +7,7 @@ import { writeClipboard } from "../lib/clipboard";
 import { formatError } from "../lib/error-text";
 import type { MsgItem } from "../lib/items";
 import type { RunStats } from "../lib/chat";
+import { hasUnknownUsage, usageUnknownDetail } from "../lib/usage";
 
 const TERMINAL_RE = /^\((已达最大轮次|错误|run 异常|已中断)/;
 
@@ -18,12 +19,16 @@ export default function AssistantItem(props: {
   item: MsgItem;
   streaming: () => boolean;
   live: () => boolean;
-  modelLabel: () => string;
   onFork: () => void;
   onRerun: () => void;
   onContinue: () => void;
   onRewind: () => void;
 }) {
+  const modelLabel = () => {
+    const model = props.item.model;
+    return model ? `${model.provider}/${model.model}` : "";
+  };
+  const statsUsageUnknown = () => hasUnknownUsage(props.item.stats);
   return (
     <div
       class="group relative text-sm"
@@ -76,17 +81,30 @@ export default function AssistantItem(props: {
       >
         <Markdown text={props.item.content} />
       </Show>
-      <Show when={props.item.stats}>
-        {(stats: () => RunStats) => (
-          <div class="text-2xs text-[var(--text-faint)] mt-1.5 tabular-nums">
-            <Show when={props.modelLabel()}>
-              <span class="text-[var(--text-dim)]">{props.modelLabel()}</span> ·{" "}
-            </Show>
-            in {stats().input_tokens} / out {stats().output_tokens} · TTFT{" "}
-            {(stats().ttft_ms / 1000).toFixed(1)}s · {(stats().duration_ms / 1000).toFixed(1)}s ·{" "}
-            {stats().tokens_per_sec} tok/s
-          </div>
-        )}
+      <Show when={modelLabel() || props.item.stats}>
+        <div class="text-2xs text-[var(--text-faint)] mt-1.5 tabular-nums">
+          <Show when={modelLabel()}>
+            <span class="text-[var(--text-dim)]">{modelLabel()}</span>
+          </Show>
+          <Show when={props.item.stats}>
+            {(stats: () => RunStats) => (
+              <>
+                <Show when={modelLabel()}> · </Show>
+                in {statsUsageUnknown() ? "≥" : ""}
+                {stats().input_tokens} / out {statsUsageUnknown() ? "≥" : ""}
+                {stats().output_tokens}
+                <Show when={statsUsageUnknown()}>
+                  <span class="text-[var(--warn)]" title={usageUnknownDetail(stats())}>
+                    {" "}
+                    · UNKNOWN
+                  </span>
+                </Show>{" "}
+                · TTFT {(stats().ttft_ms / 1000).toFixed(1)}s ·{" "}
+                {(stats().duration_ms / 1000).toFixed(1)}s · {stats().tokens_per_sec} tok/s
+              </>
+            )}
+          </Show>
+        </div>
       </Show>
       <Show when={props.item.error}>
         {(err) => <div class="text-xs text-[var(--err)] mt-1.5">{formatError(err())}</div>}

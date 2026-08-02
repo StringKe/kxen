@@ -48,6 +48,42 @@ afterEach(() => {
 });
 
 describe("ScheduleSection 展示", () => {
+  it("首载 pending、失败与真空互斥，重试成功后清除错误", async () => {
+    let reject!: (error: unknown) => void;
+    h.list.mockReturnValueOnce(new Promise<ScheduleJob[]>((_resolve, rej) => (reject = rej)));
+    const dispose = render(() => <ScheduleSection />, document.body);
+    expect(document.body.textContent).toContain("加载中…");
+    expect(document.body.textContent).not.toContain("暂无定时任务");
+    reject(new Error("scheduler offline"));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("加载定时任务失败"));
+    expect(document.body.textContent).toContain("scheduler offline");
+    expect(document.body.textContent).not.toContain("暂无定时任务");
+
+    h.list.mockResolvedValueOnce([]);
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无定时任务"));
+    expect(document.body.textContent).not.toContain("加载定时任务失败");
+    dispose();
+  });
+
+  it("成功后刷新失败保留 last-good 并标记 stale，恢复后清除", async () => {
+    const job = JOB({});
+    h.list.mockResolvedValueOnce([job]);
+    const dispose = render(() => <ScheduleSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain(job.prompt));
+
+    h.list.mockRejectedValueOnce(new Error("refresh timeout"));
+    btnByText("暂停").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("刷新定时任务失败"));
+    expect(document.body.textContent).toContain(job.prompt);
+
+    h.list.mockResolvedValueOnce([]);
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无定时任务"));
+    expect(document.body.textContent).not.toContain("刷新定时任务失败");
+    dispose();
+  });
+
   it("启用 job 显示下次；暂停 job 不显示下次", async () => {
     h.list.mockResolvedValue([JOB({}), JOB({ id: "j2", enabled: false })]);
     const dispose = render(() => <ScheduleSection />, document.body);

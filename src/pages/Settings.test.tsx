@@ -39,6 +39,7 @@ function btnByText(text: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  h.cfg.mockReset();
   h.cfg.mockResolvedValue({ roles: {}, send_when_running: "queue" });
   h.rpc.mockReset();
   h.rpc.mockResolvedValue({});
@@ -51,6 +52,20 @@ afterEach(() => {
 });
 
 describe("Settings 运行中发送", () => {
+  it("配置读取失败：显示 UNKNOWN，禁止提交默认值", async () => {
+    h.cfg.mockRejectedValue(new Error("config unavailable"));
+    const dispose = render(() => <Settings />, document.body);
+
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("配置读取失败，当前值为 UNKNOWN");
+      expect(document.body.textContent).toContain("config unavailable");
+    });
+    expect(btnByText("排队").disabled).toBe(true);
+    expect(btnByText("打断").disabled).toBe(true);
+    expect(h.rpc).not.toHaveBeenCalledWith("config.set_send_policy", expect.anything());
+    dispose();
+  });
+
   it("RPC 失败：回滚到旧策略并 flashErr，不留假状态", async () => {
     h.rpc.mockImplementation((method: string) =>
       method === "config.set_send_policy"
@@ -109,14 +124,13 @@ describe("Settings 首次运行检查", () => {
       return Promise.resolve({});
     });
     const dispose = render(() => <Settings />, document.body);
-    await vi.waitFor(() =>
-      expect(document.body.textContent).toContain("至少一个角色路由落到可用 Provider"),
-    );
-    const label = [...document.body.querySelectorAll("span")].find(
-      (el) => el.textContent === "至少一个角色路由落到可用 Provider",
-    );
-    const row = label?.parentElement;
-    expect(row?.textContent).toContain("需要处理");
+    await vi.waitFor(() => {
+      const label = [...document.body.querySelectorAll("span")].find(
+        (el) => el.textContent === "至少一个角色路由落到可用 Provider",
+      );
+      const row = label?.parentElement;
+      expect(row?.textContent).toContain("需要处理");
+    });
     dispose();
   });
 
@@ -157,6 +171,59 @@ describe("Settings 首次运行检查", () => {
 });
 
 describe("Settings 实验能力与诊断导出", () => {
+  it("实验配置 RPC 部分成功：重新读取权威配置，不盲目回滚", async () => {
+    h.cfg
+      .mockResolvedValueOnce({
+        roles: {},
+        send_when_running: "queue",
+        experimental: {
+          automatic_knowledge_distillation: false,
+          browser_automation: false,
+          remote_mcp: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        roles: {},
+        send_when_running: "queue",
+        experimental: {
+          automatic_knowledge_distillation: false,
+          browser_automation: false,
+          remote_mcp: true,
+        },
+      });
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "config.set_experimental") {
+        return Promise.reject(new Error("runtime reload failed"));
+      }
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <Settings />, document.body);
+    btnByText("高级").click();
+    await vi.waitFor(() => {
+      const toggles = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
+        (button) => button.textContent === "已关闭",
+      );
+      expect(toggles).toHaveLength(3);
+      expect(toggles.every((button) => !button.disabled)).toBe(true);
+    });
+
+    const remoteToggle = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
+      (button) => button.textContent === "已关闭",
+    )[2];
+    if (!remoteToggle) throw new Error("remote MCP toggle not found");
+    remoteToggle.click();
+
+    await vi.waitFor(() => {
+      expect(h.cfg).toHaveBeenCalledTimes(2);
+      expect(remoteToggle.textContent).toBe("已启用");
+      expect(remoteToggle.disabled).toBe(false);
+    });
+    expect(flash.msgs().some((message) => message.text.includes("runtime reload failed"))).toBe(
+      true,
+    );
+    dispose();
+  });
+
   it("展示实际蒸馏模型，启用实验能力并成功导出诊断", async () => {
     h.cfg.mockResolvedValue({
       roles: {},
@@ -184,7 +251,7 @@ describe("Settings 实验能力与诊断导出", () => {
       (button) => button.textContent === "已关闭",
     );
     expect(toggles).toHaveLength(3);
-    toggles[0].click();
+    toggles[0]!.click();
     await vi.waitFor(() =>
       expect(h.rpc).toHaveBeenCalledWith("config.set_experimental", {
         key: "automatic_knowledge_distillation",
@@ -229,7 +296,7 @@ describe("Settings 实验能力与诊断导出", () => {
     const enabled = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
       (button) => button.textContent === "已启用",
     );
-    enabled[1].click();
+    enabled[1]!.click();
     await vi.waitFor(() =>
       expect(flash.msgs().some((message) => message.text.includes("read only"))).toBe(true),
     );
