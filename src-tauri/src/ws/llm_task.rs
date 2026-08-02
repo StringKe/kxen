@@ -21,6 +21,15 @@ pub(crate) async fn run_llm(
     let state = app.state::<Arc<AppState>>();
     let sessions_dir = kxen_app::core::paths::sessions_dir();
 
+    // P1-3 竞态收口：首个 await 前原子占位。抢不到 = 另一 run 已在场（双击/kick 并发），
+    // 按 queue 语义让位（消息入队 / delivery 释放），绝不并发双 run 交叉写历史。
+    let Some(cancel) = super::run_slot::claim_run(&state.active_runs, &session_id) else {
+        super::run_slot::concede(&state, &session_id, &stream_id, text, context, images, queue_delivery_id.as_deref());
+        return;
+    };
+    // 占位守卫：本函数任何早退路径（meta 缺失 / runtime 失败 / 特殊命令短路）经 Drop 释放槽位
+    let _run_slot = super::run_slot::RunSlot { state: state.inner().clone(), session_id: session_id.clone(), cancel: cancel.clone() };
+
     // cron 触发的 run：消息前缀 [cron <id>]（main.rs tick 注入格式），run 结束回写 job 执行历史
     let cron_job_id = text.strip_prefix("[cron ").and_then(|rest| rest.split(']').next()).map(str::to_string);
 
@@ -202,10 +211,7 @@ pub(crate) async fn run_llm(
     let stream_id_event = stream_id.clone();
     let sessions_dir_event = sessions_dir.clone();
 
-    // 取消令牌：注册到 active_runs，run 结束移除（session.abort 可达）
-    let cancel = kxen_app::agent::cancel::CancelToken::new();
-    kxen_app::core::shared::lock(&state.active_runs).insert(session_id.clone(), cancel.clone());
-
+    // 取消令牌已在入口原子占位注册（run_slot::claim_run），run 结束由 RunSlot / finalize 摘除
     // 后台 agent 完成通知路由：run 存活期由 run loop 逐轮 drain 注入 messages；
     // run 收尾 close 后（含 run 结束后才完成的派发）通知直投 pending queue，由队列续跑消化
     let notify = std::sync::Arc::new(kxen_app::agent::background::NotifyRouter::new());
@@ -315,7 +321,6 @@ pub(crate) async fn run_llm(
 }
 
 pub(super) fn finish_direct(state: &Arc<AppState>, session_id: &str, stream_id: &str, terminal: kxen_app::agent::agent_loop::AgentEvent) {
-    kxen_app::core::shared::lock(&state.run_streams).remove(stream_id);
     super::run_finalize::publish_terminal(&state.bus, session_id, stream_id, &terminal);
 }
 

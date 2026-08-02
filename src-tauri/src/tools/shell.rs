@@ -43,7 +43,20 @@ fn path_setup(kind: ShellKind) -> &'static str {
 }
 
 /// rm -> trash 遮蔽（grok-build marker 门控模式）：过滤 rm 的 flags，文件列表进回收站。
+/// 探测到 /usr/bin/trash 缺失时遮蔽仍生效但只报明确错误并拒绝执行：
+/// fail-closed，宁可 rm 不可用也绝不放行真 rm（与 delete 工具同一口径，见 fs_tool::TRASH_MISSING）。
 fn trash_shadow(kind: ShellKind) -> String {
+    trash_shadow_for(kind, crate::tools::fs_tool::trash_available())
+}
+
+fn trash_shadow_for(kind: ShellKind, available: bool) -> String {
+    if !available {
+        let msg = crate::tools::fs_tool::TRASH_MISSING;
+        return match kind {
+            ShellKind::Fish => format!("function rm; echo '{msg}' >&2; return 1; end"),
+            _ => format!("rm() {{ echo '{msg}' >&2; return 1; }}"),
+        };
+    }
     match kind {
         ShellKind::Fish => "function rm; for a in $argv; switch $a; case '-*'; ; case '*'; command trash $a; end; end; end".into(),
         _ => "rm() { local args=(); for a in \"$@\"; do case \"$a\" in -*) ;; *) args+=(\"$a\");; esac; done; command trash \"${args[@]}\"; }".into(),
@@ -85,6 +98,23 @@ mod tests {
         let wrapped = wrap_command(ShellKind::Zsh, "/tmp", "type grep >/dev/null; type find >/dev/null");
         let out = std::process::Command::new(&wrapped[0]).args(&wrapped[1..]).output().expect("run zsh");
         assert!(out.status.success(), "shadow script 语法错误: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn trash_shadow_missing_is_fail_closed() {
+        for kind in [ShellKind::Zsh, ShellKind::Fish] {
+            let shadow = trash_shadow_for(kind, false);
+            assert!(shadow.contains("/usr/bin/trash"), "缺失分支必须给出指明原因的错误文案");
+            assert!(!shadow.contains("command trash"), "缺失分支不得再调用不存在的 trash");
+        }
+        // zsh 缺失分支实跑：rm 被拒、错误进 stderr、无语法错误
+        let shadow = trash_shadow_for(ShellKind::Zsh, false);
+        let out = std::process::Command::new("/bin/zsh")
+            .args(["-c", &format!("{shadow}\nrm /tmp/kxen-should-not-delete")])
+            .output()
+            .expect("run zsh");
+        assert!(!out.status.success(), "trash 缺失时 rm 必须失败而不是静默放行");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("/usr/bin/trash"));
     }
 
     #[test]

@@ -34,23 +34,32 @@ pub async fn create(repo: &Path, name: &str) -> Result<WorktreeInfo, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    git(repo, &["worktree", "add", &path.to_string_lossy(), "-b", &branch]).await?;
+    // 残留同名分支（上次 remove 保留分支后重建同名 worktree）：复用该分支，不带 -b
+    let branch_exists = git(repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).await.is_ok();
+    if branch_exists {
+        git(repo, &["worktree", "add", &path.to_string_lossy(), &branch]).await?;
+    } else {
+        git(repo, &["worktree", "add", &path.to_string_lossy(), "-b", &branch]).await?;
+    }
     Ok(WorktreeInfo { name: name.into(), path, branch })
 }
 
 /// 移除 worktree（分支默认保留，用户自行 merge/diff 后处理）。
 /// 无审批通道的旧入口：dirty 或 delete_branch 一律拒绝，clean 且保留分支才放行。
 pub async fn remove(repo: &Path, name: &str, delete_branch: bool) -> Result<(), String> {
-    remove_with_approval(repo, name, delete_branch, None).await
+    remove_with_approval(repo, name, delete_branch, None, false).await
 }
 
 /// 移除 worktree（审批门变体）：dirty（有改动可丢）或 delete_branch（删分支不可逆）时，
 /// 有审批通道则挂起等用户决定；无通道拒绝。
+/// confirmed 仅用于前端 RPC 路径：行内确认条已显式确认，再挂审批会向主会话时间线推一张
+/// 无 session 归属的第二张卡（双确认，漏看即 300s 超时）。agent 工具路径一律 confirmed=false。
 pub async fn remove_with_approval(
     repo: &Path,
     name: &str,
     delete_branch: bool,
     approval: Option<&crate::tools::exec::ApprovalCtx<'_>>,
+    confirmed: bool,
 ) -> Result<(), String> {
     let repo = &canon(repo);
     validate_name(name)?;
@@ -61,7 +70,7 @@ pub async fn remove_with_approval(
         if path.exists() { git(&path, &["status", "--porcelain"]).await?.lines().filter(|l| !l.trim().is_empty()).count() } else { 0 };
     let dirty = dirty_count > 0;
 
-    if dirty || delete_branch {
+    if (dirty || delete_branch) && !confirmed {
         let mut command = format!("git worktree remove {name}");
         let mut reasons: Vec<String> = Vec::new();
         if dirty {
@@ -154,7 +163,7 @@ pub async fn tool_dispatch(repo: &Path, args: &Value, approval: Option<&crate::t
         "remove" => {
             let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?;
             let delete_branch = args.get("delete_branch").and_then(Value::as_bool).unwrap_or(false);
-            remove_with_approval(repo, name, delete_branch, approval).await?;
+            remove_with_approval(repo, name, delete_branch, approval, false).await?;
             Ok(format!("removed worktree {name}{}", if delete_branch { " (branch deleted)" } else { " (branch kept)" }))
         }
         "list" => {
@@ -217,6 +226,12 @@ pub async fn diff_file(repo: &Path, path: &str) -> Result<String, String> {
     if text.trim().is_empty() { Err("no diff (unchanged or not a file)".into()) } else { Ok(text) }
 }
 
+/// RPC 入参路径的 workspace 边界原语（diff.file / worktree.status 等 RPC 入口统一走这里）：
+/// canonicalize 后必须落在 workspace 或会话授权清单内，否则越界读取任意文件被拒。
+pub fn resolve_in_workspace(path: &str, workspace: &Path, grants: &std::collections::HashSet<PathBuf>) -> Result<PathBuf, String> {
+    Ok(crate::tools::path_policy::resolve(path, workspace, grants)?.into_path_buf())
+}
+
 /// .kxen/ 进 .gitignore（幂等）。fs_tool 的覆盖备份也落在 .kxen/ 下，共用此入口。
 pub(crate) fn ensure_gitignore(repo: &Path) -> Result<(), String> {
     let path = repo.join(".gitignore");
@@ -230,6 +245,29 @@ pub(crate) fn ensure_gitignore(repo: &Path) -> Result<(), String> {
     }
     new.push_str(".kxen/\n");
     std::fs::write(&path, new).map_err(|e| e.to_string())
+}
+
+/// .kxen/backups/ 数量上限：超出清最旧（mtime 升序），覆盖备份不无界增长。
+const BACKUP_KEEP: usize = 50;
+
+pub fn prune_backups(root: &Path) {
+    let mut dirs = vec![root.join(".kxen").join("backups")];
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    while let Some(d) = dirs.pop() {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                if e.path().is_dir() {
+                    dirs.push(e.path());
+                } else if let Ok(mtime) = e.metadata().and_then(|m| m.modified()) {
+                    files.push((mtime, e.path()));
+                }
+            }
+        }
+    }
+    files.sort_unstable();
+    for (_, p) in files.iter().take(files.len().saturating_sub(BACKUP_KEEP)) {
+        std::fs::remove_file(p).ok();
+    }
 }
 
 async fn git(repo: &Path, args: &[&str]) -> Result<String, String> {

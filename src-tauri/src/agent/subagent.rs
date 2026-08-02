@@ -259,8 +259,7 @@ pub async fn dispatch(
     }
     let mut messages = vec![Message::system(system_prompt), Message::user(prompt)];
     let outcome = run_turn(&mut child, &mut messages).await;
-    let success = matches!(outcome.terminal, crate::agent::agent_loop::AgentEvent::Done { .. });
-    deps.mrm.record_result(&model.provider, success).await;
+    record_outcome(deps, &model.provider, &outcome).await;
     deps.agents.set_status(
         &session_id,
         &name,
@@ -268,6 +267,16 @@ pub async fn dispatch(
     );
     drop(grant);
     Ok((name, degraded_note, outcome.final_text))
+}
+
+/// 子代理终态记账（P2-5）：aborted（手动 abort / 父级级联取消）豁免熔断统计——
+/// 用户主动停止不是 provider 故障，连续 abort 计入失败会误触熔断（与 run.rs 主路径同口径）。
+async fn record_outcome(deps: &SubagentDeps, provider: &str, outcome: &crate::agent::agent_loop::AgentOutcome) {
+    if outcome.aborted {
+        return;
+    }
+    let success = matches!(outcome.terminal, crate::agent::agent_loop::AgentEvent::Done { .. });
+    deps.mrm.record_result(provider, success).await;
 }
 
 #[cfg(test)]

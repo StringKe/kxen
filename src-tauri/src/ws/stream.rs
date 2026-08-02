@@ -1,7 +1,7 @@
 //! 事件桥：bus 事件 -> JSON-RPC 3.0 stream chunk。
-//! - 带 stream_id 的 LlmDelta -> run 流 chunk（done/aborted/error 末块 complete:true 携带 stats），
-//!   同时双写到 llm.delta 订阅流（被动监听方语义统一）
-//! - 其余 topic -> 命中的订阅流 chunk（result 携带 {topic, payload}）
+//! 全部走订阅流：命中 topic 的订阅流 chunk（result 携带 {topic, payload}）。
+//! run 流分支（stream.id=run-* chunk）已删：chunk 无 topic，前端按 topic 匹配必丢弃，
+//! 实际消费全靠 llm.delta，属双端闲置通道。
 //!
 //! 会话 ACL：带 session_id 的 LlmDelta 只发给订阅了 `session:<id>` topic 的连接
 //! （别的会话的增量是越权信息）；无 session_id 的全局事件（voice、审批）行为不变。
@@ -26,26 +26,12 @@ pub(super) fn event_to_chunks(
                     return Vec::new();
                 }
             }
-            let mut out = Vec::new();
-            if let Some(stream_id) = payload.get("stream_id").and_then(Value::as_str).map(String::from) {
-                let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
-                let seq = sequences.next(&stream_id);
-                let chunk = if kind == "done" || kind == "aborted" || kind == "error" {
-                    StreamChunk::complete(&stream_id, seq, payload.clone())
-                } else {
-                    StreamChunk::new(&stream_id, seq, payload.clone())
-                };
-                out.push(chunk);
-                if kind == "done" || kind == "aborted" || kind == "error" {
-                    sequences.remove(&stream_id);
-                }
-            }
-            // 双写 llm.delta 订阅流（teammate/其他会话的被动监听也走这里）
-            if let Some(binding) = subs.iter().find(|b| b.topics.contains("llm.delta")) {
-                let seq = sequences.next(&binding.stream_id);
-                out.push(StreamChunk::new(&binding.stream_id, seq, serde_json::json!({ "topic": "llm.delta", "payload": payload })));
-            }
-            out
+            // llm.delta 订阅流是唯一消费路径（teammate/其他会话的被动监听也走这里）
+            let Some(binding) = subs.iter().find(|b| b.topics.contains("llm.delta")) else {
+                return Vec::new();
+            };
+            let seq = sequences.next(&binding.stream_id);
+            vec![StreamChunk::new(&binding.stream_id, seq, serde_json::json!({ "topic": "llm.delta", "payload": payload }))]
         }
         other => {
             let (topic, payload) = map_event(other);
@@ -62,7 +48,6 @@ fn map_event(event: kxen_app::core::event::Event) -> (&'static str, Value) {
     use kxen_app::core::event::Event;
     match event {
         Event::LlmDelta(payload) => ("llm.delta", payload),
-        Event::ToolCall { name, summary } => ("llm.delta", serde_json::json!({ "tool": name, "summary": summary })),
         Event::TaskUpdate { id, status } => ("task.update", serde_json::json!({ "id": id, "status": status })),
         Event::GoalUpdate { id, status } => ("goal.update", serde_json::json!({ "id": id, "status": status })),
         Event::Notification { text, session_id } => ("notification", serde_json::json!({ "text": text, "session_id": session_id })),
@@ -97,12 +82,12 @@ mod tests {
         assert!(event_to_chunks(delta(Some("s1")), &subs, &mut StreamSequences::default()).is_empty());
     }
 
-    /// 订阅了 session:<id> 的连接正常收到（run 流 + llm.delta 双写）
+    /// 订阅了 session:<id> 的连接正常收到（llm.delta 单写）
     #[test]
     fn subscribed_connection_receives() {
         let subs = vec![binding(&["llm.delta", "session:s1"])];
         let chunks = event_to_chunks(delta(Some("s1")), &subs, &mut StreamSequences::default());
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
     }
 
     /// 连接级判定：同一事件，两个连接各自按自己的订阅判定；
@@ -112,11 +97,11 @@ mod tests {
         let with = vec![binding(&["llm.delta", "session:s1"])];
         let without = vec![binding(&["llm.delta"])];
         let event = delta(Some("s1"));
-        assert_eq!(event_to_chunks(event.clone(), &with, &mut StreamSequences::default()).len(), 2);
+        assert_eq!(event_to_chunks(event.clone(), &with, &mut StreamSequences::default()).len(), 1);
         assert!(event_to_chunks(event, &without, &mut StreamSequences::default()).is_empty());
-        // 全局事件（voice/审批，无 session_id）：行为不变，照常双写
+        // 全局事件（voice/审批，无 session_id）：行为不变，照常吃 llm.delta
         let chunks = event_to_chunks(delta(None), &without, &mut StreamSequences::default());
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
     }
 
     /// 订了别的会话不等于订了本会话（越权不泄露）
@@ -126,16 +111,17 @@ mod tests {
         assert!(event_to_chunks(delta(Some("s1")), &subs, &mut StreamSequences::default()).is_empty());
     }
 
-    /// done 末块带 complete 标记（ACL 放行后原有语义不变）
+    /// done 帧照常走 llm.delta 下发（终态判定看 payload.kind，不靠 complete 标记）
     #[test]
-    fn done_chunk_is_complete() {
+    fn done_frame_flows_through_llm_delta() {
         let subs = vec![binding(&["llm.delta", "session:s1"])];
         let event = kxen_app::core::event::Event::LlmDelta(serde_json::json!({
             "kind": "done", "stream_id": "run-t2", "session_id": "s1",
         }));
         let chunks = event_to_chunks(event, &subs, &mut StreamSequences::default());
-        assert_eq!(chunks[0].stream.complete, Some(true));
-        assert_eq!(chunks[1].stream.complete, None, "llm.delta 双写不是末块");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].result["topic"], "llm.delta");
+        assert_eq!(chunks[0].result["payload"]["kind"], "done");
     }
 
     /// voice 帧带 session_id 后走同一条 session ACL：未订阅该 session 的连接收不到
@@ -149,7 +135,6 @@ mod tests {
         let unsubscribed = vec![binding(&["llm.delta"])];
         assert!(event_to_chunks(voice(), &unsubscribed, &mut StreamSequences::default()).is_empty());
         let subscribed = vec![binding(&["llm.delta", "session:s1"])];
-        // 无 stream_id：只有 llm.delta 双写的一份
         assert_eq!(event_to_chunks(voice(), &subscribed, &mut StreamSequences::default()).len(), 1);
     }
 

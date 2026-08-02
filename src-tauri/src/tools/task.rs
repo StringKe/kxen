@@ -62,6 +62,10 @@ pub struct TaskRegistry {
     tasks: Mutex<HashMap<String, Arc<TaskHandle>>>,
 }
 
+/// 注册表容量上限：任务终结后不淘汰会只增不删（输出缓冲一起常驻）。
+/// 超限优先淘汰最旧的已终结任务（输出缓冲随条目回收）；运行中任务不淘汰。
+const MAX_TASKS: usize = 200;
+
 impl TaskHandle {
     pub fn status(&self) -> TaskStatus {
         match *lock(&self.exit_code) {
@@ -82,7 +86,17 @@ impl TaskRegistry {
     }
 
     pub fn register(&self, handle: Arc<TaskHandle>) {
-        lock(&self.tasks).insert(handle.id.clone(), handle);
+        let mut tasks = lock(&self.tasks);
+        // restart 原位替换（同 id）不占新额度，先豁免再淘汰
+        if tasks.len() >= MAX_TASKS && !tasks.contains_key(&handle.id) {
+            let mut finished: Vec<(u64, String)> =
+                tasks.values().filter(|t| lock(&t.exit_code).is_some()).map(|t| (t.started_at, t.id.clone())).collect();
+            finished.sort_unstable();
+            for (_, id) in finished.into_iter().take(tasks.len() + 1 - MAX_TASKS) {
+                tasks.remove(&id);
+            }
+        }
+        tasks.insert(handle.id.clone(), handle);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<TaskHandle>> {
@@ -262,5 +276,50 @@ mod tests {
         assert!(registry.kill(&id).await);
         assert_eq!(task.status(), TaskStatus::Exited, "已退出任务 kill 后不得变 Killed");
         assert!(!task.killed.load(Ordering::Relaxed));
+    }
+
+    fn finished_handle(id: &str, started_at: u64) -> Arc<TaskHandle> {
+        handle_with_exit(id, started_at, Some(0))
+    }
+
+    fn handle_with_exit(id: &str, started_at: u64, exit: Option<i32>) -> Arc<TaskHandle> {
+        Arc::new(TaskHandle {
+            id: id.into(),
+            command: SharedStr::from("x"),
+            workdir: SharedStr::from("/tmp"),
+            output: Arc::new(Mutex::new("output".repeat(100))),
+            truncated: Arc::new(Mutex::new(false)),
+            started_at,
+            pid: None,
+            exit_code: Arc::new(Mutex::new(exit)),
+            child: Arc::new(Mutex::new(None)),
+            port: Arc::new(Mutex::new(None)),
+            killed: AtomicBool::new(false),
+            health_failed: AtomicBool::new(false),
+            restart: Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn registry_evicts_oldest_finished_beyond_cap() {
+        // 任务终结后不淘汰会只增不删：超限必须淘汰最旧的已终结任务（输出缓冲随条目回收）
+        let registry = TaskRegistry::new();
+        for i in 0..MAX_TASKS {
+            registry.register(finished_handle(&format!("t{i}"), i as u64));
+        }
+        registry.register(finished_handle("new", 9999));
+        assert!(registry.get("t0").is_none(), "最旧的已终结任务被淘汰");
+        assert!(registry.get("new").is_some());
+        assert!(registry.list().len() <= MAX_TASKS);
+    }
+
+    #[test]
+    fn running_tasks_are_never_evicted() {
+        // 全部运行中时允许超额：运行中任务绝不因容量被淘汰
+        let registry = TaskRegistry::new();
+        for i in 0..MAX_TASKS + 1 {
+            registry.register(handle_with_exit(&format!("r{i}"), i as u64, None));
+        }
+        assert!(registry.get("r0").is_some());
     }
 }

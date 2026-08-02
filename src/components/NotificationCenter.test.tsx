@@ -6,6 +6,7 @@ import "../styles.css";
 const h = vi.hoisted(() => ({
   rpc: vi.fn(async (_method: string) => [] as unknown[]),
   resync: new Set<() => void>(),
+  notice: new Set<(p: { text: string; session_id?: string | null }) => void>(),
 }));
 
 vi.mock("../lib/client", () => ({
@@ -15,6 +16,12 @@ vi.mock("../lib/client", () => ({
       h.resync.add(cb);
       return () => h.resync.delete(cb);
     },
+    stream: () => ({
+      on: (cb: (p: { text: string; session_id?: string | null }) => void) => {
+        h.notice.add(cb);
+        return () => h.notice.delete(cb);
+      },
+    }),
   },
 }));
 
@@ -30,9 +37,46 @@ afterEach(() => {
   h.rpc.mockClear();
   h.rpc.mockImplementation(async () => []);
   h.resync.clear();
+  h.notice.clear();
   setSessions([]);
   setActiveSessionId("");
   localStorage.clear();
+});
+
+describe("NotificationCenter topic 订阅", () => {
+  it("notification 帧即时上屏（不等 5s 轮询），轮询对账后按真源收敛；卸载注销订阅", async () => {
+    vi.useFakeTimers();
+    try {
+      const dispose = render(() => <NotificationCenter />, document.body);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listCalls()).toBe(1); // onMount 首拉
+      expect(h.notice.size).toBe(1);
+
+      (document.querySelector('button[title="通知中心"]') as HTMLButtonElement).click();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listCalls()).toBe(2);
+      expect(document.body.textContent).toContain("暂无通知");
+
+      // 帧到即上屏：面板已开，无新一轮 RPC 文本已出现
+      for (const cb of h.notice) cb({ text: "teammate w: 已完成", session_id: "s9" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.body.textContent).toContain("teammate w: 已完成");
+      expect(listCalls()).toBe(2);
+
+      // 服务端真源已含该条：5s 轮询整列替换后只剩一份（本地即时插入被收敛）
+      h.rpc.mockImplementation(async () => [
+        { at: Date.now(), text: "teammate w: 已完成", session_id: "s9" },
+      ]);
+      await vi.advanceTimersByTimeAsync(5000);
+      const hits = document.body.textContent?.match(/teammate w: 已完成/g) ?? [];
+      expect(hits).toHaveLength(1);
+
+      dispose();
+      expect(h.notice.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("NotificationCenter 轮询生命周期", () => {

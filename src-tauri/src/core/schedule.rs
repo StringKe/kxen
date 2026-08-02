@@ -45,18 +45,49 @@ fn store_file() -> std::path::PathBuf {
 }
 
 fn ensure_loaded() {
-    LOADED.get_or_init(|| {
-        if let Ok(text) = std::fs::read_to_string(store_file())
-            && let Ok(jobs) = serde_json::from_str::<Vec<CronJob>>(&text)
-        {
-            *crate::core::shared::lock(&JOBS) = jobs;
+    LOADED.get_or_init(|| match load_from(&store_file()) {
+        LoadResult::Jobs(jobs) => *crate::core::shared::lock(&JOBS) = jobs,
+        LoadResult::Missing => {}
+        // 损坏不置空内存、不覆盖旧文件（P1-7）：隔离为 .corrupt 留证，后续 persist 另起新文件
+        LoadResult::Corrupt => {
+            let path = store_file();
+            if let Err(e) = std::fs::rename(&path, path.with_extension("json.corrupt")) {
+                tracing::warn!(error = %e, "corrupt schedule.json quarantine failed");
+            }
         }
     });
 }
 
+enum LoadResult {
+    Jobs(Vec<CronJob>),
+    Missing,
+    Corrupt,
+}
+
+fn load_from(path: &std::path::Path) -> LoadResult {
+    let Ok(text) = std::fs::read_to_string(path) else { return LoadResult::Missing };
+    match serde_json::from_str::<Vec<CronJob>>(&text) {
+        Ok(jobs) => LoadResult::Jobs(jobs),
+        Err(e) => {
+            tracing::warn!(error = %e, "schedule.json parse failed; in-memory jobs kept, file quarantined");
+            LoadResult::Corrupt
+        }
+    }
+}
+
+/// 落盘：tmp+rename 原子写（同 settings/embedding_cache 口径），崩溃不留半截 JSON。
 fn persist() {
     let jobs = crate::core::shared::lock(&JOBS).clone();
-    let _ = std::fs::write(store_file(), serde_json::to_string_pretty(&jobs).unwrap_or_default());
+    let text = serde_json::to_string_pretty(&jobs).unwrap_or_default();
+    if let Err(e) = write_atomic(&store_file(), &text) {
+        tracing::warn!(error = %e, "schedule.json persist failed");
+    }
+}
+
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 fn now_ms() -> u64 {
@@ -275,5 +306,36 @@ mod tests {
         assert_eq!(after.history.front().unwrap().error.as_deref(), Some("err11"), "最新记录在前");
         remove(&job.id);
         record(&job.id, true, None); // 已删 job：静默丢弃不 panic
+    }
+
+    #[test]
+    fn load_from_distinguishes_missing_loaded_corrupt() {
+        let dir = std::env::temp_dir().join(format!("kxen-schedule-{}-{}", std::process::id(), "load"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedule.json");
+
+        assert!(matches!(load_from(&path), LoadResult::Missing), "缺失文件 = Missing");
+
+        std::fs::write(&path, serde_json::to_string(&Vec::<CronJob>::new()).unwrap()).unwrap();
+        assert!(matches!(load_from(&path), LoadResult::Jobs(_)), "合法文件 = Jobs");
+
+        // 损坏文件 = Corrupt：调用方保留内存 jobs 并隔离旧文件，不静默清空（P1-7）
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(matches!(load_from(&path), LoadResult::Corrupt));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json", "load_from 不得动旧文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_goes_through_tmp_rename() {
+        let dir = std::env::temp_dir().join(format!("kxen-schedule-{}-{}", std::process::id(), "atomic"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedule.json");
+        write_atomic(&path, "[]").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        assert!(!path.with_extension("json.tmp").exists(), "tmp 文件必须已 rename 走");
+        write_atomic(&path, "[1]").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1]", "覆盖写同样原子");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

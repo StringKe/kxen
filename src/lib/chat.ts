@@ -54,7 +54,7 @@ export async function sendMessage(
   text: string,
   context: ContextItem[] = [],
   images: Array<{ media_type: string; data: string }> = [],
-): Promise<{ queued?: boolean; stream_id?: string }> {
+): Promise<{ queued?: boolean }> {
   return client.rpc("send_message", { session_id: sessionId, text, context, images });
 }
 

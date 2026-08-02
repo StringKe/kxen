@@ -103,6 +103,9 @@ describe("KnowledgeSection 生命周期", () => {
     await vi.waitFor(() => expect(h.move).toHaveBeenCalledWith("project", "shared", "personal"));
 
     document.body.querySelector<HTMLButtonElement>("button[title='删除（废纸篓可恢复）']")?.click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("确认删除"));
+    expect(h.remove).not.toHaveBeenCalled(); // 一键不直删：先出行内确认条
+    buttonByText("确认删除").click();
     await vi.waitFor(() => expect(h.remove).toHaveBeenCalledWith("project", "shared"));
 
     const scopeSelect = [...document.body.querySelectorAll<HTMLSelectElement>("select")].find(
@@ -152,6 +155,7 @@ describe("KnowledgeSection 生命周期", () => {
     moveSelect!.value = "personal";
     moveSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     document.body.querySelector<HTMLButtonElement>("button[title='删除（废纸篓可恢复）']")?.click();
+    buttonByText("确认删除").click();
 
     const description = document.body.querySelector<HTMLInputElement>(
       "input[placeholder^='一句话描述']",

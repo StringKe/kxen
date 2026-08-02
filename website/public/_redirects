@@ -10,6 +10,7 @@
 /getting-started/availability /overview/availability 301
 /reference/tools /agent/tools 301
 /reference/safety /agent/safety 301
+/reference/release-smoke /reference 301
 /guides/sessions/ /workspace/session/ 301
 /guides/sessions/index.html /workspace/session/ 301
 /guides/sessions/index.md /workspace/session/index.md 301
@@ -58,6 +59,10 @@
 /reference/safety/index.html /agent/safety/ 301
 /reference/safety/index.md /agent/safety/index.md 301
 /reference/safety/index.mdx /agent/safety/index.mdx 301
+/reference/release-smoke/ /reference/ 301
+/reference/release-smoke/index.html /reference/ 301
+/reference/release-smoke/index.md /reference/index.md 301
+/reference/release-smoke/index.mdx /reference/index.mdx 301
 /guides/sessions/* /workspace/session/:splat 301
 /guides/providers/* /models/:splat 301
 /guides/orchestration/* /agent/:splat 301
@@ -70,3 +75,4 @@
 /getting-started/availability/* /overview/availability/:splat 301
 /reference/tools/* /agent/tools/:splat 301
 /reference/safety/* /agent/safety/:splat 301
+/reference/release-smoke/* /reference/:splat 301

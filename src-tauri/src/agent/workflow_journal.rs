@@ -61,9 +61,22 @@ impl Journal {
             }
         }
         if dropped {
-            let _ = std::fs::write(&file, kept_lines.join("\n") + if kept_lines.is_empty() { "" } else { "\n" });
+            // tmp+rename 原子写：清理重写若留半截文件，下轮 open 会把存活条目一并剔除（缓存全 miss）
+            let tmp = file.with_extension("jsonl.tmp");
+            let text = kept_lines.join("\n") + if kept_lines.is_empty() { "" } else { "\n" };
+            if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &file)) {
+                tracing::warn!(error = %e, "workflow journal purge rewrite failed");
+            }
         }
         Some(Self { ns, done, file })
+    }
+
+    /// 宿主命名空间版 open（P2：workflow run_id 完全由模型参数决定的修复）：模型传入的
+    /// run_id 只作当前会话内的 resume 令牌，真实 journal id = sha256(session, run_id)——
+    /// 跨会话/历史同 run_id 不再命中旧 journal 跳过真实派发；同会话同脚本重跑仍可断点续跑。
+    pub fn open_scoped(session_id: Option<&str>, run_id: &str, script: &str) -> Option<Self> {
+        let scoped = stable_hash(&[session_id.unwrap_or("no-session"), run_id]);
+        Self::open(&scoped, script)
     }
 
     /// 已完成的派发结果（resume 命中则免重跑）。
@@ -166,6 +179,7 @@ mod tests {
         assert!(!rewritten.contains("legacy"));
         assert!(!rewritten.contains("not json"));
         assert_eq!(rewritten.lines().count(), 1);
+        assert!(!file.with_extension("jsonl.tmp").exists(), "清理重写必须走 tmp+rename，不留残骸");
         cleanup(&run_id);
     }
 
@@ -175,5 +189,34 @@ mod tests {
         assert!(Journal::open("../escape", "s").is_none());
         assert!(Journal::open("a/b", "s").is_none());
         assert!(Journal::open("", "s").is_none());
+    }
+
+    #[test]
+    fn scoped_run_id_isolates_sessions_but_resumes_within_session() {
+        // 模型给出的同一 run_id：会话 B 不得命中会话 A 的旧 journal（跳过真实派发=跑错任务）；
+        // 同会话重开（崩溃/取消后 resume）必须照常命中。
+        let run_id = format!("test-scoped-{}", std::process::id());
+        let file_a = journal_file(&stable_hash(&["sess-a", &run_id]));
+        let file_b = journal_file(&stable_hash(&["sess-b", &run_id]));
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+
+        {
+            let mut ja = Journal::open_scoped(Some("sess-a"), &run_id, "script-v1").unwrap();
+            ja.record("execution", "do A", "result A");
+        }
+        // 同会话 resume：命中
+        let ja2 = Journal::open_scoped(Some("sess-a"), &run_id, "script-v1").unwrap();
+        assert_eq!(ja2.cached("execution", "do A").map(String::as_str), Some("result A"), "同会话 resume 必须命中");
+        // 跨会话同 run_id 同脚本：miss（模型参数不能直接命中旧 journal）
+        let jb = Journal::open_scoped(Some("sess-b"), &run_id, "script-v1").unwrap();
+        assert_eq!(jb.cached("execution", "do A"), None, "跨会话同 run_id 不得命中");
+        // 无会话上下文与有会话上下文也互不相同
+        let jn = Journal::open_scoped(None, &run_id, "script-v1").unwrap();
+        assert_eq!(jn.cached("execution", "do A"), None, "无会话命名空间不得命中");
+
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+        let _ = std::fs::remove_file(journal_file(&stable_hash(&["no-session", &run_id])));
     }
 }

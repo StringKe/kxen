@@ -8,8 +8,13 @@ use tauri::{AppHandle, Emitter, Manager};
 /// 前端切会话事件（payload = session_id；App.tsx 经 lib/os-notify.ts 挂 listen）。
 pub const CLICK_EVENT: &str = "os-notification-click";
 
-/// wait_for_action 串行 dispatcher：一个 worker 线程依次等待各通知的点击结果。
-/// 旧实现每条通知独占一个阻塞线程，通知挂通知中心无人理时线程随之堆积。
+/// worker 等单个 job 的上限：wait_for_action 无超时口，通知挂通知中心无人理时 job 永不结束，
+/// 串行 worker 会被首条堵死、后续所有点击回跳无限期排队失效。超时丢弃放行后续；
+/// 被丢弃的等待线程杀不掉（notify-rust 无可中断等待口），仍挂在原通知上，用户日后点击照常回跳。
+const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// wait_for_action 串行 dispatcher：单 worker 依次派发各通知的点击等待，
+/// job 跑在各自 detached 线程（退出语义同旧逐条 spawn：进程退出即收，不 join 不阻塞退出）。
 struct Dispatcher {
     tx: std::sync::mpsc::Sender<WaitJob>,
 }
@@ -18,11 +23,21 @@ type WaitJob = Box<dyn FnOnce() + Send + 'static>;
 
 impl Dispatcher {
     fn new() -> Self {
+        Self::with_timeout(JOB_WAIT_TIMEOUT)
+    }
+
+    fn with_timeout(timeout: std::time::Duration) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<WaitJob>();
-        // 与旧逐条 spawn 相同的退出语义：detached，进程退出即收，不 join 不阻塞退出。
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                job();
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                std::thread::spawn(move || {
+                    job();
+                    let _ = done_tx.send(());
+                });
+                if done_rx.recv_timeout(timeout).is_err() {
+                    tracing::warn!("os notification wait timed out, job dropped");
+                }
             }
         });
         Self { tx }
@@ -133,5 +148,26 @@ mod tests {
             done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("job 应在超时前完成");
         }
         assert_eq!(*log.lock().unwrap(), vec![0, 1, 2], "FIFO 串行执行顺序");
+    }
+
+    /// 阻塞 job（通知挂通知中心无人理，wait_for_action 永不返回）不得拖死后续 job：
+    /// worker 超时丢弃后队列必须继续推进。
+    #[test]
+    fn blocked_job_is_dropped_after_timeout_and_queue_moves_on() {
+        use super::Dispatcher;
+        use std::time::Duration;
+
+        let d = Dispatcher::with_timeout(Duration::from_millis(50));
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        d.enqueue(Box::new(move || {
+            // 模拟永不结束的 wait_for_action；测试末尾放行，不给后续用例留挂死线程
+            let _ = block_rx.recv();
+        }));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        d.enqueue(Box::new(move || {
+            let _ = done_tx.send(());
+        }));
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("阻塞 job 超时丢弃后，后续 job 必须执行");
+        let _ = block_tx.send(());
     }
 }

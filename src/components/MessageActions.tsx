@@ -2,6 +2,8 @@
 // user 的编辑框由 UserItem 持有（右键菜单与铅笔同一入口），本组件只发 onStartEdit 信号。
 import { createSignal, Show } from "solid-js";
 import { Check, Copy, GitFork, Pencil, RotateCcw } from "lucide-solid";
+import { flashErr } from "../lib/flash";
+import { formatError } from "../lib/error-text";
 
 export default function MessageActions(props: {
   role: "user" | "assistant";
@@ -13,17 +15,22 @@ export default function MessageActions(props: {
   const [copied, setCopied] = createSignal(false);
 
   const copy = () => {
-    void navigator.clipboard.writeText(props.content).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    });
+    void navigator.clipboard
+      .writeText(props.content)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      })
+      .catch((e: unknown) =>
+        flashErr(`写入剪贴板失败：${formatError(e instanceof Error ? e.message : String(e))}`),
+      );
   };
 
   const btn =
     "pressable px-1 py-0.5 rounded text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--bg-overlay)]/70";
 
   return (
-    <span class="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+    <span class="inline-flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
       <button class={btn} title="复制全文" onClick={copy}>
         <Show when={copied()} fallback={<Copy size={11} />}>
           <Check size={11} class="text-[var(--ok)]" />

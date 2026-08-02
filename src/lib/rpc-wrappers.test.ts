@@ -5,7 +5,6 @@ const h = vi.hoisted(() => ({
   on: vi.fn((_handler: (payload: unknown) => void) => vi.fn()),
   rpc: vi.fn(async (method: string) => {
     if (h.fail.delete(method)) throw new Error(`${method} failed`);
-    if (method === "diff.agent_file") return { text: "agent diff" };
     return {};
   }),
   stream: vi.fn(),
@@ -36,6 +35,7 @@ describe("RPC wrappers", () => {
     await chatOps.worktreeCreate("feature");
     await chatOps.worktreeRemove("feature");
     await chatOps.worktreeRemove("feature", true);
+    await chatOps.worktreeRemove("feature", true, true);
     await chatOps.worktreeStatus("/repo");
     await chatOps.workspaceList();
     await chatOps.workspaceCurrent();
@@ -44,8 +44,6 @@ describe("RPC wrappers", () => {
     await chatOps.workspacesOverview();
     await chatOps.diffStatus("s1");
     await chatOps.diffFile("s1", "a.ts");
-    await chatOps.agentDiffStatus("s1");
-    expect(await chatOps.agentDiffFile("s1", "a.ts")).toBe("agent diff");
     await chatOps.goalList();
     await chatOps.goalFocus();
     await chatOps.goalFocus("s1");
@@ -66,10 +64,17 @@ describe("RPC wrappers", () => {
     expect(h.rpc).toHaveBeenCalledWith("worktree.remove", {
       name: "feature",
       delete_branch: false,
+      confirmed: false,
     });
     expect(h.rpc).toHaveBeenCalledWith("worktree.remove", {
       name: "feature",
       delete_branch: true,
+      confirmed: false,
+    });
+    expect(h.rpc).toHaveBeenCalledWith("worktree.remove", {
+      name: "feature",
+      delete_branch: true,
+      confirmed: true,
     });
     expect(h.rpc).toHaveBeenCalledWith("goal.focus", {});
     expect(h.rpc).toHaveBeenCalledWith("goal.focus", { session_id: "s1" });
@@ -79,10 +84,6 @@ describe("RPC wrappers", () => {
   it("diff 降级路径返回稳定空值", async () => {
     h.fail.add("worktree.status");
     expect(await chatOps.worktreeStatus("/repo")).toEqual([]);
-    h.fail.add("diff.agent_status");
-    expect(await chatOps.agentDiffStatus("s1")).toEqual([]);
-    h.fail.add("diff.agent_file");
-    expect(await chatOps.agentDiffFile("s1", "a.ts")).toBe("");
   });
 
   it("provider wrappers 覆盖可选账号、候选凭证和 region", async () => {

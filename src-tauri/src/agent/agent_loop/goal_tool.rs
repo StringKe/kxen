@@ -62,6 +62,34 @@ pub async fn execute_goal_tool(
         }
         other => {
             let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
+            // complete 的逐条评审是 await 段：先无锁读合同做评审（std 锁不得跨 await），
+            // 再进锁重读落迁移。评审调用失败按可重试错误返回，不降级放行。
+            if other == "complete"
+                && let Some(j) = judge
+            {
+                let evidence = args.get("evidence").and_then(Value::as_str).ok_or("missing evidence")?;
+                let goal = crate::core::goal::Goal::load(&dir, id).map_err(|e| e.to_string())?;
+                let scores = crate::agent::goal_verify::score_completion(
+                    &j.model,
+                    j.store,
+                    &goal.contract.objective,
+                    &goal.contract.completion_criteria,
+                    evidence,
+                )
+                .await?;
+                let failed: Vec<_> = scores.iter().filter(|s| !s.pass).collect();
+                if !failed.is_empty() {
+                    let detail = failed.iter().map(|s| format!("- {}: {}", s.criterion, s.reason)).collect::<Vec<_>>().join("\n");
+                    return Err(format!(
+                        "completion verification failed ({} criterion/criteria unmet):\n{detail}\n\
+                         Provide evidence that actually satisfies every criterion, or adjust the goal contract.",
+                        failed.len()
+                    ));
+                }
+            }
+            // 与记账共用 per-id 锁（P2-2）：锁内重读的 load-modify-save 串行化，并发 charge 不互相覆盖
+            let lock = crate::core::goal::write_lock(id);
+            let _guard = crate::core::shared::lock(&lock);
             let mut goal = crate::core::goal::Goal::load(&dir, id).map_err(|e| e.to_string())?;
             match other {
                 "get" => {}
@@ -71,26 +99,6 @@ pub async fn execute_goal_tool(
                 "cancel" => goal.cancel().map_err(|e| e.to_string())?,
                 "complete" => {
                     let evidence = args.get("evidence").and_then(Value::as_str).ok_or("missing evidence")?;
-                    // score-based 逐条验证：全过才允许 complete；评审调用失败按可重试错误返回，不降级放行
-                    if let Some(j) = judge {
-                        let scores = crate::agent::goal_verify::score_completion(
-                            &j.model,
-                            j.store,
-                            &goal.contract.objective,
-                            &goal.contract.completion_criteria,
-                            evidence,
-                        )
-                        .await?;
-                        let failed: Vec<_> = scores.iter().filter(|s| !s.pass).collect();
-                        if !failed.is_empty() {
-                            let detail = failed.iter().map(|s| format!("- {}: {}", s.criterion, s.reason)).collect::<Vec<_>>().join("\n");
-                            return Err(format!(
-                                "completion verification failed ({} criterion/criteria unmet):\n{detail}\n\
-                                 Provide evidence that actually satisfies every criterion, or adjust the goal contract.",
-                                failed.len()
-                            ));
-                        }
-                    }
                     goal.complete(evidence).map_err(|e| e.to_string())?;
                 }
                 unknown => return Err(format!("unknown goal action: {unknown}")),

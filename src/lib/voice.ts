@@ -55,13 +55,17 @@ export async function startVoiceSession(
   onError: (msg: string) => void,
   sessionId = "",
 ): Promise<VoiceSession> {
-  const off = client.stream("llm.delta").on((payload) => {
-    const p = payload as VoiceEventPayload;
-    // 后端 voice 帧带 session_id（WS 层已按 session 准入），其他会话的帧到这也是串台，丢
-    if ((p.session_id ?? "") !== sessionId) return;
-    if (p.kind === "voice.partial" && p.text) onPartial(p.text);
-    if (p.kind === "voice.error") onError(p.message ?? "语音引擎错误");
-  });
+  // 订阅自带 session topic：后端 stream ACL 要求连接持有 session:<id> 绑定才放行带 session_id 的帧
+  //（旧实现裸订 llm.delta，靠 delta.ts/RightColumn 恰好持有会话订阅隐式放行——那是隐式耦合）
+  const off = client
+    .stream(sessionId ? ["llm.delta", `session:${sessionId}`] : ["llm.delta"])
+    .on((payload) => {
+      const p = payload as VoiceEventPayload;
+      // 后端 voice 帧带 session_id（WS 层已按 session 准入），其他会话的帧到这也是串台，丢
+      if ((p.session_id ?? "") !== sessionId) return;
+      if (p.kind === "voice.partial" && p.text) onPartial(p.text);
+      if (p.kind === "voice.error") onError(p.message ?? "语音引擎错误");
+    });
   try {
     const started = await client.rpc<{ engine: string }>("voice.start", {
       ...(engine ? { engine } : {}),

@@ -33,14 +33,20 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
         "worktree.remove" => {
             let name = params.get("name").and_then(Value::as_str).ok_or("missing name")?;
             let delete_branch = params.get("delete_branch").and_then(Value::as_bool).unwrap_or(false);
+            // 前端行内确认条已显式确认（confirmed）：跳过后端审批挂起，避免双确认
+            let confirmed = params.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
             let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
             let approval = kxen_app::tools::exec::ApprovalCtx::new(Some(state.approvals.as_ref()), Some(&state.bus), None, None);
-            kxen_app::tools::worktree::remove_with_approval(&dir, name, delete_branch, approval.as_ref()).await?;
+            kxen_app::tools::worktree::remove_with_approval(&dir, name, delete_branch, approval.as_ref(), confirmed).await?;
             Ok(json!(true))
         }
         "worktree.status" => {
             let path = params.get("path").and_then(Value::as_str).ok_or("missing path")?;
-            Ok(json!(kxen_app::tools::worktree::status(std::path::Path::new(path)).await?))
+            // 边界：path 必须落在 workspace（或会话授权清单）内，否则可对任意目录跑 git status
+            let dir = workspace_for_params(params, state)?;
+            let grants = session_grants(params, state);
+            let resolved = kxen_app::tools::worktree::resolve_in_workspace(path, &dir, &grants)?;
+            Ok(json!(kxen_app::tools::worktree::status(&resolved).await?))
         }
         "diff.status" => {
             let dir = workspace_for_params(params, state)?;
@@ -63,10 +69,18 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
         "diff.file" => {
             let path = params.get("path").and_then(Value::as_str).ok_or("missing path")?;
             let dir = workspace_for_params(params, state)?;
-            Ok(json!(kxen_app::tools::worktree::diff_file(&dir, path).await?))
+            // 边界：--no-index 合成 diff 会读文件全文，path 必须落在 workspace（或会话授权清单）内
+            let grants = session_grants(params, state);
+            let resolved = kxen_app::tools::worktree::resolve_in_workspace(path, &dir, &grants)?;
+            Ok(json!(kxen_app::tools::worktree::diff_file(&dir, &resolved.to_string_lossy()).await?))
         }
         other => Err(format!("unknown method: {other}")),
     }
+}
+
+/// 会话已授权路径清单（fs.allow_path 对话框登记），无 session_id 时为空集。
+fn session_grants(params: &Value, state: &Arc<AppState>) -> std::collections::HashSet<PathBuf> {
+    params.get("session_id").and_then(Value::as_str).and_then(|id| state.picked_files.snapshot(id)).unwrap_or_default()
 }
 
 fn workspace_for_params(params: &Value, state: &Arc<AppState>) -> Result<PathBuf, String> {

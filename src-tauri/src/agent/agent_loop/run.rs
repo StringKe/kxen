@@ -130,7 +130,7 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
         let mut text = String::new();
         // OAuth 主动刷新：快过期先换 token（RECENT 跨 clone 去重，不重复吊销）
         let _ = crate::auth::refresh::ensure_fresh(&mut ctx.store, &ctx.model.provider, ctx.model.account.as_deref()).await;
-        // 重试：429/5xx/网络类错误退避重试 + 账号池轮换；仅在零产出前重试（部分产出后重试会重复文本）
+        // 重试：429/5xx/网络类错误退避重试 + 账号池轮换；仅在零产出前重试（部分产出后重试会重复文本）。退避挂取消令牌：裸 sleep 不响应 abort，取消最长延迟 3.2s+jitter 才生效
         let mut attempt = 0usize;
         let mut produced = false;
         let mut wall_stop = false;
@@ -230,14 +230,13 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                             }
                             let terminal = AgentEvent::Error { message: e.clone() };
                             (ctx.on_event)(terminal.clone());
-                            // 流错误（凭证缺失/不可重试/已尽）同样落终态，避免会话只剩用户消息
-                            return AgentOutcome {
-                                final_text: format!("(错误: {e})"),
-                                turns,
-                                aborted,
-                                stats: stats(ttft, &usage_acc),
-                                terminal,
-                            };
+                            // 部分产出不丢（P2-6）：已流出的文本进历史与终态文本（live delta 不落盘，
+                            // final_text 是转录唯一载体），错误标记附后；流错误同样落终态，会话不许只剩用户消息
+                            if !text.is_empty() {
+                                messages.push(Message::assistant(text.clone()));
+                            }
+                            let final_text = if text.is_empty() { format!("(错误: {e})") } else { format!("{text}\n\n(错误: {e})") };
+                            return AgentOutcome { final_text, turns, aborted, stats: stats(ttft, &usage_acc), terminal };
                         }
                         failed = Some(e);
                         break;
@@ -269,9 +268,10 @@ pub async fn run_turn(ctx: &mut AgentContext, messages: &mut Vec<Message>) -> Ag
                 );
                 bus.publish(crate::core::event::Event::notify(note, ctx.session_id.clone()));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
-            if aborted {
-                break 'outer;
+            let backoff = tokio::time::sleep(std::time::Duration::from_millis(wait));
+            match &ctx.cancel {
+                Some(token) => tokio::select! { _ = backoff => {}, _ = token.wait() => { aborted = true; break 'outer; } },
+                None => backoff.await,
             }
         }
         if aborted {

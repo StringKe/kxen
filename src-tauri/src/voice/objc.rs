@@ -132,8 +132,12 @@ pub fn end_audio(request: &AnyObject) {
 pub type TapHandler = RcBlock<dyn Fn(*mut AnyObject, *mut AnyObject)>;
 
 /// AVAudioEngine 麦克风采集（通用）：tap 回调直送 caller 的 handler（Speech 灌流 / PCM 累积两吃）。
-/// 返回 (engine, 采样率)。
-pub fn start_mic_capture(make_handler: impl FnOnce(*mut AnyObject) -> TapHandler) -> Result<(Retained<AnyObject>, f64), String> {
+/// 返回 (engine, 采样率, tap block)。tap 由调用方持有到 stop_mic_engine（removeTap）之后回收：
+/// installTap 内部 Block_copy，但回调跑在音频实时线程，Rust 侧保活一份最稳；
+/// 旧实现 mem::forget 每次 PTT 泄漏一份 block。
+pub fn start_mic_capture(
+    make_handler: impl FnOnce(*mut AnyObject) -> TapHandler,
+) -> Result<(Retained<AnyObject>, f64, TapHandler), String> {
     unsafe {
         let Some(cls) = class(c"AVAudioEngine") else {
             return Err("系统缺少 ObjC 类 AVAudioEngine（AVFAudio 框架不可用）".into());
@@ -152,11 +156,10 @@ pub fn start_mic_capture(make_handler: impl FnOnce(*mut AnyObject) -> TapHandler
         let sample_rate: f64 = msg_send![format, sampleRate];
         let tap = make_handler(input);
         let _: () = msg_send![input, installTapOnBus: 0usize, bufferSize: 1024u32, format: format, block: &*tap];
-        // tap block 需比 engine 活得久：泄漏一份（removeTap 后由进程回收）
-        std::mem::forget(tap);
         let mut error: *mut NSError = std::ptr::null_mut();
         let ok: Bool = msg_send![&*engine, startAndReturnError: &mut error];
         if !ok.as_bool() {
+            // 启动失败：removeTap 后 tap 随函数返回回收
             let _: () = msg_send![input, removeTapOnBus: 0usize];
             return Err(if error.is_null() {
                 "音频引擎启动失败".into()
@@ -164,7 +167,7 @@ pub fn start_mic_capture(make_handler: impl FnOnce(*mut AnyObject) -> TapHandler
                 error_text(error as *mut AnyObject).unwrap_or_else(|| "音频引擎启动失败".into())
             });
         }
-        Ok((engine, sample_rate))
+        Ok((engine, sample_rate, tap))
     }
 }
 

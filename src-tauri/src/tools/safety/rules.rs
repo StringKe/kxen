@@ -65,7 +65,8 @@ pub(super) fn home_top() -> &'static [&'static str] {
 }
 
 pub(super) fn home_credential_dot() -> &'static [&'static str] {
-    &[".ssh", ".gnupg", ".aws", ".kube", ".docker"]
+    // 与 path_policy::sensitive_reason 的凭证目录清单保持一致（两处任一漏项都是绕过通道）
+    &[".ssh", ".gnupg", ".aws", ".kube", ".docker", ".codex", ".claude", ".grok", ".kimi-code"]
 }
 
 pub(super) static DISK_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {

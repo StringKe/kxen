@@ -235,4 +235,38 @@ describe("UsageSection 趋势、Provider 限制与保存", () => {
     );
     dispose();
   });
+
+  it("保存由成功转失败：残留「已保存」绿字被清掉，只显示错误", async () => {
+    let fail = false;
+    h.rpc.mockImplementation((method: string) => {
+      if (method === "usage.overview") return Promise.resolve(EMPTY);
+      if (method === "config.get") return Promise.resolve({ roles: {}, limits: {} });
+      if (method === "provider.list") return Promise.resolve(PROVIDERS);
+      if (method === "config.set_limits") {
+        // 后端对无 provider 的熔断字段返回明确错误（settings.rs set_limits），前端如实上屏
+        return fail
+          ? Promise.reject(new Error("circuit_failure_threshold requires a provider id"))
+          : Promise.resolve({ saved: true });
+      }
+      return Promise.resolve({});
+    });
+    const dispose = render(() => <UsageSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("暂无派发记录"));
+    const save = () =>
+      [...document.body.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent === "保存限制")
+        ?.click();
+    save();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("已保存并热生效"));
+
+    fail = true;
+    save();
+    await vi.waitFor(() =>
+      expect(document.body.textContent).toContain(
+        "保存失败：circuit_failure_threshold requires a provider id",
+      ),
+    );
+    expect(document.body.textContent).not.toContain("已保存并热生效");
+    dispose();
+  });
 });

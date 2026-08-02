@@ -8,14 +8,14 @@ const h = vi.hoisted(() => ({
   goalTransit: vi.fn(async (_id: string, _action: string): Promise<unknown> => ({})),
   goalCreate: vi.fn(async (): Promise<unknown> => ({})),
   taskList: vi.fn(async () => [] as unknown[]),
+  taskKill: vi.fn(async () => true),
   taskRestart: vi.fn(async (_id: string) => ({ task_id: _id })),
-  agentDiffStatus: vi.fn(async () => [] as unknown[]),
   onTopic: vi.fn(async (_topics: string[], _handler: unknown) => () => {}),
   resync: new Set<() => void>(),
 }));
 
 vi.mock("../lib/chat", async (importOriginal) => {
-  // 全量 mock 会断 state.ts -> session-model 的 currentModel 绑定：铺开真实模块，只桩测试关注的 7 个
+  // 全量 mock 会断 state.ts -> session-model 的 currentModel 绑定：铺开真实模块，只桩测试关注的 RPC
   const orig = await importOriginal<typeof import("../lib/chat")>();
   return {
     ...orig,
@@ -24,13 +24,17 @@ vi.mock("../lib/chat", async (importOriginal) => {
     goalTransit: h.goalTransit,
     goalCreate: h.goalCreate,
     taskList: h.taskList,
-    taskKill: vi.fn(async () => true),
+    taskKill: h.taskKill,
     taskRestart: h.taskRestart,
-    agentDiffStatus: h.agentDiffStatus,
-    agentDiffFile: vi.fn(async () => ""),
     onTopic: h.onTopic,
   };
 });
+
+// agent-diff 直接打 client.rpc：桩成稳定 ok 真空（三态渲染由 Dock.ops.test.tsx 覆盖）
+vi.mock("../lib/agent-diff", () => ({
+  createAgentDiff: () => ({ status: () => ({ state: "ok", entries: [] }), reload: async () => {} }),
+  fetchAgentDiffFile: async () => ({ state: "ok", text: "" }),
+}));
 
 vi.mock("../lib/client", () => ({
   client: {
@@ -47,6 +51,7 @@ vi.mock("./DockWorktree", () => ({ default: () => null }));
 
 import Dock from "./Dock";
 import { setActiveSessionId } from "../lib/state";
+import { flash } from "../lib/flash";
 
 function goal(over: Record<string, unknown>) {
   return {
@@ -72,8 +77,10 @@ afterEach(() => {
   h.goalCreate.mockClear();
   h.taskList.mockClear();
   h.taskList.mockResolvedValue([]);
+  h.taskKill.mockClear();
   h.taskRestart.mockClear();
   h.resync.clear();
+  for (const m of flash.msgs()) flash.dismiss(m.id);
   setActiveSessionId("");
 });
 

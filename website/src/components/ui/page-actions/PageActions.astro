@@ -14,7 +14,7 @@ const baseBtn =
   "inline-flex cursor-pointer items-center gap-1.5 rounded-md bg-transparent px-2 py-1 text-muted-foreground no-underline transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2";
 
 const formattedDate = lastUpdated
-  ? new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(lastUpdated)
+  ? new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "short", day: "numeric" }).format(lastUpdated)
   : null;
 ---
 
@@ -28,7 +28,7 @@ const formattedDate = lastUpdated
     {lastUpdated && (
       <span class="inline-flex items-center gap-1.5 px-2 py-1 text-muted-foreground">
         <Icon name="ph:clock" class="w-3.5 h-3.5" />
-        Updated <time datetime={lastUpdated.toISOString()}>{formattedDate}</time>
+        更新于 <time datetime={lastUpdated.toISOString()}>{formattedDate}</time>
       </span>
     )}
 
@@ -41,7 +41,7 @@ const formattedDate = lastUpdated
         <button type="button" data-nb-page-actions-copy class={baseBtn}>
           <Icon name="ph:copy" class="w-3.5 h-3.5" data-nb-page-actions-copy-icon is:inline />
           <Icon name="ph:check" class="hidden w-3.5 h-3.5 text-success" data-nb-page-actions-check-icon is:inline />
-          <span data-nb-page-actions-label aria-live="polite">Copy page</span>
+          <span data-nb-page-actions-label aria-live="polite">复制本页</span>
         </button>
 
         <span aria-hidden="true" class="select-none text-muted-foreground/40">|</span>
@@ -53,7 +53,7 @@ const formattedDate = lastUpdated
           class={baseBtn}
         >
           <Icon name="ph:markdown-logo" class="w-3.5 h-3.5" />
-          View as Markdown
+          查看 Markdown
         </a>
       </>
     )}

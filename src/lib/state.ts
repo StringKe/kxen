@@ -13,6 +13,8 @@ export const [activeSessionId, setActiveSessionId] = createSignal<string>("");
 export const [hasConversation, setHasConversation] = createSignal(false);
 /** 子代理名单（teammate/subagent/workflow 统一视图）。 */
 export const [agents, setAgents] = createSignal<AgentActivity[]>([]);
+/** agents 名单加载失败标记：与真空区分（RightColumn 据此出重试条），下一轮轮询成功自动复位。 */
+export const [agentsLoadFailed, setAgentsLoadFailed] = createSignal(false);
 /** PrimaryContent 选中项："" / "main" = 主会话，否则为 agent run 名（AgentRunCards 卡与右栏概览卡共用）。 */
 export const [activeAgentFocus, setActiveAgentFocus] = createSignal<string>("");
 
@@ -155,16 +157,23 @@ export async function deleteSession(id: string, distill = false): Promise<void> 
   else await newSession();
 }
 
-/** 刷新子代理名单（3s 轮询 + 事件驱动调用方）：mergeKeyed 保引用，无变化不触发下游重算。 */
+/** 刷新子代理名单（3s 轮询 + 事件驱动调用方）：mergeKeyed 保引用，无变化不触发下游重算。
+ *  失败保留旧名单只置失败标记：把 RPC 失败合并成空列会把运行中的卡抹掉、与真空同形。 */
 export async function refreshAgents(): Promise<void> {
   const sid = activeSessionId();
   if (!sid) {
     setAgents([]);
+    setAgentsLoadFailed(false);
     return;
   }
-  const next = (await agentsList(sid).catch(() => [])) ?? [];
+  const next = await agentsList(sid).catch(() => null);
   // await 期间切了会话：旧会话的晚到响应不得覆盖新名单
   if (activeSessionId() !== sid) return;
+  if (!next) {
+    setAgentsLoadFailed(true);
+    return;
+  }
+  setAgentsLoadFailed(false);
   setAgents((prev) => mergeKeyed(prev, next, (a) => a.name, sameAgent));
 }
 

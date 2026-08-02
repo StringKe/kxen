@@ -21,6 +21,8 @@ export default function ScheduleSection() {
   const [prompt, setPrompt] = createSignal("");
   const [once, setOnce] = createSignal(false);
   const [adding, setAdding] = createSignal(false);
+  // 待确认删除的 job id：删除统一走行内确认条（对齐会话删除/worktree 的二次确认模式）
+  const [confirmDel, setConfirmDel] = createSignal("");
   const reload = async () => {
     const list = await scheduleList().catch((e: unknown) => {
       flashErr(`加载定时任务失败：${errText(e)}`); // 失败保留旧数据，不伪装空清单
@@ -38,6 +40,7 @@ export default function ScheduleSection() {
     if (ok !== null) void reload();
   };
   const remove = async (job: ScheduleJob) => {
+    setConfirmDel("");
     const ok = await scheduleRemove(job.id).catch((e: unknown) => {
       flashErr(`删除失败：${errText(e)}`);
       return null;
@@ -140,7 +143,7 @@ export default function ScheduleSection() {
                   </button>
                   <button
                     class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-xs text-[var(--text)] flex items-center gap-1"
-                    onClick={() => void remove(job)}
+                    onClick={() => setConfirmDel(job.id)}
                   >
                     <Trash2 size={10} />
                     删除
@@ -149,6 +152,27 @@ export default function ScheduleSection() {
                 <div class="mt-1 text-xs text-[var(--text-dim)] truncate" title={job.prompt}>
                   {job.prompt}
                 </div>
+                <Show when={confirmDel() === job.id}>
+                  <div class="mt-2 rounded border border-[var(--warn)]/50 bg-[var(--warn)]/5 px-3 py-2 text-xs space-y-2">
+                    <div class="text-[var(--warn)]">
+                      {`确认删除定时任务「${job.prompt.slice(0, 40)}」？删除后不再触发。`}
+                    </div>
+                    <div class="flex gap-2">
+                      <button
+                        class="pressable px-2 py-0.5 rounded text-2xs border border-[var(--err)] text-[var(--err)]"
+                        onClick={() => void remove(job)}
+                      >
+                        确认删除
+                      </button>
+                      <button
+                        class="pressable px-2 py-0.5 rounded text-2xs border border-[var(--border)] text-[var(--text-dim)]"
+                        onClick={() => setConfirmDel("")}
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                </Show>
                 <div class="mt-1 flex items-center gap-3 text-2xs text-[var(--text-faint)]">
                   <span class="truncate">会话 {job.session_id}</span>
                   <Show when={job.history[0]} fallback={<span>尚未执行</span>}>

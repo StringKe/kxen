@@ -12,24 +12,15 @@ import {
   removeAccount,
   removeCustomProvider,
   setAccountRegion,
-  type AccountInfo,
-  type ModelsResult,
   type ProviderInfo,
   type ReprobeIssue,
-  type VerifyOutcome,
 } from "../../lib/provider";
 import { GUIDES } from "../../lib/provider-guides";
 import { flashErr, flashOk } from "../../lib/flash";
 import { formatError } from "../../lib/error-text";
 import AddAccountPanel from "./AddAccountPanel";
 import ProviderCompatibility from "./ProviderCompatibility";
-
-interface Row extends AccountInfo {
-  verify?: VerifyOutcome;
-  verifying: boolean;
-  usedBy: string[];
-  modelsResult?: ModelsResult;
-}
+import { badge, labelOf, type Row } from "./providers-row";
 
 // 实测结果与拉模型条数是时点探测：切分区重挂载后需用户重新点按获取，
 // 不缓存陈旧探测结果上屏（缓存会误导，探测本身一键可重发）。
@@ -41,17 +32,11 @@ export default function ProvidersSection() {
   const [issues, setIssues] = createSignal<ReprobeIssue[]>([]);
   const [adding, setAdding] = createSignal(false);
   const [guideFor, setGuideFor] = createSignal("");
-  // 待确认删除的行 id（账号被角色占用时先出确认条）
+  // 待确认删除的行 id（所有删除先出行内确认条，占用中的账号条内列明受影响角色）
   const [confirmDel, setConfirmDel] = createSignal("");
 
   const specOf = (key: string) => providers().find((p) => p.key === key);
   const regionsOf = (r: Row) => specOf(r.provider)?.regions ?? [];
-  /** 行标签：display + 区域后缀（如「Kimi 中国版」）；存量无 region 账号只有 display。 */
-  const labelOf = (r: Row) => {
-    const spec = specOf(r.provider);
-    const region = r.region ? spec?.regions.find((x) => x.key === r.region) : undefined;
-    return `${spec?.display ?? r.provider}${region ? ` ${region.display}` : ""}`;
-  };
 
   const load = async () => {
     const [accounts, cfg, list] = await Promise.all([
@@ -124,10 +109,9 @@ export default function ProvidersSection() {
     }
   };
 
-  const requestRemove = (row: Row) => {
-    if (row.usedBy.length > 0) setConfirmDel(row.id);
-    else void doRemove(row);
-  };
+  // 删除统一走行内确认条（对齐会话删除/worktree 的二次确认模式）：被角色占用的账号
+  // 在条内列明受影响角色，未占用的也只少一次误触点击的代价
+  const requestRemove = (row: Row) => setConfirmDel(row.id);
 
   const doRemove = async (row: Row) => {
     setConfirmDel("");
@@ -139,20 +123,6 @@ export default function ProvidersSection() {
     } catch (e) {
       flashErr(`删除失败：${formatError(e instanceof Error ? e.message : String(e))}`);
     }
-  };
-
-  const badge = (r: Row) => {
-    if (r.verifying) return { text: "实测中…", cls: "text-[var(--text-faint)]" };
-    if (r.verify) {
-      if (r.verify.ok)
-        return {
-          text: `实测正常 ${(r.verify.latency_ms / 1000).toFixed(1)}s`,
-          cls: "text-[var(--ok)]",
-        };
-      return { text: "实测失败", cls: "text-[var(--err)]" };
-    }
-    if (r.expired) return { text: "已过期", cls: "text-[var(--err)]" };
-    return { text: "凭证在位（未实测）", cls: "text-[var(--warn)]" };
   };
 
   return (
@@ -217,7 +187,7 @@ export default function ProvidersSection() {
                 <div class="flex items-center justify-between">
                   <div>
                     <div class="text-sm font-medium">
-                      {labelOf(r)}
+                      {labelOf(specOf(r.provider), r)}
                       <Show when={r.account !== "default"}>
                         <span class="text-[var(--text-faint)]"> · {r.account}</span>
                       </Show>
@@ -317,7 +287,9 @@ export default function ProvidersSection() {
                 <Show when={confirmDel() === r.id}>
                   <div class="mt-2 rounded border border-[var(--warn)]/50 bg-[var(--warn)]/5 px-3 py-2 text-xs space-y-2">
                     <div class="text-[var(--warn)]">
-                      {`该账号正被 ${r.usedBy.join(" / ")} 使用，删除后这些角色将失去可用凭证。`}
+                      {r.usedBy.length > 0
+                        ? `该账号正被 ${r.usedBy.join(" / ")} 使用，删除后这些角色将失去可用凭证。`
+                        : `确认删除 ${r.id}？删除后需重新添加才能恢复使用。`}
                     </div>
                     <div class="flex gap-2">
                       <button

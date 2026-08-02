@@ -70,7 +70,7 @@ async fn lifecycle() {
     let broker = ApprovalBroker::new();
     let bus = EventBus::default();
     let ctx = ApprovalCtx { broker: &broker, bus: &bus, cancel: None, session_id: "t" };
-    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "wt1", true, Some(&ctx))).await.unwrap();
+    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "wt1", true, Some(&ctx), false)).await.unwrap();
     assert!(list(&repo).await.unwrap().is_empty());
 
     std::fs::remove_dir_all(&repo).ok();
@@ -133,7 +133,7 @@ async fn delete_branch_requires_approval() {
     let broker = ApprovalBroker::new();
     let bus = EventBus::default();
     let ctx = ApprovalCtx { broker: &broker, bus: &bus, cancel: None, session_id: "t" };
-    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "b1", true, Some(&ctx))).await.unwrap();
+    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "b1", true, Some(&ctx), false)).await.unwrap();
     assert!(!repo.join(".kxen/worktrees/b1").exists());
     assert!(git_out(&repo, &["branch", "--list", "kxen/b1"]).trim().is_empty());
     std::fs::remove_dir_all(&repo).ok();
@@ -154,11 +154,84 @@ async fn dirty_remove_guarded_by_approval() {
     let broker = ApprovalBroker::new();
     let bus = EventBus::default();
     let ctx = ApprovalCtx { broker: &broker, bus: &bus, cancel: None, session_id: "t" };
-    let err = respond_via_bus(&broker, &bus, false, remove_with_approval(&repo, "d1", false, Some(&ctx))).await.unwrap_err();
+    let err = respond_via_bus(&broker, &bus, false, remove_with_approval(&repo, "d1", false, Some(&ctx), false)).await.unwrap_err();
     assert!(err.contains("用户拒绝"), "{err}");
     assert!(wt.join("dirty.txt").exists());
 
-    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "d1", false, Some(&ctx))).await.unwrap();
+    respond_via_bus(&broker, &bus, true, remove_with_approval(&repo, "d1", false, Some(&ctx), false)).await.unwrap();
     assert!(!wt.exists());
     std::fs::remove_dir_all(&repo).ok();
+}
+
+/// confirmed（前端行内确认条已显式确认）：dirty/删分支都不再挂审批，无通道也直接执行；
+/// agent 工具路径恒 confirmed=false，审批语义不受影响（见 dirty_remove_guarded_by_approval）
+#[tokio::test]
+async fn confirmed_skips_approval() {
+    let repo = init_repo("conf");
+    create(&repo, "cf1").await.unwrap();
+    let wt = repo.join(".kxen/worktrees/cf1");
+    std::fs::write(wt.join("dirty.txt"), "x").unwrap();
+
+    // 无审批通道 + confirmed：不拒绝、不挂起，直接删（连分支一起）
+    remove_with_approval(&repo, "cf1", true, None, true).await.unwrap();
+    assert!(!wt.exists());
+    assert!(git_out(&repo, &["branch", "--list", "kxen/cf1"]).trim().is_empty());
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// 残留同名分支（remove 保留分支后重建同名 worktree）：复用该分支而不是报错
+#[tokio::test]
+async fn create_reuses_leftover_branch() {
+    let repo = init_repo("rebr");
+    create(&repo, "rb1").await.unwrap();
+    remove(&repo, "rb1", false).await.unwrap(); // 分支保留
+    assert!(git_out(&repo, &["branch", "--list", "kxen/rb1"]).contains("kxen/rb1"));
+
+    let info = create(&repo, "rb1").await.unwrap();
+    assert_eq!(info.branch, "kxen/rb1");
+    assert!(info.path.join("a.txt").exists(), "复用分支重建的 worktree 必须有内容");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// .kxen/backups 数量上限：超出保留最近 50 份，最旧的被清掉
+#[test]
+fn prune_backups_keeps_newest() {
+    use kxen_app::tools::worktree::prune_backups;
+    let dir = std::env::temp_dir().join(format!("kxen-wt-prune-{}", std::process::id()));
+    let backups = dir.join(".kxen/backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    // f000 最先写且 sleep 隔开：mtime 严格最旧，淘汰必命中它
+    std::fs::write(backups.join("f000.kxen-bak"), "x").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    for i in 1..60 {
+        std::fs::write(backups.join(format!("f{i:03}.kxen-bak")), "x").unwrap();
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    std::fs::write(backups.join("newest.kxen-bak"), "x").unwrap();
+    prune_backups(&dir);
+    let left = std::fs::read_dir(&backups).unwrap().count();
+    assert_eq!(left, 50, "必须只保留最近 50 份");
+    assert!(!backups.join("f000.kxen-bak").exists(), "最旧的被清掉");
+    assert!(backups.join("newest.kxen-bak").exists(), "最新的保留");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RPC 边界原语：workspace 内放行（相对/绝对），越界路径被拒
+#[test]
+fn resolve_in_workspace_rejects_escape() {
+    use kxen_app::tools::worktree::resolve_in_workspace;
+    let dir = std::env::temp_dir().join(format!("kxen-wt-bound-{}", std::process::id()));
+    let work = dir.join("work");
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "s").unwrap();
+    let work = work.canonicalize().unwrap();
+    let grants = std::collections::HashSet::new();
+
+    assert!(resolve_in_workspace("a.txt", &work, &grants).is_ok(), "workspace 内相对路径放行");
+    let abs = outside.join("secret.txt").canonicalize().unwrap();
+    let err = resolve_in_workspace(abs.to_str().unwrap(), &work, &grants).unwrap_err();
+    assert!(err.contains("escapes workspace"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
 }

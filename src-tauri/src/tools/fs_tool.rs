@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 const READ_MAX_LINES: usize = 2000;
 const READ_MAX_LINE_CHARS: usize = 2000;
+/// 全量读的大小上限（与 grep 的 MAX_FILE_BYTES 同量级）：超限 read_to_string 会把整文件灌进上下文。
+const READ_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FsToolError {
@@ -24,6 +26,10 @@ pub enum FsToolError {
     Ambiguous { count: usize, expected: usize },
     #[error("file changed externally since last read/edit; re-read before anchor edit: {path}")]
     ExternallyModified { path: String },
+    #[error("delete unavailable: {0}")]
+    TrashUnavailable(&'static str),
+    #[error("file too large for full read/edit ({size} bytes > 512KB cap); use grep or shell sed/head for targeted inspection")]
+    TooLarge { size: u64 },
 }
 
 // ---------------- 会话内文件新鲜度跟踪（免强制 read-before-edit） ----------------
@@ -82,7 +88,7 @@ pub struct ReadResult {
 /// offset 1 基起始行（缺省 1）；limit 缺省 READ_MAX_LINES 且硬 cap 在 READ_MAX_LINES。
 pub fn read(path: &Path, tracker: &FileTracker, cwd: &str, offset: Option<usize>, limit: Option<usize>) -> Result<ReadResult, FsToolError> {
     safety_check(path, cwd)?;
-    let text = std::fs::read_to_string(path)?;
+    let text = read_capped(path)?;
     tracker.mark(path);
 
     let all: Vec<&str> = text.lines().collect();
@@ -136,7 +142,7 @@ pub fn edit(path: &Path, spec: &EditSpec, tracker: &FileTracker, cwd: &str) -> R
     if tracker.changed_externally(path) && matches!(spec, EditSpec::Anchors { .. }) {
         return Err(FsToolError::ExternallyModified { path: path.display().to_string() });
     }
-    let text = std::fs::read_to_string(path)?;
+    let text = read_capped(path)?;
     let mut lines: Vec<String> = text.lines().map(String::from).collect();
 
     let before_lines: Vec<String> = text.lines().map(String::from).collect();
@@ -271,14 +277,32 @@ fn backup(path: &Path, cwd: &str) {
     if std::fs::copy(path, &backup).is_ok() {
         // 备份目录不进 .gitignore 就是另一种工作区污染
         crate::tools::worktree::ensure_gitignore(root).ok();
+        // 数量上限：超出清最旧，.kxen/backups 不无界增长
+        crate::tools::worktree::prune_backups(root);
     }
 }
 
+const TRASH_BIN: &str = "/usr/bin/trash";
+
+/// trash 缺失统一文案（delete 工具错误与 shell rm 遮蔽共用口径）。
+pub(crate) const TRASH_MISSING: &str =
+    "/usr/bin/trash not found (requires macOS 13+); deletion refused instead of a silent fallback to permanent rm";
+
+/// 首次使用即探测 trash 二进制（存在 + 有可执行位）。低版本 macOS 没有该二进制。
+pub(crate) fn trash_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(TRASH_BIN).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
 /// 删除走回收站（macOS /usr/bin/trash）。
+/// trash 缺失时 fail-closed 报明确错误：delete 工具的全部承诺就是可恢复，绝不静默降级成真删除。
 pub fn delete(path: &Path, tracker: &FileTracker, cwd: &str) -> Result<(), FsToolError> {
     safety_check(path, cwd)?;
     tracker.snapshots.record_before(path);
-    let status = std::process::Command::new("/usr/bin/trash").arg(path).status()?;
+    if !trash_available() {
+        return Err(FsToolError::TrashUnavailable(TRASH_MISSING));
+    }
+    let status = std::process::Command::new(TRASH_BIN).arg(path).status()?;
     if !status.success() {
         return Err(FsToolError::Io(std::io::Error::other(format!("trash failed: {status}"))));
     }
@@ -290,6 +314,14 @@ fn safety_check(path: &Path, cwd: &str) -> Result<(), FsToolError> {
         Verdict::Deny { rule_id, reason, .. } => Err(FsToolError::Safety(format!("{rule_id}: {reason}"))),
         _ => Ok(()),
     }
+}
+
+fn read_capped(path: &Path) -> Result<String, FsToolError> {
+    let size = std::fs::metadata(path)?.len();
+    if size > READ_MAX_BYTES {
+        return Err(FsToolError::TooLarge { size });
+    }
+    Ok(std::fs::read_to_string(path)?)
 }
 
 #[cfg(test)]
@@ -304,5 +336,14 @@ mod tests {
         let anchors = generate_anchors(&lines);
         let shifted = find_shifted(&anchors, &lines, 3, &anchors[2].hash, 5);
         assert_eq!(shifted, Some(3));
+    }
+
+    #[test]
+    fn trash_probe_and_missing_message() {
+        // 开发/CI 均为 macOS 13+：探测应命中；缺失分支的用户可读文案钉死在这里
+        assert!(trash_available(), "{TRASH_BIN} should exist on macOS 13+");
+        let msg = FsToolError::TrashUnavailable(TRASH_MISSING).to_string();
+        assert!(msg.contains("/usr/bin/trash"));
+        assert!(msg.contains("refused"), "fail-closed 文案必须说明未执行删除");
     }
 }

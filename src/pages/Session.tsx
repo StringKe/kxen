@@ -6,7 +6,6 @@ import {
   sessionExport,
   sessionMessages,
   sessionPendingList,
-  sessionRunning,
   statusline,
 } from "../lib/chat";
 import { createConverge } from "../lib/converge";
@@ -17,6 +16,7 @@ import { editResend as editResendImpl, forkAt, rerun as rerunImpl } from "../lib
 import { createSendFlow } from "../lib/send";
 import { createSessionRewind } from "../lib/rewind";
 import { createSessionModelLabel } from "../lib/session-model";
+import { createStreamingReconcile } from "../lib/streaming-reconcile";
 import SessionItem from "../components/SessionItem";
 import PendingQueue from "../components/PendingQueue";
 import RewindConfirm from "../components/RewindConfirm";
@@ -29,6 +29,7 @@ import AgentRunCards from "../components/AgentRunCards";
 import Composer from "../components/composer/TextComposer";
 import { ArrowDown, Download, FolderOpen } from "lucide-solid";
 import { toItems, type Item } from "../lib/items";
+import { formatError } from "../lib/error-text";
 
 export default function Session() {
   const [items, setItems] = createSignal<Item[]>([]);
@@ -38,8 +39,7 @@ export default function Session() {
   const [workdir, setWorkdir] = createSignal("");
   let unlisten: (() => void) | undefined;
   let listRef: HTMLDivElement | undefined;
-  // null 哨兵 = 组件首跑（含路由卸载重挂载）：强制重载时间线；
-  // 仅 ""（草稿->激活首发）才跳过重载保住乐观上屏，否则重挂载 items 永远空（时间线空白的根因）
+  // null 哨兵 = 组件首跑强制重载时间线；仅 ""（草稿->激活首发）跳过保住乐观上屏（时间线空白根因修复）
   let prevSid: string | null = null;
   const [pendingQueue, setPendingQueue] = createSignal<string[]>([]);
 
@@ -65,6 +65,44 @@ export default function Session() {
   // 有对话内容才驱动右 dock 滑入
   createEffect(() => setHasConversation(items().length > 0));
 
+  // 首载失败必须与真空区分（Workspaces 同模式）：无 catch 时后端不可达只剩 EmptyHero，
+  // 「加载失败」被伪装成「新会话」，且裸 Promise 产生 unhandled rejection
+  const [loadErr, setLoadErr] = createSignal("");
+  const loadErrText = (e: unknown) => formatError(e instanceof Error ? e.message : String(e));
+
+  const loadQueue = (id: string) => {
+    void sessionPendingList(id)
+      .then((q) => {
+        if (activeSessionId() === id) setPendingQueue(q);
+      })
+      .catch((e: unknown) => {
+        if (activeSessionId() === id) setLoadErr(loadErrText(e));
+      });
+  };
+
+  const loadTimeline = (id: string) => {
+    setLoadErr("");
+    void Promise.all([sessionMessages(id), approvalPending(id)])
+      .then(([messages, pend]) => {
+        if (activeSessionId() === id) {
+          // 落盘决定由 toItems 渲染为已决历史卡；仍在等的审批（broker 300s 窗口内）恢复为等待卡
+          setItems([...toItems(messages), ...pendingApprovalItems(pend)]);
+          scroll();
+        }
+      })
+      .catch((e: unknown) => {
+        if (activeSessionId() === id) setLoadErr(loadErrText(e));
+      });
+  };
+
+  // 重试：时间线与排队队列一起重拉（两者任一失败都落在同一条错误条上）
+  const retryLoad = () => {
+    const id = activeSessionId();
+    if (!id) return;
+    loadQueue(id);
+    loadTimeline(id);
+  };
+
   // 切换会话：加载存储的时间线；草稿态（""）清空。
   // 草稿->激活（首发）跳过重载：此时本地上屏是唯一权威（空载会抹掉乐观消息 = 首行消失的根因）。
   createEffect(() => {
@@ -73,24 +111,15 @@ export default function Session() {
     if (!id) {
       setItems([]);
       setPendingQueue([]);
+      setLoadErr("");
       prevSid = id;
       return;
     }
-    if (prevSid !== id) {
-      void sessionPendingList(id).then((q) => {
-        if (activeSessionId() === id) setPendingQueue(q);
-      });
-    }
+    if (prevSid !== id) loadQueue(id);
     const fromDraft = prevSid === "";
     prevSid = id;
     if (fromDraft) return;
-    void Promise.all([sessionMessages(id), approvalPending(id)]).then(([messages, pend]) => {
-      if (activeSessionId() === id) {
-        // 落盘决定由 toItems 渲染为已决历史卡；仍在等的审批（broker 300s 窗口内）恢复为等待卡
-        setItems([...toItems(messages), ...pendingApprovalItems(pend)]);
-        scroll();
-      }
-    });
+    loadTimeline(id);
   });
 
   /** Done 对账（实现见 lib/converge.ts）：快照权威 + 队列真源。 */
@@ -99,6 +128,13 @@ export default function Session() {
     setPendingQueue,
     scroll: () => scroll(),
   });
+  // streaming 收放按运行真源对账（lib/streaming-reconcile.ts）：done/存亡广播/resync 只是扳机
+  const { reconcile, mountSource } = createStreamingReconcile({
+    activeSessionId,
+    streamingSid,
+    setStreamingSid,
+  });
+  onCleanup(mountSource());
 
   const appendRaw = (field: "content" | "reasoning", text: string) => {
     setItems((prev) => appendRawItem(prev, field, text));
@@ -121,24 +157,22 @@ export default function Session() {
       (reasoning) => appendAssistant("reasoning", reasoning),
       (stats, error) => {
         setOrbPhase(error ? "error" : "thinking");
-        setStreamingSid("");
         batcher.flushNow(); // 残余 delta 先上屏再对账
-        // Done 对账：存储快照为最终权威（含终态文本），stats/error 尾注重挂
-        converge(activeSessionId(), { stats, error });
+        // Done 对账：存储快照为最终权威（含终态文本），stats/error 尾注重挂；
+        // streaming 不当场清：终态先于续跑 spawn 发布，按真源核对（RPC 失败按 run 已终收回）
+        const sid = activeSessionId();
+        converge(sid, { stats, error });
+        if (sid) reconcile(sid, "clear");
       },
       (event) => applyStreamEvent(event, { setItems, setOrbPhase, scroll }),
       () => {
-        // resync（bus lag / 断线重连）：只对账，streaming 由运行真源决定——
-        // run 还在跑：保留 streaming（后续 delta 自然续上，stop 按钮不丢）；
-        // done 在断线窗口丢失：running=false 按真源收回；核对失败（null）保守保留等下轮 resync
+        // resync（bus lag / 断线重连）：只对账；streaming 按真源保持/重臂/收回，
+        // 核对失败（null）保守保留等下轮 resync
         batcher.flushNow();
         const sid = activeSessionId();
         if (!sid) return;
         converge(sid);
-        if (streamingSid() !== sid) return;
-        void sessionRunning(sid).then((running) => {
-          if (running === false && streamingSid() === sid) setStreamingSid("");
-        });
+        reconcile(sid, "keep");
       },
     );
   });
@@ -216,8 +250,9 @@ export default function Session() {
             <span class="text-2xs text-[var(--ok)]">{exportNote()}</span>
           </Show>
           <button
-            class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--text)]"
-            title="导出会话为 markdown"
+            class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-40"
+            disabled={activeSessionId() === ""}
+            title={activeSessionId() === "" ? "暂无可导出内容" : "导出会话为 markdown"}
             onClick={() => void doExport()}
           >
             <Download size={13} />
@@ -253,7 +288,20 @@ export default function Session() {
           {/* agent 状态卡钉在时间线尾部：空会话恢复 agent 现场时也在 EmptyHero 上方可见 */}
           <AgentRunCards />
 
-          <Show when={items().length === 0}>
+          {/* 首载失败给错误条 + 重试（Workspaces 同模式），不与 EmptyHero 同形 */}
+          <Show when={loadErr()}>
+            <div class="rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 p-6 flex items-center gap-3">
+              <span class="text-xs text-[var(--err)]">加载会话失败：{loadErr()}</span>
+              <button
+                class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-xs text-[var(--text-dim)]"
+                onClick={retryLoad}
+              >
+                重试
+              </button>
+            </div>
+          </Show>
+
+          <Show when={items().length === 0 && !loadErr()}>
             <EmptyHero />
           </Show>
         </div>
@@ -270,8 +318,7 @@ export default function Session() {
 
       <div class="px-3 pb-3 composer-fade">
         <div class="w-full">
-          {/* rewind 失败尾注锚在 composer 上方固定区（与 RewindConfirm 同区位）：
-              标题栏右上角离 rewind 触发点（消息操作菜单）太远，错误易被忽略 */}
+          {/* rewind 失败尾注锚在 composer 上方固定区：标题栏离触发点（消息操作菜单）太远易忽略 */}
           <Show when={rewind.note()}>
             <button
               class="pressable mb-1.5 text-2xs text-[var(--err)]"

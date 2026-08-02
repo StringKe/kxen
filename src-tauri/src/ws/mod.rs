@@ -1,7 +1,8 @@
 //! 内嵌 WebSocket 单端点（前端 <-> Rust）：JSON-RPC 3.0 单连接多路复用。
 //! - 请求-响应：{jsonrpc:"3.0", id, method, params} -> {id, resId, result|error}
-//! - 服务端流：stream:{id, seq, mode:"server", complete?}（run 流 / 订阅流）
-//! - 系统方法：rpc.subscribe / rpc.unsubscribe / rpc.cancelStream / rpc.heartbeat
+//! - 服务端流：stream:{id, seq, mode:"server", complete?}（订阅流）
+//! - 系统方法：rpc.subscribe / rpc.unsubscribe / rpc.heartbeat
+//!   （rpc.cancelStream 已删：run 流移除后无消费者，run 取消走 session.abort）
 //!
 //! 端口启动时随机分配，前端经 ws_port command 获取。
 
@@ -20,6 +21,7 @@ pub mod protocol;
 mod queue_delivery;
 mod rpc;
 mod run_finalize;
+mod run_slot;
 mod session_delete;
 pub mod session_ops;
 mod session_recovery;
@@ -205,12 +207,6 @@ async fn handle_client_frame(text: &str, subs: &mut Vec<SubBinding>, sequences: 
             let resp = Response::ok(req.id, json!(true));
             return serde_json::to_string(&resp).ok();
         }
-        protocol::M_CANCEL_STREAM => {
-            let stream_id = req.params.get("stream_id").and_then(Value::as_str).unwrap_or("");
-            let cancelled = cancel_stream(stream_id, subs, sequences, app);
-            let resp = Response::ok(req.id, json!(cancelled));
-            return serde_json::to_string(&resp).ok();
-        }
         _ => {}
     }
 
@@ -220,25 +216,6 @@ async fn handle_client_frame(text: &str, subs: &mut Vec<SubBinding>, sequences: 
         Err(e) => Response::err(req.id, e.code, e.message),
     };
     serde_json::to_string(&resp).ok()
-}
-
-/// cancelStream：run 流找 session cancel；sub 流退订。
-fn cancel_stream(stream_id: &str, subs: &mut Vec<SubBinding>, sequences: &mut StreamSequences, app: &AppHandle) -> bool {
-    if stream_id.starts_with("sub-") {
-        subs.retain(|b| b.stream_id != stream_id);
-        sequences.remove(stream_id);
-        return true;
-    }
-    let state = app.state::<Arc<AppState>>();
-    let session_id = kxen_app::core::shared::lock(&state.run_streams).get(stream_id).cloned();
-    if let Some(session_id) = session_id {
-        let token = kxen_app::core::shared::lock(&state.active_runs).get(&session_id).cloned();
-        if let Some(token) = token {
-            token.cancel();
-            return true;
-        }
-    }
-    false
 }
 
 /// resync 控制帧的固定 stream id：前端按此识别「丢增量，需全量重拉」。

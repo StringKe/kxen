@@ -86,8 +86,53 @@ pub async fn execute_calls(
     let assistant_calls: Vec<crate::llm::types::AssistantToolCall> =
         calls.iter().map(|c| crate::llm::types::AssistantToolCall::function(c.id.clone(), c.name.clone(), c.arguments.clone())).collect();
     messages.push(Message::assistant_with_tools(text, assistant_calls));
-    for (call, result) in calls.into_iter().zip(results) {
-        messages.push(Message::tool_result(call.id, call.name, result_text(&result)));
-    }
+    push_tool_results(calls, results, messages);
     (aborted, loop_stop)
+}
+
+/// 中断/截断时 results 短于 calls：provider 要求每个 tool_call 都有配对 tool_result，
+/// 否则历史被毒化、下一次请求被 400 拒绝且不可自愈（P1-1）。未执行的 call 补占位结果。
+fn push_tool_results(calls: Vec<ToolCall>, results: Vec<Result<String, String>>, messages: &mut Vec<Message>) {
+    let mut results = results.into_iter();
+    for call in calls {
+        let text = results.next().map(|r| result_text(&r)).unwrap_or_else(|| "(interrupted: aborted before execution)".to_string());
+        messages.push(Message::tool_result(call.id, call.name, text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::Role;
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall { id: id.to_string(), name: "read".to_string(), arguments: "{}".to_string() }
+    }
+
+    #[test]
+    fn aborted_run_pads_placeholder_results_for_unexecuted_calls() {
+        // 模拟 abort：4 个 call 只产 1 条结果（中断占位），其余 3 条未执行
+        let calls = vec![call("c1"), call("c2"), call("c3"), call("c4")];
+        let results = vec![Err("(interrupted)".to_string())];
+        let mut messages = Vec::new();
+        push_tool_results(calls, results, &mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert!(messages.iter().all(|m| m.role == Role::Tool && m.tool_call_id.is_some()));
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[0].content, "ERROR: (interrupted)");
+        for (msg, id) in messages[1..].iter().zip(["c2", "c3", "c4"]) {
+            assert_eq!(msg.tool_call_id.as_deref(), Some(id));
+            assert_eq!(msg.content, "(interrupted: aborted before execution)");
+        }
+    }
+
+    #[test]
+    fn normal_run_pairs_every_call_with_its_result() {
+        let calls = vec![call("c1"), call("c2")];
+        let results = vec![Ok("a".to_string()), Ok("b".to_string())];
+        let mut messages = Vec::new();
+        push_tool_results(calls, results, &mut messages);
+        assert_eq!(messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
 }

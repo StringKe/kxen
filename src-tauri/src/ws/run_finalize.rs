@@ -96,8 +96,7 @@ pub(super) async fn finalize_run(end: RunEnd<'_>) {
         parts.push(ses::Part::Text { text: "(run 异常结束，无输出——请重试或发送「继续」)".into() });
     }
     let assistant_msg = ses::new_message(&session_id, ses::Role::Assistant, parts);
-    // 客户端收到终态会立即对账；先摘除 run 状态并持久化 Assistant，终态只能是最后一个可见状态变化。
-    kxen_app::core::shared::lock(&state.run_streams).remove(&stream_id);
+    // 客户端收到终态会立即对账：持久化 Assistant 必须先于终态发布，终态只能是最后一个可见状态变化。
     append_assistant_and_publish(&sessions_dir, &assistant_msg, &state.bus, &stream_id, &outcome.terminal);
 
     // Queue delivery 在用户消息幂等落盘后已经 ack。这里只 claim 下一条；
@@ -117,7 +116,6 @@ pub(super) async fn finalize_run(end: RunEnd<'_>) {
     };
     if let Some(q) = next {
         let stream_id = super::protocol::stream_id("run");
-        kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), session_id.clone());
         super::llm_task::spawn_run(stream_id, session_id, q.text, q.context, q.images, Some(q.id), app.clone());
     }
 }

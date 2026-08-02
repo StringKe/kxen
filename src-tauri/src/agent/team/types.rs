@@ -93,7 +93,14 @@ pub(crate) struct TeamState {
 /// 各写一份内联序列化会在字段演进时漂移（一处改了另一处漏改）。
 pub(crate) fn persist_config(state: &TeamState) {
     let config = serde_json::json!({ "session_id": state.session_id, "members": *crate::core::shared::lock(&state.members) });
-    let _ = std::fs::write(state.dir.join("config.json"), serde_json::to_string_pretty(&config).unwrap_or_default());
+    // tmp+rename 原子写：崩溃不留半截 config（restore 靠它重建常驻 teammate，半截 JSON = 整队丢失）
+    let path = state.dir.join("config.json");
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) =
+        std::fs::write(&tmp, serde_json::to_string_pretty(&config).unwrap_or_default()).and_then(|_| std::fs::rename(&tmp, &path))
+    {
+        tracing::warn!(session = state.session_id, error = %e, "team config.json persist failed");
+    }
 }
 
 /// 成员 + 任务的可读清单（lead/teammate 的 list 动作输出）

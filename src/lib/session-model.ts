@@ -50,9 +50,12 @@ export async function applyDraftModel(sessionId: string): Promise<void> {
 export function createSessionModelLabel(getSid: () => string): () => string {
   const [label, setLabel] = createSignal("");
   createEffect(() => {
-    void currentModel(getSid() || undefined).then(async (m) =>
-      setLabel(displayName(await modelsCatalog().catch(() => []), m.provider, m.model)),
-    );
+    void currentModel(getSid() || undefined)
+      .then(async (m) =>
+        setLabel(displayName(await modelsCatalog().catch(() => []), m.provider, m.model)),
+      )
+      // 后端不可达不浮 unhandled rejection：署名是增强，空串回落（同 createSessionCtxWindow）
+      .catch(() => setLabel(""));
   });
   return label;
 }

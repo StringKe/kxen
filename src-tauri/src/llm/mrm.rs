@@ -4,7 +4,6 @@
 use crate::core::config::{Config, RoleBinding};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod state;
 
@@ -25,8 +24,8 @@ pub struct DispatchRecord {
 }
 
 pub struct Slot {
-    _permit_global: OwnedSemaphorePermit,
-    _permit_provider: OwnedSemaphorePermit,
+    _permit_global: state::PoolPermit,
+    _permit_provider: state::PoolPermit,
 }
 
 /// acquire_role 的产出：解析证据与并发槽绑定（Drop 即释放槽位，杜绝解析到占槽之间的超发窗口）。
@@ -238,22 +237,16 @@ impl ModelResourceManager {
     }
 
     /// 并发池按 provider 段归一：同 provider 多账号共享一个池（"" 为全局池，不进此归一以外的拆分）。
-    async fn semaphore_for(&self, key: &str) -> Arc<Semaphore> {
-        let provider = key.split(':').next().unwrap_or(key);
-        let limit = self.limit_of(provider) as usize;
-        let mut map = self.state.semaphores.lock().await;
-        map.entry(provider.to_string()).or_insert_with(|| Arc::new(Semaphore::new(limit.max(1)))).clone()
-    }
-
-    fn limit_of(&self, key: &str) -> u32 {
+    /// 限额实时读 config：热更换限即生效（P1-6），在飞计数经共享 state 跨重建保留。
+    fn slot_limit(&self, key: &str) -> usize {
         // key 可为账号槽位键（provider:account）：取 provider 段的限额配置
         let provider = key.split(':').next().unwrap_or(key);
         self.config.limits.providers.get(provider).and_then(|l| l.concurrent).unwrap_or(self.config.limits.global_concurrent.max(1))
+            as usize
     }
 
     pub async fn available(&self, provider: &str) -> bool {
-        let sem = self.semaphore_for(provider).await;
-        sem.available_permits() > 0
+        self.state.pools.in_flight(provider) < self.slot_limit(provider).max(1)
     }
 
     /// 占槽（RPM 滑窗等待 + provider 并发总池 + 全局并发池），返回 RAII guard。
@@ -261,20 +254,16 @@ impl ModelResourceManager {
     pub async fn acquire(&self, provider: &str, account: Option<&str>) -> Slot {
         let key = crate::auth::credential::account_id(provider, account.unwrap_or("default"));
         self.wait_rpm(&key).await;
-        let sem = self.semaphore_for(provider).await;
-        let permit_provider = sem.acquire_owned().await.expect("semaphore closed");
-        // 全局并发（用 global_concurrent 总量的独立 semaphore）
-        let global = self.semaphore_for("").await;
-        let permit_global = global.acquire_owned().await.expect("semaphore closed");
+        let permit_provider = self.state.pools.acquire(provider, self.slot_limit(provider)).await;
+        // 全局并发（global_concurrent 总量的独立池）
+        let permit_global = self.state.pools.acquire("", self.slot_limit("")).await;
         Slot { _permit_global: permit_global, _permit_provider: permit_provider }
     }
 
     /// 非阻塞占槽：provider 池 try 成功才选定；全局池失败时 provider permit 随 drop 回吐，不留半占状态。
     async fn try_slot(&self, provider: &str) -> Option<Slot> {
-        let sem = self.semaphore_for(provider).await;
-        let permit_provider = sem.try_acquire_owned().ok()?;
-        let global = self.semaphore_for("").await;
-        let permit_global = global.try_acquire_owned().ok()?;
+        let permit_provider = self.state.pools.try_acquire(provider, self.slot_limit(provider))?;
+        let permit_global = self.state.pools.try_acquire("", self.slot_limit(""))?;
         Some(Slot { _permit_global: permit_global, _permit_provider: permit_provider })
     }
 
@@ -333,10 +322,10 @@ impl ModelResourceManager {
     }
 
     pub async fn describe(&self) -> String {
-        let map = self.state.semaphores.lock().await;
         let mut lines = vec![format!("global limit: {}", self.config.limits.global_concurrent)];
-        for (provider, sem) in map.iter() {
-            lines.push(format!("{provider}: {}/{} available", sem.available_permits(), self.limit_of(provider)));
+        for (provider, in_flight) in self.state.pools.snapshot() {
+            let limit = self.slot_limit(&provider).max(1);
+            lines.push(format!("{provider}: {}/{} available", limit.saturating_sub(in_flight), limit));
         }
         lines.join("\n")
     }

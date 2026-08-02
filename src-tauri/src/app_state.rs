@@ -24,8 +24,6 @@ pub struct AppState {
     pub active_runs: std::sync::Mutex<std::collections::HashMap<String, kxen_app::agent::cancel::CancelToken>>,
     /// session 排队消息（落盘持久化：崩溃重启可恢复续跑；run 结束按序接续，防并发 run 交叉写历史）
     pub pending_messages: std::sync::Arc<kxen_app::core::pending_queue::PendingQueues>,
-    /// stream_id -> session_id（rpc.cancelStream 路由用）
-    pub run_streams: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// session_id -> (input, output) tokens 累计（状态栏用量段）
     pub session_tokens: std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
     /// session_id -> 最近一次 run 的 input tokens（ctx 占用近似值，进度条数据源）
@@ -102,7 +100,6 @@ impl AppState {
             agents,
             active_runs: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_messages,
-            run_streams: std::sync::Mutex::new(std::collections::HashMap::new()),
             mrm,
             session_tokens: std::sync::Mutex::new(kxen_app::core::usage::load()),
             session_last_input: std::sync::Mutex::new(std::collections::HashMap::new()),

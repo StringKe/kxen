@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import AgentFocusView from "./AgentFocusView";
 import { setActiveSessionId, setAgents } from "../lib/state";
 import { flash } from "../lib/flash";
+import { fireResync } from "../lib/client";
 import type { AgentActivity, TranscriptEntry } from "../lib/team";
 
 const mocks = vi.hoisted(() => ({
@@ -187,6 +188,21 @@ describe("AgentFocusView", () => {
     expect(divs).toHaveLength(2);
     expect(divs[0]!.textContent).toBe("The user wants");
     expect(divs[1]!.textContent).toBe("think more");
+    dispose();
+  });
+
+  it("resync（断线重连/bus lag）：重拉转录对账，不闪 loading", async () => {
+    setAgents([run("w", "working")]);
+    mocks.transcript.mockResolvedValue([{ kind: "text", text: "旧转录" }]);
+    const { dispose, body } = mount("w");
+    await tick();
+    expect(body()).toContain("旧转录");
+    mocks.transcript.mockResolvedValue([{ kind: "text", text: "补齐的转录" }]);
+    fireResync();
+    await tick();
+    expect(mocks.transcript).toHaveBeenCalledTimes(2);
+    expect(body()).toContain("补齐的转录");
+    expect(body()).not.toContain("加载中…");
     dispose();
   });
 });

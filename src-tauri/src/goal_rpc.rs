@@ -27,7 +27,8 @@ fn to_json(goal: &Goal) -> Value {
     })
 }
 
-pub fn call(method: &str, params: Value, bus: &kxen_app::core::event::EventBus) -> Result<Value, String> {
+pub fn call(method: &str, params: Value, state: &std::sync::Arc<crate::AppState>) -> Result<Value, String> {
+    let bus = &state.bus;
     match method {
         "goal.list" => {
             let goals = Goal::list(&dir());
@@ -58,12 +59,12 @@ pub fn call(method: &str, params: Value, bus: &kxen_app::core::event::EventBus) 
             publish(bus, &goal);
             Ok(to_json(&goal))
         }
-        "goal.activate" => transit(params, bus, |g| g.activate()),
-        "goal.pause" => transit(params, bus, |g| g.pause()),
-        "goal.resume" => transit(params, bus, |g| g.resume()),
-        "goal.cancel" => transit(params, bus, |g| g.cancel()),
+        "goal.activate" => transit(params, state, |g| g.activate()),
+        "goal.pause" => transit(params, state, |g| g.pause()),
+        "goal.resume" => transit(params, state, |g| g.resume()),
+        "goal.cancel" => transit(params, state, |g| g.cancel()),
         // 预算耗尽后的唯一自助出口：提高预算并 resume（Dock「提高预算并继续」按钮）
-        "goal.adjust" => transit(params, bus, |g| g.adjust_budget_and_resume()),
+        "goal.adjust" => transit(params, state, |g| g.adjust_budget_and_resume()),
         other => Err(format!("unknown goal method: {other}")),
     }
 }
@@ -78,14 +79,25 @@ fn load(id: &str) -> Result<Goal, String> {
 
 fn transit(
     params: Value,
-    bus: &kxen_app::core::event::EventBus,
+    state: &std::sync::Arc<crate::AppState>,
     f: impl FnOnce(&mut Goal) -> Result<(), kxen_app::core::goal::GoalError>,
 ) -> Result<Value, String> {
     let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
+    // 与记账共用 per-id 锁（P2-2）：并发 adjust 与 charge 的 load-modify-save 串行化，不互相覆盖
+    let lock = kxen_app::core::goal::write_lock(id);
+    let _guard = kxen_app::core::shared::lock(&lock);
     let mut goal = load(id)?;
     f(&mut goal).map_err(|e| e.to_string())?;
     goal.save(&dir()).map_err(|e| e.to_string())?;
-    publish(bus, &goal);
+    // pause/cancel 停在飞 run（P2-1）：直接 cancel run 令牌即时停出，不等轮末记账发现
+    if matches!(goal.status, kxen_app::core::goal::GoalStatus::Paused | kxen_app::core::goal::GoalStatus::Canceled)
+        && let Some(sid) = goal.session_id.as_deref()
+    {
+        if let Some(token) = kxen_app::core::shared::lock(&state.active_runs).get(sid).cloned() {
+            token.cancel();
+        }
+    }
+    publish(&state.bus, &goal);
     Ok(to_json(&goal))
 }
 

@@ -20,6 +20,8 @@ const h = vi.hoisted(() => ({
   sendMessage: vi.fn(async (_sid: string, _text: string, _c: unknown[], _i: unknown[]) => ({
     queued: false,
   })),
+  // session.update 存亡广播订阅的回调按次捕获：测试手动驱动 RunGuard 帧
+  sessionUpdateHandlers: [] as Array<(p: unknown) => void>,
   // onLlmDelta 的回调按次捕获：测试手动驱动 delta/done/resync 帧
   delta: {} as {
     onText?: (text: string) => void;
@@ -57,6 +59,24 @@ vi.mock("../lib/chat", async (importOriginal) => {
     sessionAbort: h.sessionAbort,
     sendMessage: h.sendMessage,
     onLlmDelta: h.onLlmDelta,
+  };
+});
+
+// 铺开真实 client 只桩 stream：streaming-reconcile 的 session.update 订阅需要手动驱动，
+// rpc 保持真实（测试环境无 Tauri internals，原样失败，各调用方本就有 catch）
+vi.mock("../lib/client", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../lib/client")>();
+  return {
+    ...orig,
+    client: {
+      ...orig.client,
+      stream: (topics: string | string[]) => ({
+        on: (cb: (p: unknown) => void) => {
+          if (topics === "session.update") h.sessionUpdateHandlers.push(cb);
+          return () => {};
+        },
+      }),
+    },
   };
 });
 
@@ -120,6 +140,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   setActiveSessionId("");
   h.delta = {};
+  h.sessionUpdateHandlers.length = 0;
   for (const fn of Object.values(h)) if (vi.isMockFunction(fn)) fn.mockClear();
   h.sessionMessages.mockImplementation(async () => []);
   h.approvalPending.mockImplementation(async () => []);
@@ -221,6 +242,39 @@ describe("Session 流式与对账", () => {
     await flush();
     expect(h.sessionRunning).toHaveBeenCalledWith("s1");
     expect(document.body.textContent).not.toContain("composer-streaming");
+    dispose();
+  });
+
+  it("Done 后续跑 run（running=true）：streaming 保持，进度指示/停止钮不丢", async () => {
+    h.sessionRunning.mockImplementation(async () => true);
+    const dispose = await mountStreaming();
+    h.delta.onDone?.();
+    await flush();
+    expect(h.sessionRunning).toHaveBeenCalledWith("s1");
+    expect(document.body.textContent).toContain("composer-streaming");
+    dispose();
+  });
+
+  it("快速终态 done 帧被 ACL 丢弃：session.update 存亡广播按真源收回（不卡死）", async () => {
+    h.sessionRunning.mockImplementation(async () => false);
+    const dispose = await mountStreaming();
+    expect(document.body.textContent).toContain("composer-streaming");
+    // onDone 永不触发，只有 RunGuard 存亡广播兜底
+    h.sessionUpdateHandlers.forEach((cb) => cb({}));
+    await flush();
+    expect(document.body.textContent).not.toContain("composer-streaming");
+    dispose();
+  });
+
+  it("session.update 存亡广播 running=true：未臂时重臂 streaming（续跑恢复进度指示）", async () => {
+    h.sessionRunning.mockImplementation(async () => true);
+    setActiveSessionId("s1");
+    const dispose = render(() => <Session />, document.body);
+    await flush();
+    expect(document.body.textContent).not.toContain("composer-streaming");
+    h.sessionUpdateHandlers.forEach((cb) => cb({}));
+    await flush();
+    expect(document.body.textContent).toContain("composer-streaming");
     dispose();
   });
 });

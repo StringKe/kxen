@@ -1,7 +1,6 @@
 // SessionTree：Codex 式项目-会话树（每组 ≤5 条，组可折叠，行内置顶/重命名/删除确认/拖拽排序）。
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { ChevronDown, ChevronRight, FolderOpen, FolderPlus, PenLine, Plus } from "lucide-solid";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   sessionUpdateMeta,
   workspaceAdd,
@@ -12,6 +11,7 @@ import {
 } from "../lib/chat";
 import { deleteSession, newSession, refreshSessions, sessions, switchSession } from "../lib/state";
 import { createInFlight } from "../lib/async-guard";
+import { openProjectDir } from "../lib/open-project";
 import { flashErr } from "../lib/flash";
 import { formatError } from "../lib/error-text";
 import { sortGroup } from "../lib/order";
@@ -146,18 +146,9 @@ export default function SessionTree() {
     await reloadRecents();
   };
 
-  // 原生目录选择器：用户不应手敲绝对路径
+  // 原生目录选择器（逻辑收口在 open-project，与 EmptyHero 首屏卡共用）；成功后补 recents
   const pickDir = async () => {
-    const selected = await openDialog({
-      directory: true,
-      multiple: false,
-      title: "选择项目目录",
-    }).catch(() => null);
-    if (typeof selected === "string" && selected) {
-      await addAndSwitch(selected).catch((e) => {
-        flashErr(`添加目录失败：${formatError(e instanceof Error ? e.message : String(e))}`);
-      });
-    }
+    if (await openProjectDir()) await reloadRecents();
   };
 
   const addPath = async () => {
@@ -208,9 +199,18 @@ export default function SessionTree() {
             expanded().has(group.path) ? group.sessions : group.sessions.slice(0, MAX_PER_GROUP);
           return (
             <div>
-              <button
-                class="group w-full flex items-center gap-1 px-1.5 py-1 rounded text-xs text-[var(--text-dim)] hover:bg-[var(--bg-overlay)]/60"
+              <div
+                class="group w-full flex items-center gap-1 px-1.5 py-1 rounded text-xs text-[var(--text-dim)] hover:bg-[var(--bg-overlay)]/60 cursor-pointer"
+                role="button"
+                tabindex="0"
                 onClick={() => toggle(group.path)}
+                onKeyDown={(e) => {
+                  // 只在行本体响应：内嵌「新建会话」真 button 的键盘事件不抢（button 原生处理 Enter/Space）
+                  if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+                    e.preventDefault();
+                    toggle(group.path);
+                  }
+                }}
               >
                 <Show when={isCollapsed()} fallback={<ChevronDown size={11} />}>
                   <ChevronRight size={11} />
@@ -219,10 +219,9 @@ export default function SessionTree() {
                 <span class="flex-1 text-left truncate font-medium" title={group.path}>
                   {group.name}
                 </span>
-                <span
-                  role="button"
-                  tabindex="0"
-                  class="opacity-0 group-hover:opacity-100 px-0.5 rounded hover:text-[var(--text)]"
+                {/* 真 button（旧 span 假按钮键盘不可达）；button 不许嵌 button，外层故为 div[role=button] */}
+                <button
+                  class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 px-0.5 rounded hover:text-[var(--text)]"
                   title="在此项目下新建会话"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -230,11 +229,11 @@ export default function SessionTree() {
                   }}
                 >
                   <Plus size={12} />
-                </span>
+                </button>
                 <Show when={group.sessions.length > 0}>
                   <span class="text-2xs text-[var(--text-faint)]">{group.sessions.length}</span>
                 </Show>
-              </button>
+              </div>
               <Show when={!isCollapsed()}>
                 <div class="ml-4 space-y-0.5">
                   <For each={visible()}>

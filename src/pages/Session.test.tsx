@@ -81,3 +81,25 @@ describe("Session 路由卸载重挂载", () => {
     dispose();
   });
 });
+
+describe("Session 首载错误态", () => {
+  it("时间线加载失败出错误条 + 重试（不与 EmptyHero 同形），重试成功恢复", async () => {
+    setActiveSessionId("s1");
+    h.sessionMessages.mockRejectedValueOnce(new Error("backend down"));
+    const dispose = render(() => <Session />, document.body);
+    await flush();
+    expect(document.body.textContent).toContain("加载会话失败");
+    expect(document.body.textContent).toContain("backend down"); // 原因上屏
+    expect(document.body.textContent).not.toContain("历史消息一");
+
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (b) => b.textContent === "重试",
+    );
+    expect(retry).toBeTruthy();
+    retry?.click();
+    await flush();
+    expect(document.body.textContent).toContain("历史消息一");
+    expect(document.body.textContent).not.toContain("加载会话失败");
+    dispose();
+  });
+});

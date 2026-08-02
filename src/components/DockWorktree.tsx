@@ -40,15 +40,22 @@ export default function DockWorktree() {
   const [active, setActive] = createSignal("");
   const [name, setName] = createSignal("");
   const [pendingRemove, setPendingRemove] = createSignal<PendingRemove | null>(null);
+  // 首载失败与真空区分（Session/Workspaces 同模式）：失败出重试条，5s 轮询成功自动复位
+  const [loadFailed, setLoadFailed] = createSignal(false);
   const removeAction = createAction();
   const switchAction = createAction();
 
   const reload = async () => {
     const [list, sl] = await Promise.all([
-      worktreeList().catch(() => []),
+      worktreeList().catch(() => null),
       statusline("").catch(() => null),
     ]);
     if (sl) setActive(sl.workdir);
+    if (!list) {
+      setLoadFailed(true); // 失败保留旧数据，不伪装真空
+      return;
+    }
+    setLoadFailed(false);
     setTrees(
       await Promise.all(
         list.map(async (t) => ({ ...t, dirty: (await worktreeStatus(t.path)).length })),
@@ -91,8 +98,10 @@ export default function DockWorktree() {
     await reload();
   };
 
-  const doRemove = (r: PendingRemove) =>
-    removeAction.run(() => worktreeRemove(r.name, r.withBranch), {
+  // confirmed=true 仅来自行内确认条确认后：后端据此跳过审批挂起（否则同一删除要确认两次，
+  // 第二次是无 session 归属的时间线审批卡，漏看即 300s 超时）
+  const doRemove = (r: PendingRemove, confirmed: boolean) =>
+    removeAction.run(() => worktreeRemove(r.name, r.withBranch, confirmed), {
       okText: r.withBranch ? `已删除 ${r.branch}` : "已移除 worktree（分支保留）",
       errPrefix: "删除失败",
       onOk: () => void reload(),
@@ -104,7 +113,7 @@ export default function DockWorktree() {
     if (t.dirty > 0 || withBranch) {
       setPendingRemove(r);
     } else {
-      void doRemove(r);
+      void doRemove(r, false);
     }
   };
 
@@ -133,7 +142,7 @@ export default function DockWorktree() {
                 onClick={() => {
                   const p = r();
                   setPendingRemove(null);
-                  void doRemove(p);
+                  void doRemove(p, true);
                 }}
               >
                 确认删除
@@ -149,7 +158,18 @@ export default function DockWorktree() {
         )}
       </Show>
       <div class="space-y-1">
-        <For each={trees()} fallback={<EmptyLine text="无隔离树" />}>
+        <Show when={loadFailed()}>
+          <div class="rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 px-3 py-2 flex items-center gap-2">
+            <span class="text-2xs text-[var(--err)]">加载 worktree 列表失败</span>
+            <button
+              class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-2xs text-[var(--text-dim)]"
+              onClick={() => void reload()}
+            >
+              重试
+            </button>
+          </div>
+        </Show>
+        <For each={trees()}>
           {(t) => (
             <div class="group flex items-center gap-1.5 text-xs">
               <Show when={t.path === active()}>
@@ -163,7 +183,7 @@ export default function DockWorktree() {
               </Show>
               <Show when={t.path !== active()}>
                 <button
-                  class="opacity-0 group-hover:opacity-100 pressable px-1 rounded text-2xs text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-50"
+                  class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pressable px-1 rounded text-2xs text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-50"
                   title="切换工作区到此树（会话跑在该隔离目录）"
                   disabled={switchAction.pending()}
                   onClick={() => void switchTo(t)}
@@ -172,7 +192,7 @@ export default function DockWorktree() {
                 </button>
               </Show>
               <button
-                class="opacity-0 group-hover:opacity-100 pressable px-1 rounded text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-50"
+                class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pressable px-1 rounded text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-50"
                 title={
                   t.path === active()
                     ? "当前活跃 worktree 不可删除（先切换到其他目录）"
@@ -184,7 +204,7 @@ export default function DockWorktree() {
                 <Trash2 size={11} />
               </button>
               <button
-                class="opacity-0 group-hover:opacity-100 pressable px-1 rounded text-2xs text-[var(--err)] disabled:opacity-50"
+                class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pressable px-1 rounded text-2xs text-[var(--err)] disabled:opacity-50"
                 title={
                   t.path === active()
                     ? "当前活跃 worktree 不可删除（先切换到其他目录）"
@@ -198,6 +218,10 @@ export default function DockWorktree() {
             </div>
           )}
         </For>
+        {/* 真空与首载失败区分：失败时只出上面的重试条，不画「无隔离树」 */}
+        <Show when={trees().length === 0 && !loadFailed()}>
+          <EmptyLine text="无隔离树" />
+        </Show>
       </div>
       <div class="flex gap-1.5 mt-2">
         <input

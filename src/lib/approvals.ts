@@ -1,5 +1,7 @@
 // 审批事件处理：approval 事件入时间线 + 用户应答回写（Session.tsx 拆出，350 门禁）。
 import { approvalRespond, type PendingApproval } from "./chat";
+import { flashErr } from "./flash";
+import { formatError } from "./error-text";
 import type { ToolEvent } from "./delta";
 import type { Item } from "./items";
 
@@ -28,11 +30,16 @@ export async function respondApproval(
   id: string,
   allow: boolean,
 ): Promise<void> {
-  const r = await approvalRespond(id, allow).catch(() => null);
-  // resolved:false = 服务端已了结（超时/取消/已被应答）的迟到应答：置失效，不冒充用户决定；
-  // RPC 失败保持旧乐观行为（按用户点击上屏）
+  // RPC 失败不上假已决态：后端 broker 仍在等应答，保持等待卡（用户可重试或等超时事件），
+  // 错误上屏让用户感知失败——假已决态会让用户以为已应答，实际命令仍挂起
+  const r = await approvalRespond(id, allow).catch((e: unknown) => {
+    flashErr(`审批应答失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+    return null;
+  });
+  if (r === null) return;
+  // resolved:false = 服务端已了结（超时/取消/已被应答）的迟到应答：置失效，不冒充用户决定
   const resolved =
-    r?.resolved === false
+    r.resolved === false
       ? ("expired" as const)
       : allow
         ? ("allowed" as const)

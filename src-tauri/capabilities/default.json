@@ -7,7 +7,6 @@
     "core:default",
     "websocket:default",
     "core:window:allow-start-dragging",
-    "notification:default",
     "dialog:default",
     "updater:default",
     "process:default"

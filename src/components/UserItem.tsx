@@ -3,6 +3,7 @@
 import { createSignal, For, Show } from "solid-js";
 import MessageActions from "./MessageActions";
 import { openMenu } from "../lib/context-menu";
+import { writeClipboard } from "../lib/clipboard";
 import type { MsgItem } from "../lib/items";
 
 export default function UserItem(props: {
@@ -35,11 +36,13 @@ export default function UserItem(props: {
       class="group relative flex flex-col items-end gap-1"
       onContextMenu={(e) => {
         openMenu(e, [
+          { label: "复制内容", action: () => writeClipboard(props.item.content) },
           {
-            label: "复制内容",
-            action: () => void navigator.clipboard.writeText(props.item.content),
+            label: "从此处分叉",
+            // 未持久化的乐观消息没有 messageId，后端只会报 missing message_id：入口禁用（同「回退到此处」）
+            disabled: !props.item.messageId,
+            action: props.onFork,
           },
-          { label: "从此处分叉", action: props.onFork },
           { label: "编辑并重发", action: startEdit },
           {
             label: "回退到此处",

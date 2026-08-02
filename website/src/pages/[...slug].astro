@@ -30,8 +30,12 @@ const prevNext = await getPrevNext(currentSlug, {
   overrides: { prev: entry.data.prev, next: entry.data.next },
 });
 // Pass `collection` so versioned pages (docs-<v>) get version-prefixed
-// breadcrumb hrefs — parity with the getSidebar call above.
-const breadcrumbs = await getBreadcrumbs(currentSlug, { collection: entry.collection });
+// breadcrumb hrefs — parity with the getSidebar call above. 根 crumb 标签
+// 需显式传入，nimbus 默认英文 "Home"，不读 config.homeLabel。
+const breadcrumbs = await getBreadcrumbs(currentSlug, {
+  collection: entry.collection,
+  root: { label: "首页", href: "/" },
+});
 const editUrl = await getEditUrl(entry);
 // Frontmatter wins; git is the fallback.
 const lastUpdated = entry.data.lastUpdated ?? await getLastUpdated(entry);

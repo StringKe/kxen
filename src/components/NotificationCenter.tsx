@@ -43,6 +43,18 @@ export default function NotificationCenter() {
   // Solid 忽略 onMount 返回值（React 写法）：轮询 timer 必须挂 onCleanup，否则卸载后泄漏
   onCleanup(() => timer && clearInterval(timer));
 
+  // 订阅 notification topic 即时上屏（ws/stream.rs topic 映射早已存在，前端此前零订阅纯靠轮询）；
+  // 5s 轮询保留降为对账：整列按服务端真源替换，本地即时插入的重复项随之收敛
+  const offNotice = client
+    .stream<{ text: string; session_id?: string | null }>("notification")
+    .on((p) => {
+      setItems((prev) => [
+        { at: Date.now(), text: p.text, session_id: p.session_id ?? null },
+        ...prev,
+      ]);
+    });
+  onCleanup(offNotice);
+
   // bus lag 丢帧后服务端下发 resync：不等下一轮轮询，立即按真源重拉
   const offResync = client.onResync(() => void reload());
   onCleanup(offResync);

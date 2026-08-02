@@ -21,7 +21,7 @@ const GOAL_STATUS: Record<string, { text: string; cls: string }> = {
 
 export default function DockGoal(props: {
   goal: GoalInfo | null;
-  act: (action: GoalAction) => void;
+  act: (action: GoalAction) => Promise<boolean>;
   acting: () => boolean;
 }) {
   const goal = () => props.goal;
@@ -44,6 +44,12 @@ export default function DockGoal(props: {
     } catch (error) {
       setCreateErr(formatError(error instanceof Error ? error.message : String(error)));
     }
+  };
+  // 「提高预算并继续」只做状态迁移（budget_limited 时 run 已终态，goal.adjust 不会续跑）：
+  // 成功后预填 composer「继续」引导用户发送，否则按钮承诺的「继续」落空
+  const adjustAndContinue = async () => {
+    const ok = await act("adjust");
+    if (ok && activeSessionId()) insertComposerText("继续");
   };
   return (
     <DockSection title="目标" icon={Target}>
@@ -123,7 +129,7 @@ export default function DockGoal(props: {
                 <button
                   class="pressable px-2 py-0.5 rounded text-2xs border border-[var(--border)] text-[var(--warn)] disabled:opacity-50"
                   disabled={acting()}
-                  onClick={() => act("pause")}
+                  onClick={() => void act("pause")}
                 >
                   暂停
                 </button>
@@ -132,7 +138,7 @@ export default function DockGoal(props: {
                 <button
                   class="pressable px-2 py-0.5 rounded text-2xs bg-[var(--accent)] text-white disabled:opacity-50"
                   disabled={acting()}
-                  onClick={() => act("resume")}
+                  onClick={() => void act("resume")}
                 >
                   恢复
                 </button>
@@ -141,7 +147,7 @@ export default function DockGoal(props: {
                 <button
                   class="pressable px-2 py-0.5 rounded text-2xs bg-[var(--accent)] text-white disabled:opacity-50"
                   disabled={acting()}
-                  onClick={() => act("adjust")}
+                  onClick={() => void adjustAndContinue()}
                 >
                   提高预算并继续
                 </button>
@@ -150,7 +156,7 @@ export default function DockGoal(props: {
                 <button
                   class="pressable px-2 py-0.5 rounded text-2xs bg-[var(--accent)] text-white disabled:opacity-50"
                   disabled={acting()}
-                  onClick={() => act("activate")}
+                  onClick={() => void act("activate")}
                 >
                   激活
                 </button>
@@ -159,7 +165,7 @@ export default function DockGoal(props: {
                 <button
                   class="pressable px-2 py-0.5 rounded text-2xs border border-[var(--border)] text-[var(--err)] disabled:opacity-50"
                   disabled={acting()}
-                  onClick={() => act("cancel")}
+                  onClick={() => void act("cancel")}
                 >
                   取消
                 </button>

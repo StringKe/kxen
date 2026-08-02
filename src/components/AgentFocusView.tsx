@@ -1,6 +1,7 @@
 import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
 import { Bot, X } from "lucide-solid";
 import { onTopic } from "../lib/chat";
+import { client } from "../lib/client";
 import { agentsTranscript, mergeDeltas, teamMessage, type TranscriptEntry } from "../lib/team";
 import { kindBadge, statusText } from "../lib/agent-display";
 import { formatError } from "../lib/error-text";
@@ -70,7 +71,19 @@ export default function AgentFocusView(props: { name: string }) {
       scroll();
     });
   });
-  onCleanup(() => off?.());
+  // resync（bus lag / 断线重连）：增量订阅可能有缺口，重拉转录对账（不闪 loading/不动失败标记）
+  const offResync = client.onResync(() => {
+    const id = guard.next();
+    agentsTranscript(activeSessionId(), props.name)
+      .then((t) => {
+        if (guard.isCurrent(id)) setEntries(mergeDeltas(t));
+      })
+      .catch(() => {}); // 失败不清现有转录：等下轮 resync 或手动重试
+  });
+  onCleanup(() => {
+    off?.();
+    offResync();
+  });
 
   const send = () => {
     const text = draft().trim();

@@ -65,11 +65,36 @@ fn split_segments(command: &str) -> Vec<&str> {
 }
 
 /// 命令替换展开：反引号与 $() 内嵌的命令同样要进评估（`rm -rf $(cat f)` 类绕过）。
+/// $() 用平衡括号扫描：非嵌套正则只捕到第一个 )，嵌套内层命令会整个漏掉；
+/// 每个捕获内容再递归展开一次，内层替换里的命令也进评估。
 fn expand_substitutions(command: &str) -> Vec<String> {
-    static RE: LazyLock<Vec<Regex>> = LazyLock::new(|| vec![Regex::new(r"`([^`]+)`").unwrap(), Regex::new(r"\$\(([^)]+)\)").unwrap()]);
-    RE.iter()
-        .flat_map(|re| re.captures_iter(command).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect::<Vec<_>>())
-        .collect()
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`]+)`").unwrap());
+    let mut out: Vec<String> = RE.captures_iter(command).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect();
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'(' {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                out.push(command[i + 2..j - 1].to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let inner: Vec<String> = out.iter().filter(|s| s.contains("$(") || s.contains('`')).flat_map(|s| expand_substitutions(s)).collect();
+    out.extend(inner);
+    out
 }
 
 fn eval_segment(seg: &str, cwd: &str) -> Verdict {
@@ -103,13 +128,32 @@ fn tokens_of(seg: &str) -> Vec<&str> {
     seg.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\'')).filter(|t| !t.is_empty()).collect()
 }
 
+/// 前导环境变量赋值（X=1 cmd 的 X=1 段）：不算命令本身。
+/// 不跳过则 tokens.first() 拿到赋值，`X=1 rm -rf ~` 整体绕过删除判定。
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else { return false };
+    !name.is_empty() && !name.chars().next().unwrap().is_ascii_digit() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 命令 token 下标：跳过前导 VAR=value 赋值（sudo/doas 后面的赋值同样跳过）。
+fn command_index(tokens: &[&str]) -> usize {
+    let mut i = 0;
+    while i < tokens.len() && is_env_assignment(tokens[i]) {
+        i += 1;
+    }
+    if matches!(tokens.get(i).copied(), Some("sudo") | Some("doas")) {
+        i += 1;
+        while i < tokens.len() && is_env_assignment(tokens[i]) {
+            i += 1;
+        }
+    }
+    i
+}
+
 fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
     let tokens = tokens_of(seg);
-    let cmd = match tokens.first().copied() {
-        Some("sudo") | Some("doas") => tokens.get(1).copied().unwrap_or(""),
-        Some(c) => c,
-        None => "",
-    };
+    let cmd_idx = command_index(&tokens);
+    let cmd = tokens.get(cmd_idx).copied().unwrap_or("");
 
     let is_delete = DELETE_CMDS.contains(&cmd)
         || (seg.starts_with("find ") && (seg.contains(" -delete") || seg.contains(" -exec rm") || seg.contains(" -exec trash")))
@@ -122,7 +166,7 @@ fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
     // trash 命令按可恢复降档（删除进回收站）：只拦 .git 与系统路径
     let recoverable = cmd == "trash";
 
-    let targets: Vec<&str> = tokens.iter().skip(1).filter(|t| !t.starts_with('-')).copied().collect();
+    let targets: Vec<&str> = tokens.iter().skip(cmd_idx + 1).filter(|t| !t.starts_with('-')).copied().collect();
 
     if targets.is_empty() && is_delete && (seg.contains("-r") || seg.contains("-f")) {
         return deny("F5", "递归/强制删除缺少可静态确定的目标路径", Some("明确写出完整目标路径后再执行"));

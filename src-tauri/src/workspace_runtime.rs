@@ -21,7 +21,7 @@ impl WorkspaceRuntime {
         let config = workspace_config(&root)?;
         Ok(Arc::new(Self {
             lsp: crate::lsp::LspManager::new(root.clone()),
-            hooks: Arc::new(crate::tools::hooks::HookRunner::from_config(&config)),
+            hooks: Arc::new(crate::tools::hooks::HookRunner::from_config(&config, &root)),
             mcp: crate::mcp::McpManager::new(),
             root: Arc::from(root),
             mcp_loaded: AtomicBool::new(false),

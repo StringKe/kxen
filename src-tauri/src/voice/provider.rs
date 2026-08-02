@@ -133,6 +133,8 @@ use std::sync::{Arc, Mutex};
 
 pub struct RecordSession {
     engine: Retained<AnyObject>,
+    /// tap block：stop/cancel 先 removeTap 再随结构体回收（旧实现 mem::forget 每次 PTT 泄漏一份）
+    tap: super::objc::TapHandler,
     samples: Arc<Mutex<Vec<f32>>>,
     sample_rate: u32,
 }
@@ -141,7 +143,7 @@ pub struct RecordSession {
 pub fn start_recording() -> Result<RecordSession, String> {
     let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = samples.clone();
-    let (engine, rate) = super::objc::start_mic_capture(move |_input| {
+    let (engine, rate, tap) = super::objc::start_mic_capture(move |_input| {
         super::objc::TapHandler::new(move |buffer, _time| {
             let chunk = unsafe { super::objc::pcm_samples(buffer) };
             if !chunk.is_empty() {
@@ -149,13 +151,14 @@ pub fn start_recording() -> Result<RecordSession, String> {
             }
         })
     })?;
-    Ok(RecordSession { engine, samples, sample_rate: rate as u32 })
+    Ok(RecordSession { engine, tap, samples, sample_rate: rate as u32 })
 }
 
 impl RecordSession {
     /// PTT 松开：停止 -> 写 WAV 到临时文件 -> 返回 (path, 时长秒)。
     pub fn stop(self) -> Result<(String, f32), String> {
         super::objc::stop_mic_engine(&self.engine);
+        drop(self.tap); // removeTap 之后回收 tap block
         let samples = std::mem::take(&mut *crate::core::shared::lock(&self.samples));
         if samples.is_empty() {
             return Err("未录到音频".into());
@@ -169,6 +172,7 @@ impl RecordSession {
     /// Session 被删除或同 Session 重启 PTT 时停止录音且丢弃未提交样本。
     pub fn cancel(self) {
         super::objc::stop_mic_engine(&self.engine);
+        drop(self.tap);
     }
 }
 

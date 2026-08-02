@@ -95,3 +95,52 @@ fn role_exists_gate() {
     assert!(role_exists("sentry", &dir) && !role_exists("nonexistent", &dir));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// P2-5 熔断豁免回归：连续手动 abort（含父级级联取消）不计入 provider 熔断统计；
+/// 真实失败仍按阈值触发（豁免不松熔断口径）。
+#[tokio::test]
+async fn consecutive_aborts_do_not_trip_circuit() {
+    let mut config = crate::core::config::Config::default();
+    config.limits.providers.insert(
+        "p".into(),
+        crate::core::config::ProviderLimit {
+            circuit_failure_threshold: Some(2),
+            circuit_cooldown_seconds: Some(600),
+            ..Default::default()
+        },
+    );
+    let deps = SubagentDeps {
+        registry: Arc::new(crate::tools::task::TaskRegistry::new()),
+        workdir: Arc::from(Path::new("/tmp")),
+        path_grants: Arc::new(Default::default()),
+        store: crate::auth::credential::AuthStore::default(),
+        mrm: Arc::new(ModelResourceManager::new(config)),
+        hooks: None,
+        extras: None,
+        cancel: None,
+        agents: Arc::new(crate::agent::activity::AgentRegistry::default()),
+        session_id: None,
+        bus: crate::core::event::EventBus::default(),
+        approvals: None,
+        mcp: None,
+        lsp: None,
+    };
+    let outcome = |aborted: bool, terminal: crate::agent::agent_loop::AgentEvent| crate::agent::agent_loop::AgentOutcome {
+        final_text: String::new(),
+        turns: 1,
+        aborted,
+        stats: None,
+        terminal,
+    };
+
+    let aborted = outcome(true, crate::agent::agent_loop::AgentEvent::Aborted);
+    for _ in 0..5 {
+        record_outcome(&deps, "p", &aborted).await;
+    }
+    assert!(deps.mrm.admit("p").await.is_ok(), "连续 abort 不得触发熔断");
+
+    let failed = outcome(false, crate::agent::agent_loop::AgentEvent::Error { message: "boom".into() });
+    record_outcome(&deps, "p", &failed).await;
+    record_outcome(&deps, "p", &failed).await;
+    assert!(deps.mrm.admit("p").await.is_err(), "真实失败仍按阈值熔断");
+}

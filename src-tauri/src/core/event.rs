@@ -5,7 +5,6 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone)]
 pub enum Event {
     LlmDelta(serde_json::Value),
-    ToolCall { name: &'static str, summary: String },
     TaskUpdate { id: String, status: &'static str },
     GoalUpdate { id: String, status: &'static str },
     // session_id 记录来源会话：通知中心条目点击可跳转回来源，系统级通知为 None（不可点）

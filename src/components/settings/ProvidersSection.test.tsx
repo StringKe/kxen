@@ -221,7 +221,7 @@ describe("ProvidersSection 删除", () => {
     dispose();
   });
 
-  it("custom 行：有删除入口、无扳手；删除接 remove_custom", async () => {
+  it("custom 行：有删除入口、无扳手；删除先确认再接 remove_custom", async () => {
     h.accounts.mockResolvedValue([{ ...CUSTOM }]);
     const dispose = render(() => <ProvidersSection />, document.body);
     await vi.waitFor(() => expect(document.body.textContent).toContain("custom:relay"));
@@ -230,7 +230,34 @@ describe("ProvidersSection 删除", () => {
       false,
     ); // custom 无修复指引（原空框问题）
     btnByTitle("删除自定义提供商").click();
+    await flush();
+    expect(h.removeCustom).not.toHaveBeenCalled(); // 未确认不发 RPC
+    expect(document.body.textContent).toContain("确认删除 custom:relay");
+    btnByText("确认删除").click();
     await vi.waitFor(() => expect(h.removeCustom).toHaveBeenCalledWith("relay"));
+    dispose();
+  });
+
+  it("未被角色占用的账号：同样先出确认条，取消不发 RPC", async () => {
+    h.accounts.mockResolvedValue([{ ...XAI_B }]);
+    const dispose = render(() => <ProvidersSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("xai:b"));
+
+    btnByTitle("删除账号").click();
+    await flush();
+    expect(h.removeAccount).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("确认删除 xai:b");
+    expect(document.body.textContent).not.toContain("失去可用凭证"); // 未占用不列角色告警
+
+    btnByText("取消").click();
+    await flush();
+    expect(h.removeAccount).not.toHaveBeenCalled();
+    expect(document.body.textContent).not.toContain("确认删除 xai:b");
+
+    btnByTitle("删除账号").click();
+    await flush();
+    btnByText("确认删除").click();
+    await vi.waitFor(() => expect(h.removeAccount).toHaveBeenCalledWith("xai", "b"));
     dispose();
   });
 });

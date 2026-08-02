@@ -107,7 +107,9 @@ fn start_one(
                         }
                     };
                     for e in events {
-                        bus.publish(crate::core::event::Event::LlmDelta(event_payload(e, &key)));
+                        if let Some(payload) = event_payload(e, &key) {
+                            bus.publish(crate::core::event::Event::LlmDelta(payload));
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
@@ -136,16 +138,17 @@ fn start_one(
 
 /// 转写事件统一携带 session_id（ws/stream.rs 的 session ACL 按它准入）；
 /// 空 id 是旧全局通道：不带键，否则会被 ACL 当成未知 session 拦掉。
-fn event_payload(e: apple::SessionEvent, session_id: &str) -> serde_json::Value {
+/// Final 不出帧：前端只消费 voice.partial/voice.error，终稿经 voice.stop RPC 返回，发了必被丢弃。
+fn event_payload(e: apple::SessionEvent, session_id: &str) -> Option<serde_json::Value> {
     let mut payload = match e {
         apple::SessionEvent::Partial(t) => serde_json::json!({"kind": "voice.partial", "text": t}),
-        apple::SessionEvent::Final(t) => serde_json::json!({"kind": "voice.final", "text": t}),
+        apple::SessionEvent::Final(_) => return None,
         apple::SessionEvent::Error(m) => serde_json::json!({"kind": "voice.error", "message": m}),
     };
     if !session_id.is_empty() {
         payload.as_object_mut().expect("voice payload").insert("session_id".into(), serde_json::Value::String(session_id.into()));
     }
-    payload
+    Some(payload)
 }
 
 /// PTT 松开：只停自己槽（别的 session 继续录）。apple 先出本地终稿，有就绪云引擎则云转写升级（Wispr 双轨）；失败回落本地。
@@ -254,13 +257,15 @@ mod tests {
 
     #[test]
     fn event_payload_carries_session_id() {
-        let p = event_payload(apple::SessionEvent::Partial("你好".into()), "s1");
+        let p = event_payload(apple::SessionEvent::Partial("你好".into()), "s1").unwrap();
         assert_eq!(p["kind"], "voice.partial");
         assert_eq!(p["session_id"], "s1");
-        let p = event_payload(apple::SessionEvent::Error("boom".into()), "s2");
+        let p = event_payload(apple::SessionEvent::Error("boom".into()), "s2").unwrap();
         assert_eq!(p["session_id"], "s2");
         // 空 session 走旧全局通道：不带 session_id 键
-        let p = event_payload(apple::SessionEvent::Final("完".into()), "");
+        let p = event_payload(apple::SessionEvent::Partial("完".into()), "").unwrap();
         assert!(p.get("session_id").is_none());
+        // Final 不出帧（终稿经 voice.stop RPC 返回）
+        assert!(event_payload(apple::SessionEvent::Final("完".into()), "s1").is_none());
     }
 }

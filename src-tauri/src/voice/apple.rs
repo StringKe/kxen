@@ -79,6 +79,10 @@ pub struct MicSession {
     task: Retained<AnyObject>,
     engine: Retained<AnyObject>,
     request: Retained<AnyObject>,
+    /// tap block 与 tap 回调持有的 request retain：stop/cancel 先 removeTap 再随结构体回收
+    /// （旧实现 mem::forget 每次 PTT 各泄漏一份）。
+    tap: objc::TapHandler,
+    req_kept: Retained<AnyObject>,
     rx: std::sync::mpsc::Receiver<SessionEvent>,
     samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
     sample_rate: u32,
@@ -100,12 +104,12 @@ pub fn start_mic(locale: &str) -> Result<MicSession, String> {
         }
     });
     let task = objc::recognition_task(&recognizer, &request, &handler).ok_or("无法启动识别任务")?;
-    // tap 线程持有 request 一份（防悬垂）；session 结束时进程级泄漏回收
+    // tap 线程经裸指针读 request：显式 retain 一份防悬垂，session 结束（removeTap 之后）随结构体回收
     let req_ptr = &*request as *const AnyObject as *mut AnyObject;
     let req_kept = unsafe { objc::retain_autoreleased(req_ptr) }.ok_or("request 持有失败")?;
     let samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = samples.clone();
-    let (engine, rate) = objc::start_mic_capture(move |_input| {
+    let (engine, rate, tap) = objc::start_mic_capture(move |_input| {
         objc::TapHandler::new(move |buffer: *mut AnyObject, _time: *mut AnyObject| {
             if !buffer.is_null() {
                 objc::append_buffer(unsafe { &*req_ptr }, buffer);
@@ -116,8 +120,7 @@ pub fn start_mic(locale: &str) -> Result<MicSession, String> {
             }
         })
     })?;
-    std::mem::forget(req_kept);
-    Ok(MicSession { task, engine, request, rx, samples, sample_rate: rate as u32 })
+    Ok(MicSession { task, engine, request, tap, req_kept, rx, samples, sample_rate: rate as u32 })
 }
 
 impl MicSession {
@@ -134,6 +137,9 @@ impl MicSession {
     /// 返回 (本地终稿, 云转写用 WAV 路径)。
     pub fn stop(self) -> (Option<String>, Option<String>) {
         objc::stop_mic_engine(&self.engine);
+        // removeTap 之后回收 tap block 与 request retain（旧实现 mem::forget 每次 PTT 各泄漏一份）
+        drop(self.tap);
+        drop(self.req_kept);
         objc::end_audio(&self.request);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut last: Option<String> = None;
@@ -167,6 +173,8 @@ impl MicSession {
     /// Session 被删除或同 Session 重启 PTT 时立即释放麦克风，不等待终稿。
     pub fn cancel(self) {
         objc::stop_mic_engine(&self.engine);
+        drop(self.tap);
+        drop(self.req_kept);
         objc::end_audio(&self.request);
         objc::cancel_task(&self.task);
     }

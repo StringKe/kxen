@@ -130,10 +130,11 @@ async fn wait_ready(task: Arc<crate::tools::task::TaskHandle>, pattern: Option<S
 }
 
 fn parse_port(output: &str) -> Option<u16> {
+    // 2-5 位（8080/300/80 都合法 dev 端口）；u16 parse 顺带拦 >65535 的 5 位串
     static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?:localhost|127\.0\.0\.1|:):(\d{4,5})\b").unwrap());
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?:localhost|127\.0\.0\.1|:):(\d{2,5})\b").unwrap());
     RE.captures(output).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok()).or_else(|| {
-        static RE2: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"port\s+(\d{4,5})").unwrap());
+        static RE2: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"port\s+(\d{2,5})\b").unwrap());
         RE2.captures(output).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok())
     })
 }
@@ -190,6 +191,13 @@ mod tests {
         assert_eq!(parse_port("ready at 127.0.0.1:4096"), Some(4096));
         assert_eq!(parse_port("server port 3000 ready"), Some(3000));
         assert_eq!(parse_port("no port here"), None);
+        // 2-3 位端口同样解析（旧正则 \d{4,5} 漏掉）
+        assert_eq!(parse_port("listening on http://localhost:80/"), Some(80));
+        assert_eq!(parse_port("ready at 127.0.0.1:300"), Some(300));
+        assert_eq!(parse_port("server port 99 ready"), Some(99));
+        // 范围校验：>65535 的 5 位串与超长数字串都不是端口
+        assert_eq!(parse_port("listening on localhost:99999"), None);
+        assert_eq!(parse_port("server port 123456 ready"), None);
     }
 
     #[tokio::test]

@@ -91,7 +91,6 @@ fn cleanup_references(state: &Arc<AppState>, id: &str) {
         usage.remove(id);
         kxen_app::core::usage::persist(&usage);
     }
-    kxen_app::core::shared::lock(&state.run_streams).retain(|_, session_id| session_id != id);
     if let Ok(mut foreground) = state.foreground_session.write()
         && foreground.as_str() == id
     {

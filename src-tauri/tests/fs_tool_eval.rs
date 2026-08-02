@@ -1,6 +1,6 @@
 // fs_tool 公开 API 集成测试（从 fs_tool.rs 拆出，350 行门禁）：
 // read 分页 / 文件新鲜度（纳秒精度）/ edit 双模式。
-use kxen_app::tools::fs_tool::{AnchorEdit, EditSpec, FileTracker, FsToolError, edit, read, write};
+use kxen_app::tools::fs_tool::{AnchorEdit, EditSpec, FileTracker, FsToolError, delete, edit, read, write};
 use kxen_app::tools::hashline::generate_anchors;
 use std::path::PathBuf;
 
@@ -245,4 +245,39 @@ fn write_fresh_file_no_backup() {
     write(&path, "v1\n", &tracker, &cwd).unwrap();
     write(&path, "v2\n", &tracker, &cwd).unwrap();
     assert!(!dir.join(".kxen").exists(), "无外部变更不得产生备份目录");
+}
+
+// ---------------- delete / 大小上限 ----------------
+
+/// 迁移自 fs_tool.rs 体内测试（350 门禁）：delete 走回收站，文件从原位置消失。
+#[test]
+fn delete_moves_file_to_trash() {
+    let dir = temp_workspace("delete");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "x").unwrap();
+    delete(&file, &FileTracker::default(), dir.to_str().unwrap()).unwrap();
+    assert!(!file.exists());
+}
+
+/// read/edit 全量读有 512KB 大小上限（与 grep 同量级）：超限报明确错误，不读入上下文。
+#[test]
+fn read_and_edit_reject_oversized_files() {
+    let dir = temp_workspace("toolarge");
+    let cwd = dir.to_string_lossy().to_string();
+    let path = dir.join("big.txt");
+    std::fs::write(&path, "x".repeat(600 * 1024)).unwrap();
+    let tracker = FileTracker::default();
+
+    let err = read(&path, &tracker, &cwd, None, None).unwrap_err();
+    assert!(matches!(err, FsToolError::TooLarge { .. }), "{err}");
+    assert!(err.to_string().contains("512KB"), "{err}");
+
+    let spec = EditSpec::Match { old_string: "x".into(), new_string: "y".into(), expected_replacements: None };
+    let err = edit(&path, &spec, &tracker, &cwd).unwrap_err();
+    assert!(matches!(err, FsToolError::TooLarge { .. }), "{err}");
+
+    // 恰在上限内的文件不受影响
+    let ok = dir.join("ok.txt");
+    std::fs::write(&ok, "a\n".repeat(100)).unwrap();
+    assert!(read(&ok, &tracker, &cwd, None, None).is_ok());
 }

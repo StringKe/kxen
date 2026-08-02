@@ -167,7 +167,6 @@ pub fn run() {
                                 cron_dispatch::CronDispatch::Spawn => {
                                     dispatched.insert(job.session_id.clone());
                                     let stream_id = ws::protocol::stream_id("run");
-                                    kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), job.session_id.clone());
                                     tokio::spawn(ws::llm_task::run_llm(
                                         stream_id,
                                         job.session_id,

@@ -54,6 +54,9 @@ export default function KnowledgeSection() {
   const [noteType, setNoteType] = createSignal("convention");
   const [desc, setDesc] = createSignal("");
   const [content, setContent] = createSignal("");
+  // 待确认删除的条目：删除统一走行内确认条（对齐 ScheduleSection/DockWorktree 的二次确认模式）
+  const [confirmDel, setConfirmDel] = createSignal("");
+  const keyOf = (e: KnowledgeEntry) => `${e.scope}:${e.kind}:${e.slug}`;
 
   const reload = async () => {
     // 首屏双源独立降级：单源失败只缺对应区块；用户操作路径各自显错
@@ -107,10 +110,12 @@ export default function KnowledgeSection() {
       await knowledgeRemove(e.scope, e.slug);
     } catch (err) {
       flashErr(`删除失败：${errText(err)}`);
+      setConfirmDel(""); // 错误已 flash：退出确认态，确认条不挂着
       return;
     }
+    setConfirmDel("");
     await reload();
-    flashOk("已删除（废纸篓可恢复）");
+    flashOk("已删除（废纸篓可恢复）"); // 后端 knowledge.remove 进系统废纸篓（store.rs），文案属实
   };
 
   const byScope = (s: KnowledgeScope) => entries().filter((e) => e.scope === s);
@@ -228,13 +233,33 @@ export default function KnowledgeSection() {
                                 <option value={sc.id}>{sc.label}</option>
                               ))}
                             </select>
-                            <button
-                              class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--err)]"
-                              title="删除（废纸篓可恢复）"
-                              onClick={() => void remove(e)}
+                            <Show
+                              when={confirmDel() === keyOf(e)}
+                              fallback={
+                                <button
+                                  class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--err)]"
+                                  title="删除（废纸篓可恢复）"
+                                  onClick={() => setConfirmDel(keyOf(e))}
+                                >
+                                  <Trash2 size={13} />
+                                </button>
+                              }
                             >
-                              <Trash2 size={13} />
-                            </button>
+                              <span class="flex items-center gap-1">
+                                <button
+                                  class="pressable px-1.5 py-0.5 rounded text-2xs border border-[var(--err)] text-[var(--err)]"
+                                  onClick={() => void remove(e)}
+                                >
+                                  确认删除
+                                </button>
+                                <button
+                                  class="pressable px-1.5 py-0.5 rounded text-2xs border border-[var(--border)] text-[var(--text-dim)]"
+                                  onClick={() => setConfirmDel("")}
+                                >
+                                  取消
+                                </button>
+                              </span>
+                            </Show>
                           </div>
                         )}
                       </For>

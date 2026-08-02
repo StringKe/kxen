@@ -3,7 +3,9 @@ import { createSignal } from "solid-js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const chatMock = vi.hoisted(() => ({ approvalRespond: vi.fn() }));
+const flashMock = vi.hoisted(() => ({ flashErr: vi.fn() }));
 vi.mock("./chat", () => ({ approvalRespond: chatMock.approvalRespond }));
+vi.mock("./flash", () => ({ flashErr: flashMock.flashErr }));
 
 import {
   applyApprovalEvent,
@@ -25,7 +27,10 @@ function setup() {
   return { items, setItems, card: () => items().at(-1) as ApprovalItem };
 }
 
-beforeEach(() => chatMock.approvalRespond.mockReset());
+beforeEach(() => {
+  chatMock.approvalRespond.mockReset();
+  flashMock.flashErr.mockClear();
+});
 
 describe("applyApprovalResolved（后端了结事件）", () => {
   it("timeout 置已超时，其他 outcome 置已取消", () => {
@@ -64,6 +69,16 @@ describe("respondApproval", () => {
     const a = setup();
     await respondApproval(a.setItems, "a1", true);
     expect(a.card().resolved).toBe("expired");
+  });
+
+  it("RPC 失败：不上假已决态，保持等待卡并 flashErr（后端 broker 仍在等）", async () => {
+    chatMock.approvalRespond.mockRejectedValue(new Error("connection lost"));
+    const a = setup();
+    await respondApproval(a.setItems, "a1", true);
+    expect(a.card().resolved).toBeUndefined(); // 等待卡原样保留，可重试
+    expect(flashMock.flashErr).toHaveBeenCalledTimes(1);
+    expect(String(flashMock.flashErr.mock.calls[0]?.[0])).toContain("审批应答失败");
+    expect(String(flashMock.flashErr.mock.calls[0]?.[0])).toContain("connection lost");
   });
 });
 

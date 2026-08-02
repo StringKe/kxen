@@ -77,6 +77,9 @@ export default function UsageSection() {
   const nullableNumber = (value: string) => (value.trim() === "" ? null : Number(value));
 
   const saveLimits = async () => {
+    // 先清上一轮反馈：失败时残留「已保存」绿字会与错误并存误导（后端对无 provider 的熔断字段返回明确错误，走 catch 上屏）
+    setSaved("");
+    setSaveErr("");
     try {
       await client.rpc("config.set_limits", {
         daily_token_budget: nullableNumber(dailyBudget()),

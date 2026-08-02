@@ -48,8 +48,21 @@ interface RpcResponse {
 }
 
 interface StreamChunk {
-  stream?: { id: string; seq: number; complete?: boolean };
+  stream?: { id: string; seq: number };
   result?: unknown;
+}
+
+/** RPC 错误：message 保持后端原文（rewind 靠 message 内嵌 JSON 传结构化 code，不动），
+ *  code 供调用方按 -32601/-32603 等归类（此前前端只取 message，两类错误不可区分）。 */
+export class RpcError extends Error {
+  constructor(
+    message: string,
+    readonly code: number,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = "RpcError";
+  }
 }
 
 // ---------------- 连接管理（单连接 + 掉线重连 + 订阅恢复） ----------------
@@ -124,7 +137,7 @@ async function ensureConn(): Promise<WebSocket> {
         pending.delete(String(msg.id));
         clearTimeout(entry.timer);
         if (msg.error) {
-          entry.reject(new Error(msg.error.message));
+          entry.reject(new RpcError(msg.error.message, msg.error.code, msg.error.data));
         } else {
           entry.resolve(msg.result);
         }
@@ -247,7 +260,8 @@ export const client = {
       chunkHandlers.add(onChunk);
       return () => {
         chunkHandlers.delete(onChunk);
-        void closeSubscription(streamId);
+        // 断线窗口退订必然失败：静默吞掉即可，但不能浮 unhandled rejection
+        void closeSubscription(streamId).catch(() => {});
       };
     });
   },

@@ -2,13 +2,23 @@
 import { render } from "solid-js/web";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import RightColumn from "./RightColumn";
-import { activeAgentFocus, setActiveAgentFocus, setActiveSessionId, setAgents } from "../lib/state";
+import { fireResync } from "../lib/client";
+import {
+  activeAgentFocus,
+  agentsLoadFailed,
+  refreshAgents,
+  setActiveAgentFocus,
+  setActiveSessionId,
+  setAgents,
+  setAgentsLoadFailed,
+} from "../lib/state";
 import type { AgentActivity, TranscriptEntry } from "../lib/team";
 
 const mocks = vi.hoisted(() => ({
   transcript: vi.fn<(sid: string, name: string) => Promise<TranscriptEntry[]>>(),
   stop: vi.fn<(sid: string, name: string) => Promise<boolean>>(),
   dismiss: vi.fn<(sid: string, name: string) => Promise<boolean>>(),
+  list: vi.fn<(sid: string) => Promise<AgentActivity[]>>(),
   topicCalls: [] as string[][],
   handler: null as null | ((topic: string, payload: unknown) => void),
 }));
@@ -19,7 +29,7 @@ vi.mock("../lib/team", async (importOriginal) => {
     agentsTranscript: mocks.transcript,
     agentsStop: mocks.stop,
     agentsDismiss: mocks.dismiss,
-    agentsList: async () => [],
+    agentsList: mocks.list,
   };
 });
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -48,6 +58,7 @@ beforeEach(() => {
   mocks.transcript.mockReset().mockResolvedValue([]);
   mocks.stop.mockReset().mockResolvedValue(true);
   mocks.dismiss.mockReset().mockResolvedValue(true);
+  mocks.list.mockReset().mockResolvedValue([]);
   mocks.topicCalls.length = 0;
   mocks.handler = null;
   setActiveSessionId("s1");
@@ -55,6 +66,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setAgents([]);
+  setAgentsLoadFailed(false);
   setActiveSessionId("");
   setActiveAgentFocus("");
   document.body.innerHTML = "";
@@ -82,6 +94,20 @@ describe("RightColumn 概览卡", () => {
     dispose();
   });
 
+  it("resync（断线重连/bus lag）：重拉转录更新 preview", async () => {
+    mocks.transcript.mockResolvedValue([{ kind: "text", text: "旧 preview" }]);
+    setAgents([run("w", "working")]);
+    const dispose = render(() => <RightColumn />, document.body);
+    await tick();
+    expect(previewEl()?.textContent).toBe("旧 preview");
+    mocks.transcript.mockResolvedValue([{ kind: "text", text: "新 preview" }]);
+    fireResync();
+    await tick();
+    expect(mocks.transcript).toHaveBeenCalledTimes(2);
+    expect(previewEl()?.textContent).toBe("新 preview");
+    dispose();
+  });
+
   it("live：text 追加 / tool 替换 / error 红字替换，他 agent 他会话帧忽略", async () => {
     setAgents([run("w", "working")]);
     const dispose = render(() => <RightColumn />, document.body);
@@ -101,6 +127,41 @@ describe("RightColumn 概览卡", () => {
     emit({ agent: "other", session_id: "s1", kind: "text", text: "别 agent" });
     emit({ agent: "w", session_id: "s2", kind: "text", text: "别会话" });
     expect(previewEl()?.textContent).toBe("后续");
+    dispose();
+  });
+});
+
+describe("RightColumn 名单加载失败", () => {
+  it("首载失败出重试条（与真空区分），重试成功后条消失且名单上屏", async () => {
+    mocks.list.mockRejectedValue(new Error("ws down"));
+    await refreshAgents();
+    expect(agentsLoadFailed()).toBe(true);
+    const dispose = render(() => <RightColumn />, document.body);
+    await tick();
+    expect(document.body.textContent).toContain("加载 agent 名单失败");
+
+    mocks.list.mockResolvedValue([run("w", "working")]);
+    const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (b) => b.textContent === "重试",
+    );
+    if (!retry) throw new Error("retry button not found");
+    retry.click();
+    await tick();
+    expect(document.body.textContent).not.toContain("加载 agent 名单失败");
+    expect(document.body.textContent).toContain("w");
+    dispose();
+  });
+
+  it("失败保留旧名单时不出重试条（有数据可看，轮询自愈）", async () => {
+    mocks.list.mockResolvedValue([run("w", "working")]);
+    await refreshAgents();
+    mocks.list.mockRejectedValue(new Error("ws down"));
+    await refreshAgents();
+    expect(agentsLoadFailed()).toBe(true); // 失败标记照记
+    const dispose = render(() => <RightColumn />, document.body);
+    await tick();
+    expect(document.body.textContent).toContain("w"); // 旧名单不被失败抹掉
+    expect(document.body.textContent).not.toContain("加载 agent 名单失败");
     dispose();
   });
 });

@@ -5,6 +5,7 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { mcpAuth, mcpRestart, mcpStatus, type McpServerStatus } from "../../lib/mcp";
 import { formatError } from "../../lib/error-text";
 import { flashErr } from "../../lib/flash";
+import { writeClipboard } from "../../lib/clipboard";
 
 export default function McpSection() {
   const [mcpServers, setMcpServers] = createSignal<McpServerStatus[]>([]);
@@ -146,7 +147,7 @@ export default function McpSection() {
                     <code class="flex-1 truncate text-[var(--text)] select-all">{u()}</code>
                     <button
                       class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text)]"
-                      onClick={() => void navigator.clipboard.writeText(u())}
+                      onClick={() => writeClipboard(u())}
                     >
                       复制
                     </button>

@@ -97,8 +97,12 @@ describe("client transport", () => {
     await flush();
     const errorFrame = sentFrame(socket);
     expect(errorFrame.params).toEqual({});
-    emit(socket, { id: errorFrame.id, error: { code: 1, message: "denied" } });
+    emit(socket, { id: errorFrame.id, error: { code: -32603, message: "denied", data: { h: 1 } } });
     await expect(failure).rejects.toThrow("denied");
+    // 错误帧的 code/data 随 Error 上抛：-32601 与 -32603 前端可区分（rewind 的 message 内嵌 JSON 不动）
+    const { RpcError } = await import("./client");
+    await expect(failure).rejects.toBeInstanceOf(RpcError);
+    await expect(failure).rejects.toMatchObject({ code: -32603, data: { h: 1 } });
     expect(h.connect).toHaveBeenCalledOnce();
 
     offResync();

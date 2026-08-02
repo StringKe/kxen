@@ -74,7 +74,13 @@ export default function SessionRow(props: {
         "shadow-[inset_0_2px_0_var(--accent)]": props.dropTarget,
       }}
       draggable={props.draggable && !renaming() && !props.deleting}
+      role="button"
+      tabindex="0"
       onClick={props.onOpen}
+      onKeyDown={(e) => {
+        // 只在行本体响应：内嵌按钮/重命名输入框的 Enter 各自有主（原生 click / 提交重命名）
+        if (e.target === e.currentTarget && e.key === "Enter") props.onOpen();
+      }}
       onMouseLeave={() => setConfirming(false)}
       onContextMenu={(e) => {
         openMenu(e, [
@@ -142,7 +148,7 @@ export default function SessionRow(props: {
         <span class="text-2xs text-[var(--text-faint)] shrink-0 pr-1 group-hover:hidden">
           {relTime(s().updated_at)}
         </span>
-        <span class="hidden group-hover:flex items-center shrink-0">
+        <span class="hidden group-hover:flex group-focus-within:flex items-center shrink-0">
           <button
             class="px-1 text-[var(--text-faint)] hover:text-[var(--text)]"
             title={s().pinned ? "取消置顶" : "置顶"}

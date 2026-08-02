@@ -70,7 +70,8 @@ export default function SessionItem(props: {
     return (
       <UserItem
         item={item}
-        onFork={() => props.onForkId(item.messageId!)}
+        // 无 messageId 的乐观消息不可分叉：菜单入口已禁用，此处兜底替代非空断言
+        onFork={() => item.messageId && props.onForkId(item.messageId)}
         onEditResend={props.onEditResend}
         onRewind={() => props.onRewindId(item.messageId!)}
         onRetry={() => props.onRetryItem(item)}
@@ -85,7 +86,7 @@ export default function SessionItem(props: {
       streaming={props.streaming}
       live={props.live}
       modelLabel={props.modelLabel}
-      onFork={() => props.onForkId(item.messageId!)}
+      onFork={() => item.messageId && props.onForkId(item.messageId)}
       onRerun={props.onRerun}
       onContinue={props.onContinue}
       onRewind={() => props.onRewindId(item.messageId!)}

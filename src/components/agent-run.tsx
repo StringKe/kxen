@@ -76,7 +76,7 @@ export function useAgentRunActions() {
   return { stopping, stopAgent, dismissAgent };
 }
 
-/** 卡角落的管理钮：running 出停止、终态出关闭，hover 卡面才显示（父级需 group + relative）。
+/** 卡角落的管理钮：running 出停止、终态出关闭，hover 卡面或焦点落入才显示（父级需 group + relative）。
  *  与卡面主按钮是兄弟节点而非嵌套（嵌套 button 非法且点击会冒泡触发卡的选中跳转）。 */
 export function AgentRunActionButtons(props: {
   name: string;
@@ -89,7 +89,9 @@ export function AgentRunActionButtons(props: {
   const btn =
     "flex items-center justify-center w-3.5 h-3.5 rounded bg-[var(--bg-overlay)] text-[var(--text-faint)]";
   return (
-    <span class={`absolute hidden group-hover:flex items-center ${props.class ?? ""}`}>
+    <span
+      class={`absolute hidden group-hover:flex group-focus-within:flex items-center ${props.class ?? ""}`}
+    >
       <Show when={isAgentRunning(props.status) && !props.stopping}>
         <button
           data-stop

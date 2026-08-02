@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 const EXCLUDES: &[&str] = &[":(exclude)node_modules", ":(exclude)target", ":(exclude).kxen/worktrees"];
 
 fn repo_dir(workdir: &Path) -> PathBuf {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    workdir.to_string_lossy().hash(&mut h);
-    crate::core::paths::data_dir().join("shadow").join(format!("{:x}.git", h.finish()))
+    use sha2::Digest;
+    // canonicalize：/var 与 /private/var 这类拼写分叉必须收敛到同一 shadow repo；
+    // sha256 取代 DefaultHasher：后者输出跨 Rust 版本不受保证，工具链升级会让存量检查点变孤儿。
+    // 代价：从 DefaultHasher 迁到 sha256 是一次性断代，存量 shadow repo 变孤儿（仅多占盘，可手动清）
+    let path = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let digest = sha2::Sha256::digest(path.to_string_lossy().as_bytes());
+    crate::core::paths::data_dir().join("shadow").join(format!("{:x}.git", digest))
 }
 
 fn git(workdir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -25,16 +27,38 @@ fn git(workdir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
 
 fn ensure_repo(workdir: &Path) -> Result<(), String> {
     let dir = repo_dir(workdir);
+    // shadow repo 存工作区全量快照：0700 仅属主可进（与 auth.json 0600 同一加固口径）。
+    // 每次调用都设：存量默认 umask 创建的 repo 一并收紧。
     if dir.join("HEAD").exists() {
+        harden_dir(&dir)?;
         return Ok(());
     }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    harden_dir(&dir)?;
     // init 不带 --work-tree（init 不接受该参数）；后续操作才走 --git-dir/--work-tree
     let out = std::process::Command::new("git").args(["init", "--bare"]).arg(&dir).output().map_err(|e| format!("git spawn: {e}"))?;
     if !out.status.success() {
         return Err(format!("git init: {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn harden_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn harden_dir(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// 同 workspace 多会话并发 checkpoint 会撞 index.lock：按 shadow repo 加进程内互斥。
+fn repo_lock(workdir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    crate::core::shared::lock(&LOCKS).entry(repo_dir(workdir)).or_default().clone()
 }
 
 /// commit 固定 -c 配置：user 身份 + 强制关签名。
@@ -58,6 +82,10 @@ fn commit_args(label: &str) -> [&str; 12] {
 
 /// 打检查点：当前 worktree 全量提交（无变更也成功返回）。
 pub fn commit(workdir: &Path, label: &str) -> Result<(), String> {
+    // 互斥覆盖 init + add + commit 全段：并发 ensure_repo 会双双 git init 撞模板拷贝，
+    // 并发 add/commit 撞 index.lock。find/dirty_count 只读不锁
+    let lock = repo_lock(workdir);
+    let _guard = crate::core::shared::lock(&lock);
     ensure_repo(workdir)?;
     let mut add_args = vec!["add", "-A", "--", "."];
     add_args.extend(EXCLUDES);
@@ -65,13 +93,15 @@ pub fn commit(workdir: &Path, label: &str) -> Result<(), String> {
     if !out.status.success() {
         return Err(format!("git add: {}", String::from_utf8_lossy(&out.stderr)));
     }
-    // 无变更时 commit 失败属正常（nothing to commit），不算错误
+    // 无变更时跳过 commit：用 diff --cached 预判，而不是匹配 "nothing to commit" 文案
+    // （git 本地化输出下该文案在 stdout 且非英文，匹配不可靠）
+    let staged = git(workdir, &["diff", "--cached", "--quiet", "--exit-code"])?;
+    if staged.status.code() == Some(0) {
+        return Ok(());
+    }
     let out = git(workdir, &commit_args(label))?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.contains("nothing to commit") {
-            return Err(format!("git commit: {stderr}"));
-        }
+        return Err(format!("git commit: {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(())
 }
@@ -93,13 +123,24 @@ fn find(workdir: &Path, label: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// rewind 到 label 检查点（reset --hard，调用方自行负责会话截断与提示）。
+/// rewind 到 label 检查点（reset --hard + clean 未跟踪，调用方自行负责会话截断与提示）。
 pub fn reset_to(workdir: &Path, label: &str) -> Result<String, String> {
     let Some(hash) = find(workdir, label)? else {
         return Err(format!("checkpoint not found: {label}"));
     };
+    // 与 commit 同一把锁：reset/clean 进行中不能有并发 add 改写 index
+    let lock = repo_lock(workdir);
+    let _guard = crate::core::shared::lock(&lock);
     let out = git(workdir, &["reset", "--hard", &hash])?;
-    if out.status.success() { Ok(hash) } else { Err(format!("git reset: {}", String::from_utf8_lossy(&out.stderr))) }
+    if !out.status.success() {
+        return Err(format!("git reset: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    // commit 的 add -A 已把检查点时刻全部未跟踪文件入库，故 reset 后仍是未跟踪的一定是
+    // 检查点之后新建的文件——确认框承诺「回退将丢弃」必须连它们一起清（gitignored 文件不动）。
+    let mut clean_args = vec!["clean", "-fdq", "--", "."];
+    clean_args.extend(EXCLUDES);
+    let out = git(workdir, &clean_args)?;
+    if out.status.success() { Ok(hash) } else { Err(format!("git clean: {}", String::from_utf8_lossy(&out.stderr))) }
 }
 
 /// 会话是否有 rewind 历史可导（首条 checkpoint 是否存在）。
@@ -134,6 +175,25 @@ pub async fn checkpoint_barrier(workdir: &Path, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_dir_stable_and_canonical() {
+        use sha2::Digest;
+        let base = std::env::temp_dir().join(format!("kxen-ckpt-hash-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // 同一路径多次调用哈希稳定，格式 = sha256 64 hex + .git
+        let dir = repo_dir(&real);
+        assert_eq!(dir, repo_dir(&real));
+        let expect = format!("{:x}", sha2::Sha256::digest(real.canonicalize().unwrap().to_string_lossy().as_bytes()));
+        assert!(dir.ends_with(format!("{expect}.git")), "寻址必须是 canonical 路径的 sha256: {}", dir.display());
+        // symlink 拼写分叉（link 与 real 指向同一目录）必须收敛到同一 shadow repo
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(dir, repo_dir(&link));
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn commit_args_disable_gpgsign() {
@@ -185,6 +245,72 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
         // 不存在的 label 报错
         assert!(reset_to(&dir, "msg_404").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewind_removes_files_created_after_checkpoint() {
+        // 与确认框承诺一致：检查点之后新建的文件（turn 内 agent 产物）在 rewind 后不复存在
+        let dir = std::env::temp_dir().join(format!("kxen-ckpt-clean-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        commit(&dir, "msg_1").unwrap();
+        // turn 内：新建文件、新建子目录文件、改动既有文件
+        std::fs::write(dir.join("new.txt"), "agent new\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/nested.txt"), "agent nested\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
+        reset_to(&dir, "msg_1").unwrap();
+        assert!(!dir.join("new.txt").exists(), "检查点后新建文件必须被清除");
+        assert!(!dir.join("sub").exists(), "检查点后新建目录必须被清除");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewind_keeps_preexisting_untracked_files() {
+        // 检查点时刻已存在的未跟踪文件已被 add -A 入库：rewind 不得误删用户自己的文件
+        let dir = std::env::temp_dir().join(format!("kxen-ckpt-keep-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        commit(&dir, "msg_1").unwrap();
+        commit(&dir, "msg_2").unwrap();
+        reset_to(&dir, "msg_1").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n", "检查点前已存在的文件必须保留");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_commits_do_not_collide_on_index_lock() {
+        // 同 workspace 多会话并发 checkpoint：进程内互斥保证不撞 index.lock
+        let dir = std::env::temp_dir().join(format!("kxen-ckpt-conc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let d = dir.clone();
+            handles.push(std::thread::spawn(move || commit(&d, &format!("msg_{i}"))));
+        }
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shadow_repo_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kxen-ckpt-perm-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        commit(&dir, "msg_1").unwrap();
+        let mode = std::fs::metadata(repo_dir(&dir)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "shadow repo 目录必须 0700: {mode:o}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

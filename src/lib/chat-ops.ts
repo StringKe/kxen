@@ -14,8 +14,14 @@ export async function worktreeCreate(name: string): Promise<WorktreeInfo> {
   return client.rpc("worktree.create", { name });
 }
 
-export async function worktreeRemove(name: string, deleteBranch = false): Promise<void> {
-  return client.rpc("worktree.remove", { name, delete_branch: deleteBranch });
+// confirmed：前端行内确认条已显式确认（后端收到后跳过审批挂起，避免双确认）。
+// agent 工具路径不走此 RPC，审批语义不受影响。
+export async function worktreeRemove(
+  name: string,
+  deleteBranch = false,
+  confirmed = false,
+): Promise<void> {
+  return client.rpc("worktree.remove", { name, delete_branch: deleteBranch, confirmed });
 }
 
 export async function worktreeStatus(path: string): Promise<{ path: string; status: string }[]> {
@@ -104,24 +110,12 @@ export async function diffFile(sessionId: string, path: string): Promise<string>
 
 // ---------------- agent 改动快照（本会话口径，与 git status 无关） ----------------
 
+// 数据访问走 lib/agent-diff.ts（三态不吞错，失败可与真空区分）；这里只保留共享类型。
 export interface AgentDiffEntry {
   path: string;
   added: number;
   deleted: number;
   status: "created" | "modified" | "deleted";
-}
-
-export async function agentDiffStatus(sessionId: string): Promise<AgentDiffEntry[]> {
-  return client
-    .rpc<AgentDiffEntry[]>("diff.agent_status", { session_id: sessionId })
-    .catch(() => []);
-}
-
-export async function agentDiffFile(sessionId: string, path: string): Promise<string> {
-  const r = await client
-    .rpc<{ text: string }>("diff.agent_file", { session_id: sessionId, path })
-    .catch(() => ({ text: "" }));
-  return r.text;
 }
 
 // ---------------- goal ----------------

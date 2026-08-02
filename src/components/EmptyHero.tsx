@@ -1,9 +1,10 @@
-// 空态：logo + 四快捷卡。
+// 空态：logo + 「打开项目目录」引导卡 + 四快捷卡。
 // 入场动画只在 app 首次挂载播放；之后点新会话直接静态到位
 //（旧时间线清空与空态呈现同帧完成，不再经历 300ms 空白 + 闪入的割裂感）。
 import { onMount } from "solid-js";
-import { CalendarClock, Target, Users, Workflow } from "lucide-solid";
+import { CalendarClock, FolderOpen, Target, Users, Workflow } from "lucide-solid";
 import { insertComposerText } from "../lib/composer-bus";
+import { openProjectDir } from "../lib/open-project";
 
 const CARDS = [
   {
@@ -53,11 +54,26 @@ export default function EmptyHero() {
         </div>
       </div>
       <div class="grid grid-cols-2 gap-2.5">
+        {/* 新用户首屏引导：四张 prompt 卡之前先给「打开项目」入口，
+            否则首发消息可能直接跑在回退的家目录 workspace */}
+        <button
+          type="button"
+          class={`rounded-xl border border-[var(--border)] bg-[var(--bg-raised)] p-3.5 space-y-1.5 ${animated ? "empty-card" : ""}`}
+          style={animated ? "animation-delay: 80ms" : ""}
+          title="选择本地项目文件夹"
+          onClick={() => void openProjectDir()}
+        >
+          <FolderOpen size={16} class="text-[var(--accent-hover)]" />
+          <div class="text-left text-xs font-medium">打开项目目录</div>
+          <div class="text-left text-xs leading-snug text-[var(--text-faint)]">
+            选择本地项目文件夹，会话在该目录下运行
+          </div>
+        </button>
         {CARDS.map((c, i) => (
           <button
             type="button"
             class={`rounded-xl border border-[var(--border)] bg-[var(--bg-raised)] p-3.5 space-y-1.5 ${animated ? "empty-card" : ""}`}
-            style={animated ? `animation-delay: ${80 + i * 50}ms` : ""}
+            style={animated ? `animation-delay: ${80 + (i + 1) * 50}ms` : ""}
             title={`填入 ${c.title}`}
             onClick={() => insertComposerText(c.prompt)}
           >

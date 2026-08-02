@@ -22,7 +22,7 @@ const tailItems = shouldCollapse ? items.slice(items.length - tailCount) : [];
 ---
 
 {items.length > 1 && (
-  <nav aria-label="Breadcrumb" class={cn("text-xs font-medium", className)} {...attrs}>
+  <nav aria-label="面包屑导航" class={cn("text-xs font-medium", className)} {...attrs}>
     <ol class="flex flex-wrap items-center gap-y-0.5 text-muted-foreground">
       {headItems.map((crumb, i) => (
         <li class="flex items-center">
@@ -43,7 +43,7 @@ const tailItems = shouldCollapse ? items.slice(items.length - tailCount) : [];
           <details class="relative group">
             <summary
               class="list-none cursor-pointer select-none rounded px-1 py-0.5 transition-colors hover:bg-accent hover:text-foreground [&::-webkit-details-marker]:hidden group-open:before:fixed group-open:before:inset-0 group-open:before:z-[39] group-open:before:cursor-default group-open:before:content-['']"
-              aria-label={`Show ${collapsedItems.length} more path segments`}
+              aria-label={`显示其余 ${collapsedItems.length} 级路径`}
             >
               <span class="tracking-widest">&hellip;</span>
             </summary>

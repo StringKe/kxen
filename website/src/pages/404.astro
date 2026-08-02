@@ -1,10 +1,9 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import Header from "../components/Header.astro";
-import { config } from "virtual:nimbus/config";
 ---
 
-<BaseLayout title={`页面不存在 · ${config.title}`} description="你访问的页面不存在或已被移动。">
+<BaseLayout title="页面不存在" description="你访问的页面不存在或已被移动。" noindex>
   <div class="flex flex-col min-h-screen">
     <Header />
     <main class="flex-1 mx-auto max-w-2xl w-full px-6 py-24 text-center">

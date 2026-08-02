@@ -7,7 +7,7 @@ const WT1 = { name: "wt1", path: "/repo/.kxen/worktrees/wt1", branch: "kxen/wt1"
 
 const h = vi.hoisted(() => ({
   list: vi.fn(async () => [] as { name: string; path: string; branch: string }[]),
-  remove: vi.fn(async (_name: string, _deleteBranch?: boolean) => {}),
+  remove: vi.fn(async (_name: string, _deleteBranch?: boolean, _confirmed?: boolean) => {}),
   create: vi.fn(),
   status: vi.fn(async (_path: string) => [] as { path: string; status: string }[]),
   switch: vi.fn(async (_path: string) => {}),
@@ -79,6 +79,8 @@ describe("DockWorktree 删除三态", () => {
     removeBtn.click();
     await flush();
     expect(h.remove).toHaveBeenCalledTimes(1);
+    // clean 且保留分支直连路径：未经确认条，confirmed=false（审批语义不变）
+    expect(h.remove).toHaveBeenCalledWith("wt1", false, false);
     expect(btn("移除 worktree（分支保留）").disabled).toBe(true); // 进行中禁用
     btn("移除 worktree（分支保留）").click(); // 连点被拒
     await flush();
@@ -133,7 +135,8 @@ describe("DockWorktree 删除三态", () => {
     btnByText("确认删除").click();
     await flush();
     await flush();
-    expect(h.remove).toHaveBeenCalledWith("wt1", true);
+    // 行内确认条确认后 confirmed=true：后端据此跳过审批挂起（双确认的修复）
+    expect(h.remove).toHaveBeenCalledWith("wt1", true, true);
     expect(flash.msgs().some((m) => m.kind === "ok" && m.text.includes("已删除 kxen/wt1"))).toBe(
       true,
     );
@@ -209,6 +212,20 @@ describe("DockWorktree 自动刷新", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("DockWorktree 首载失败", () => {
+  it("失败与真空区分：出重试条不出「无隔离树」，重试成功恢复列表", async () => {
+    h.list.mockRejectedValueOnce(new Error("ws down"));
+    const dispose = render(() => <DockWorktree />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("加载 worktree 列表失败"));
+    expect(document.body.textContent).not.toContain("无隔离树");
+
+    btnByText("重试").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("kxen/wt1"));
+    expect(document.body.textContent).not.toContain("加载 worktree 列表失败");
+    dispose();
   });
 });
 

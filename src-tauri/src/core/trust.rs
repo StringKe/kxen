@@ -54,9 +54,10 @@ pub fn trust(workdir: &Path) {
     trust_into(&store_file(), workdir);
 }
 
-/// 项目内存在需要信任决策的内容（知识树或项目级 hooks 配置）。
+/// 项目内存在需要信任决策的内容（知识树、项目级 hooks 配置或 MCP 服务器清单）。
 pub fn needs_gate(workdir: &Path) -> bool {
-    workdir.join(".agents").is_dir() || workdir.join(".kxen/config.toml").is_file()
+    // .mcp.json 的 server 命令会在信任后由 MCP 加载执行，未信任前同样要过门
+    workdir.join(".agents").is_dir() || workdir.join(".kxen/config.toml").is_file() || workdir.join(".mcp.json").is_file()
 }
 
 /// 项目 hooks 死代码接线：已信任合并项目 .kxen/config.toml 重载，未信任回用户级。
@@ -134,6 +135,18 @@ mod tests {
         assert!(!is_trusted(&dir.join("src")), "普通子目录不继承");
         let other = std::env::temp_dir().join(format!("kxen-trust-wt-other-{}", std::process::id()));
         assert!(!is_trusted(&other), "无关目录不信任");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mcp_json_alone_triggers_gate() {
+        // 仅含 .mcp.json 的项目（无 .agents、无 .kxen/config.toml）也必须触发信任门
+        let dir = std::env::temp_dir().join(format!("kxen-trust-mcp-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!needs_gate(&dir));
+        std::fs::write(dir.join(".mcp.json"), "{}").unwrap();
+        assert!(needs_gate(&dir));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

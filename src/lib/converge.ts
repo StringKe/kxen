@@ -70,7 +70,13 @@ export function createConverge(deps: {
     const sid = activeSessionId();
     if (!sid) return;
     resetHold();
-    await sessionPendingClear(sid);
+    // 清空失败上屏且不碰本地队列：UI 保持原队列（与后端一致），用户可重试
+    try {
+      await sessionPendingClear(sid);
+    } catch (e) {
+      flashErr(`清空队列失败：${formatError(e instanceof Error ? e.message : String(e))}`);
+      return;
+    }
     converge(sid); // 真源重载（乐观上屏的排队消息随快照撤下）
   };
 

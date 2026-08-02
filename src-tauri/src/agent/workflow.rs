@@ -46,14 +46,21 @@ struct WfStats {
 /// workflow 工具入口：QuickJS 在专属线程 + current_thread runtime 跑（rquickjs !Send 全隔离），
 /// 本任务侧只做 phase 转发 / 结果等待 / 超时取消（全部 Send）。
 /// run_id 给了就开 journal resume：同 run_id 重跑时已完成 agent 派发直接回缓存（崩溃/取消可续）。
+/// run_id 经宿主按 session 派生后才进 journal（open_scoped）：模型参数不能直接命中其它会话的旧 journal。
 pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_id: Option<&str>) -> Result<String, String> {
-    let journal = run_id.and_then(|id| crate::agent::workflow_journal::Journal::open(id, script));
+    let journal = run_id.and_then(|id| crate::agent::workflow_journal::Journal::open_scoped(ctx.session_id.as_deref(), id, script));
     let (phase_tx, mut phase_rx) = mpsc::unbounded_channel::<PhaseMsg>();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
     let cancel = Arc::new(AtomicBool::new(false));
 
     let script_owned = script.to_string();
     let cancel_thread = cancel.clone();
+    // 超时/中断级联取消（P2-3）：workflow 级 cancel token 作为派发子代理的父令牌（dispatch 的
+    // _cascade watcher 同源），结束/超时随 CancelGuard 一并取消在飞子代理——旧实现只置 JS 中断
+    // 标志，挂在 Rust future 上的子代理收不到取消，白烧 tokens 直到自然结束。
+    let wf_cancel = crate::agent::cancel::CancelToken::new();
+    let parent_cascade = cascade_parent(deps.cancel.clone(), &wf_cancel);
+    let deps = SubagentDeps { cancel: Some(wf_cancel.clone()), ..deps };
     std::thread::Builder::new()
         .name("kxen-workflow".into())
         .spawn(move || {
@@ -70,7 +77,7 @@ pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_
         .map_err(|e| format!("workflow thread: {e}"))?;
 
     // 超时/取消：置中断标志，QuickJS 在下一个字节码检查点中止，线程自行退出
-    let cancel_on_drop = CancelGuard(cancel.clone());
+    let cancel_on_drop = CancelGuard(cancel.clone(), wf_cancel);
     let on_event = ctx.on_event.clone();
     let body = async {
         tokio::pin!(result_rx);
@@ -87,6 +94,7 @@ pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_
         Err(_) => Err(format!("workflow timed out after {}s", WORKFLOW_TIMEOUT_MS / 1000)),
     };
     drop(cancel_on_drop);
+    drop(parent_cascade);
     // 结果先到时排空已发送但未接收的 phase（发送先于 result，通道里必有）
     while let Ok(msg) = phase_rx.try_recv() {
         on_event(AgentEvent::Phase { name: msg.name, index: msg.index, total: msg.total, workflow_name: msg.workflow_name });
@@ -94,12 +102,31 @@ pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_
     out
 }
 
-/// 作用域结束即触发 JS 中断（覆盖超时与提前返回两条路径）。
-struct CancelGuard(Arc<AtomicBool>);
+/// 父 run abort 级联进 workflow 令牌（与 dispatch 的父子级联同一共识，done_tx drop 回收 watcher）。
+fn cascade_parent(
+    parent: Option<crate::agent::cancel::CancelToken>,
+    child: &crate::agent::cancel::CancelToken,
+) -> Option<tokio::sync::oneshot::Sender<()>> {
+    parent.map(|parent| {
+        let child = child.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = parent.wait() => child.cancel(),
+                _ = done_rx => {}
+            }
+        });
+        done_tx
+    })
+}
+
+/// 作用域结束即触发 JS 中断 + 在飞子代理级联取消（覆盖超时与提前返回两条路径）。
+struct CancelGuard(Arc<AtomicBool>, crate::agent::cancel::CancelToken);
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
+        self.1.cancel();
     }
 }
 
@@ -240,6 +267,39 @@ pub async fn run_script(
 /// 脚本侧可见的错误（promise rejection 的 message）。
 fn workflow_err(msg: String) -> rquickjs::Error {
     rquickjs::Error::FromJs { from: "workflow agent", to: "promise", message: Some(msg) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P2-3 级联回归：作用域结束（超时/提前返回同一 Drop 路径）必须同时置 JS 中断标志
+    /// 并取消 workflow 令牌——在飞子代理经 dispatch 的 _cascade watcher 收到取消。
+    #[test]
+    fn cancel_guard_cascades_to_workflow_token() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = crate::agent::cancel::CancelToken::new();
+        {
+            let _guard = CancelGuard(flag.clone(), token.clone());
+        }
+        assert!(flag.load(Ordering::Relaxed), "JS 中断标志必须置位");
+        assert!(token.is_cancelled(), "workflow 令牌必须取消（子代理级联取消的源头）");
+    }
+
+    /// P2-3 级联回归：父 run abort 经 cascade_parent 传到 workflow 令牌；
+    /// done_tx 回收后 watcher 退出不再误触。
+    #[tokio::test]
+    async fn parent_abort_cascades_into_workflow_token() {
+        let parent = crate::agent::cancel::CancelToken::new();
+        let child = crate::agent::cancel::CancelToken::new();
+        let done = cascade_parent(Some(parent.clone()), &child);
+        parent.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await.expect("父取消必须级联到 workflow 令牌");
+        drop(done);
+
+        // 无父令牌（subagent 嵌套外路径）：不建 watcher
+        assert!(cascade_parent(None, &child).is_none());
+    }
 }
 
 /// constraints 快照：角色绑定 + provider 实时可用性 + mrm 文字描述。

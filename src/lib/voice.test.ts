@@ -5,8 +5,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => {
   const handlers = new Set<(payload: unknown) => void>();
   const rpcCalls: Array<{ method: string; params: unknown }> = [];
+  const streamCalls: string[][] = [];
   const state = { failStart: false };
-  return { handlers, rpcCalls, state };
+  return { handlers, rpcCalls, streamCalls, state };
 });
 
 vi.mock("./client", () => ({
@@ -21,12 +22,15 @@ vi.mock("./client", () => ({
       if (method === "voice.stop") return Promise.resolve({ text: "终稿" });
       return Promise.resolve({});
     },
-    stream: () => ({
-      on: (cb: (payload: unknown) => void) => {
-        mocks.handlers.add(cb);
-        return () => mocks.handlers.delete(cb);
-      },
-    }),
+    stream: (topics: string | string[]) => {
+      mocks.streamCalls.push(Array.isArray(topics) ? topics : [topics]);
+      return {
+        on: (cb: (payload: unknown) => void) => {
+          mocks.handlers.add(cb);
+          return () => mocks.handlers.delete(cb);
+        },
+      };
+    },
   },
 }));
 
@@ -40,6 +44,7 @@ describe("startVoiceSession session 隔离", () => {
   beforeEach(() => {
     mocks.handlers.clear();
     mocks.rpcCalls.length = 0;
+    mocks.streamCalls.length = 0;
     mocks.state.failStart = false;
   });
 
@@ -52,6 +57,8 @@ describe("startVoiceSession session 隔离", () => {
       (m) => errors.push(m),
       "sess-A",
     );
+    // 订阅自带 session topic：stream ACL 要求连接持有会话绑定才放行（不隐式依赖其他订阅）
+    expect(mocks.streamCalls[0]).toEqual(["llm.delta", "session:sess-A"]);
     expect(mocks.rpcCalls[0]).toEqual({
       method: "voice.start",
       params: { engine: "apple", session_id: "sess-A" },

@@ -64,8 +64,6 @@ pub struct StreamMeta {
     pub id: String,
     pub seq: u64,
     pub mode: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub complete: Option<bool>,
 }
 
 /// 服务端 -> 客户端：流 chunk（无根 id，stream.id 关联）。
@@ -78,11 +76,7 @@ pub struct StreamChunk {
 
 impl StreamChunk {
     pub fn new(stream_id: &str, seq: u64, result: Value) -> Self {
-        Self { jsonrpc: VERSION, stream: StreamMeta { id: stream_id.into(), seq, mode: "server", complete: None }, result }
-    }
-
-    pub fn complete(stream_id: &str, seq: u64, result: Value) -> Self {
-        Self { jsonrpc: VERSION, stream: StreamMeta { id: stream_id.into(), seq, mode: "server", complete: Some(true) }, result }
+        Self { jsonrpc: VERSION, stream: StreamMeta { id: stream_id.into(), seq, mode: "server" }, result }
     }
 }
 
@@ -126,7 +120,6 @@ impl From<&str> for CallError {
 /// 系统方法名（rpc. 前缀保留）。
 pub const M_SUBSCRIBE: &str = "rpc.subscribe";
 pub const M_UNSUBSCRIBE: &str = "rpc.unsubscribe";
-pub const M_CANCEL_STREAM: &str = "rpc.cancelStream";
 pub const M_HEARTBEAT: &str = "rpc.heartbeat";
 
 static RES_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -175,15 +168,10 @@ mod tests {
     }
 
     #[test]
-    fn chunk_has_no_root_id_and_complete_marker() {
+    fn chunk_has_no_root_id() {
         let c = StreamChunk::new("run-1", 3, serde_json::json!({"delta": "x"}));
         let v = serde_json::to_value(&c).unwrap();
         assert!(v.get("id").is_none(), "流帧不得有根 id");
         assert_eq!(v["stream"]["seq"], 3);
-        assert!(v["stream"].get("complete").is_none());
-
-        let end = StreamChunk::complete("run-1", 4, serde_json::json!({"stats": {}}));
-        let v = serde_json::to_value(&end).unwrap();
-        assert_eq!(v["stream"]["complete"], true);
     }
 }

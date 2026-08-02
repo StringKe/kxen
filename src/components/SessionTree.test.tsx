@@ -92,7 +92,7 @@ describe("SessionTree 切换门", () => {
     h.workspaceSwitch.mockRejectedValue(new Error("directory not found: /a"));
     const dispose = render(() => <SessionTree />, document.body);
     await flush();
-    const plus = document.body.querySelector("span[title='在此项目下新建会话']");
+    const plus = document.body.querySelector("button[title='在此项目下新建会话']");
     plus?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await flush();
     expect(h.nav).not.toHaveBeenCalled(); // newSession 会 navigate：未发生即未进草稿
@@ -105,7 +105,7 @@ describe("SessionTree 切换门", () => {
   it("workspaceSwitch 成功：quickNew 进草稿态", async () => {
     const dispose = render(() => <SessionTree />, document.body);
     await flush();
-    const plus = document.body.querySelector("span[title='在此项目下新建会话']");
+    const plus = document.body.querySelector("button[title='在此项目下新建会话']");
     plus?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await flush();
     expect(h.nav).toHaveBeenCalledWith("/");

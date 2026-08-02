@@ -178,6 +178,9 @@ pub(super) async fn set_experimental(params: &Value, state: &Arc<AppState>) -> R
 /// MRM 预算、显式计价和熔断参数写回。所有金额必须由用户提供实际合同口径，
 /// 后端只计算和执行阈值，不维护可能漂移的公开模型价目表。
 pub(super) fn set_limits(params: &Value, state: &Arc<AppState>) -> Result<Value, String> {
+    if let Some(key) = dropped_provider_scoped_field(params) {
+        return Err(format!("{key} requires a provider id: provider-scoped pricing/circuit fields are dropped without one"));
+    }
     let path = kxen_app::core::paths::config_dir().join("config.toml");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut doc: toml::Table =
@@ -221,6 +224,18 @@ pub(super) fn set_limits(params: &Value, state: &Arc<AppState>) -> Result<Value,
     Ok(json!({ "saved": true }))
 }
 
+const PROVIDER_SCOPED_KEYS: [&str; 5] =
+    ["input_usd_per_million", "output_usd_per_million", "daily_cost_budget_usd", "circuit_failure_threshold", "circuit_cooldown_seconds"];
+
+/// provider 缺席时会被静默丢弃的 provider 级字段（只认非 null 值：null = 清除，无可写目标时本就不动）。
+/// 此前这类调用假报 saved:true，熔断配置看似保存实际没落盘。
+fn dropped_provider_scoped_field(params: &Value) -> Option<&'static str> {
+    if params.get("provider").and_then(Value::as_str).is_some() {
+        return None;
+    }
+    PROVIDER_SCOPED_KEYS.into_iter().find(|key| params.get(key).is_some_and(|v| !v.is_null()))
+}
+
 fn set_optional_integer(table: &mut toml::Table, key: &str, value: Option<&Value>) -> Result<(), String> {
     match value {
         None => {}
@@ -255,7 +270,7 @@ fn set_optional_float(table: &mut toml::Table, key: &str, value: Option<&Value>)
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_binding, set_optional_float, set_optional_integer};
+    use super::{dropped_provider_scoped_field, merge_binding, set_optional_float, set_optional_integer};
 
     fn old_binding() -> toml::map::Map<String, toml::Value> {
         let mut t = toml::map::Map::new();
@@ -310,5 +325,18 @@ mod tests {
         set_optional_integer(&mut table, "daily_token_budget", Some(&serde_json::Value::Null)).unwrap();
         assert!(!table.contains_key("daily_token_budget"));
         assert!(set_optional_float(&mut table, "daily_cost_budget_usd", Some(&serde_json::json!(-1.0))).is_err());
+    }
+
+    #[test]
+    fn provider_scoped_fields_without_provider_are_rejected_not_dropped() {
+        // 零 provider 场景回归：熔断字段带值但无 provider 时必须显式报错（旧实现静默丢弃仍回 saved:true）
+        let params = serde_json::json!({ "circuit_failure_threshold": 3, "circuit_cooldown_seconds": 60 });
+        assert_eq!(dropped_provider_scoped_field(&params), Some("circuit_failure_threshold"));
+        // null = 清除语义：无可写目标时不拦（只设全局 daily_token_budget 的调用不受影响）
+        let clearing = serde_json::json!({ "daily_token_budget": 1000, "circuit_failure_threshold": null });
+        assert_eq!(dropped_provider_scoped_field(&clearing), None);
+        // 带 provider 的正常调用不拦
+        let scoped = serde_json::json!({ "provider": "xai", "input_usd_per_million": 2.0 });
+        assert_eq!(dropped_provider_scoped_field(&scoped), None);
     }
 }

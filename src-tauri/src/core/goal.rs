@@ -336,3 +336,11 @@ pub fn evidence_sufficient(evidence: &str) -> bool {
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
+
+/// 全局 goal 跨会话并发记账（P1-1）与 goal RPC/工具写路径（P2-2）共用的 per-id 进程内锁：
+/// 「重读 + 修改 + save」串行化（map 常驻不清理：goal 数量级有限，清理引入新竞态）。
+pub fn write_lock(id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    crate::core::shared::lock(&LOCKS).entry(id.to_string()).or_default().clone()
+}

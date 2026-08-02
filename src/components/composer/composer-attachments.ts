@@ -2,6 +2,8 @@
 // 图片内联 base64（先经 image-scale 压到长边 1568）；文件存路径引用（工作区外经 fs.allow_path 授权，见 attach.ts）。
 // 失败不静默跳过：push err 态 chip（title 写明原因，可点 X 移除）。
 import { ensureActiveSession } from "../../lib/state";
+import { flashErr } from "../../lib/flash";
+import { formatError } from "../../lib/error-text";
 import { baseName, fsResolveName, resolveAttachPath, resolvePickedPath } from "./attach";
 import { fileToImageDataUrl } from "./image-scale";
 import type { RowChip } from "./RowChips";
@@ -59,7 +61,13 @@ export function createAttachments(deps: AttachDeps) {
 
   /** 原生对话框/拖放路径附件：真实绝对路径。授权绑会话（草稿态先落库）；图片读 base64 内联，文件走 context chip。 */
   async function attachPaths(paths: string[]) {
-    const sid = await ensureActiveSession();
+    // 会话创建（草稿态落库）失败不能吞：拖放/AttachMenu 入口都是 void 调用，
+    // 无 catch 就是 unhandled rejection + 用户零反馈
+    const sid = await ensureActiveSession().catch((e: unknown) => {
+      flashErr(`添加附件失败：${formatError(errText(e))}`);
+      return null;
+    });
+    if (!sid) return;
     for (const path of paths) {
       const r = await resolvePickedPath(sid, path);
       if (!r.ok) {

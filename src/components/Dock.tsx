@@ -1,7 +1,5 @@
 import { createEffect, createSignal, For, Show, onCleanup, onMount } from "solid-js";
 import {
-  agentDiffFile,
-  agentDiffStatus,
   goalFocus,
   goalList,
   goalTransit,
@@ -9,14 +7,16 @@ import {
   taskKill,
   taskList,
   taskRestart,
-  type AgentDiffEntry,
   type GoalAction,
   type GoalInfo,
   type TaskInfo,
 } from "../lib/chat";
+import { createAgentDiff, fetchAgentDiffFile, type AgentDiffStatus } from "../lib/agent-diff";
 import { client } from "../lib/client";
 import { createAction } from "../lib/async-guard";
 import { activeSessionId } from "../lib/state";
+import { flashErr } from "../lib/flash";
+import { formatError } from "../lib/error-text";
 import Markdown from "./Markdown";
 import DockWorktree from "./DockWorktree";
 import DockGoal from "./DockGoal";
@@ -37,61 +37,109 @@ const [openTask, setOpenTask] = createSignal("");
 /** 右 dock：会话上下文（目标 / 改动 / 后台任务）。 */
 function DockSections(props: {
   goal: GoalInfo | null;
-  act: (action: GoalAction) => void;
+  act: (action: GoalAction) => Promise<boolean>;
   acting: () => boolean;
-  changes: AgentDiffEntry[];
+  diffStatus: () => AgentDiffStatus;
+  reloadDiff: () => void;
   openDiff: { path: string; text: string } | null;
   toggleDiff: (path: string) => void;
   tasks: TaskInfo[];
   reloadTasks: () => void;
 }) {
   const reloadTasks = props.reloadTasks;
-  const changes = () => props.changes;
+  const diffStatus = props.diffStatus;
+  const diffEntries = () => {
+    const s = diffStatus();
+    return s.state === "ok" ? s.entries : [];
+  };
+  const diffErr = () => {
+    const s = diffStatus();
+    return s.state === "err" ? s.message : "";
+  };
   const openDiff = () => props.openDiff;
   const toggleDiff = props.toggleDiff;
   const tasks = () => props.tasks;
+  // 任务操作失败不吞（裸 then 的失败是 unhandled rejection 且用户无感知）：原因走 flashErr
+  const restartTask = (id: string) =>
+    void taskRestart(id)
+      .then(reloadTasks)
+      .catch((e: unknown) =>
+        flashErr(`重启任务失败：${formatError(e instanceof Error ? e.message : String(e))}`),
+      );
+  const killTask = (id: string) =>
+    void taskKill(id)
+      .then(reloadTasks)
+      .catch((e: unknown) =>
+        flashErr(`终止任务失败：${formatError(e instanceof Error ? e.message : String(e))}`),
+      );
   return (
     <>
       <DockGoal goal={props.goal} act={props.act} acting={props.acting} />
 
       <DockSection title="会话改动" icon={FileDiff}>
         <Show
-          when={changes().length > 0}
-          fallback={<div class="text-xs text-[var(--text-faint)]">本会话暂无 agent 改动</div>}
+          when={diffStatus().state !== "loading"}
+          fallback={<div class="text-xs text-[var(--text-faint)]">加载中…</div>}
         >
-          <div class="space-y-0.5">
-            <For each={changes()}>
-              {(c) => (
-                <div>
-                  <button
-                    class="w-full flex items-center gap-1.5 px-1 py-0.5 rounded text-xs text-left hover:bg-[var(--bg-overlay)]/60"
-                    onClick={() => void toggleDiff(c.path)}
-                  >
-                    <span
-                      class="font-mono text-2xs w-10 shrink-0"
-                      classList={{
-                        "text-[var(--ok)]": c.status === "created",
-                        "text-[var(--warn)]": c.status === "modified",
-                        "text-[var(--err)]": c.status === "deleted",
-                      }}
-                    >
-                      {c.status === "created" ? "新增" : c.status === "deleted" ? "删除" : "修改"}
-                    </span>
-                    <span class="truncate font-mono text-[var(--text-dim)] flex-1">{c.path}</span>
-                    <span class="text-2xs tabular-nums shrink-0">
-                      <span class="text-[var(--ok)]">+{c.added}</span>{" "}
-                      <span class="text-[var(--err)]">-{c.deleted}</span>
-                    </span>
-                  </button>
-                  <Show when={openDiff()?.path === c.path}>
-                    <div class="mt-1 mb-2 text-2xs max-h-72 overflow-auto rounded border border-[var(--border)]">
-                      <Markdown text={"```diff\n" + (openDiff()?.text ?? "") + "\n```"} />
+          <Show
+            when={!diffErr()}
+            fallback={
+              <div class="flex items-center gap-2 text-xs">
+                <span class="text-[var(--err)]">加载改动失败：{diffErr()}</span>
+                <button
+                  class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-dim)]"
+                  onClick={() => props.reloadDiff()}
+                >
+                  重试
+                </button>
+              </div>
+            }
+          >
+            <Show
+              when={diffEntries().length > 0}
+              fallback={<div class="text-xs text-[var(--text-faint)]">本会话暂无 agent 改动</div>}
+            >
+              <div class="space-y-0.5">
+                <For each={diffEntries()}>
+                  {(c) => (
+                    <div>
+                      <button
+                        class="w-full flex items-center gap-1.5 px-1 py-0.5 rounded text-xs text-left hover:bg-[var(--bg-overlay)]/60"
+                        onClick={() => void toggleDiff(c.path)}
+                      >
+                        <span
+                          class="font-mono text-2xs w-10 shrink-0"
+                          classList={{
+                            "text-[var(--ok)]": c.status === "created",
+                            "text-[var(--warn)]": c.status === "modified",
+                            "text-[var(--err)]": c.status === "deleted",
+                          }}
+                        >
+                          {c.status === "created"
+                            ? "新增"
+                            : c.status === "deleted"
+                              ? "删除"
+                              : "修改"}
+                        </span>
+                        <span class="truncate font-mono text-[var(--text-dim)] flex-1">
+                          {c.path}
+                        </span>
+                        <span class="text-2xs tabular-nums shrink-0">
+                          <span class="text-[var(--ok)]">+{c.added}</span>{" "}
+                          <span class="text-[var(--err)]">-{c.deleted}</span>
+                        </span>
+                      </button>
+                      <Show when={openDiff()?.path === c.path}>
+                        <div class="mt-1 mb-2 text-2xs max-h-72 overflow-auto rounded border border-[var(--border)]">
+                          <Markdown text={"```diff\n" + (openDiff()?.text ?? "") + "\n```"} />
+                        </div>
+                      </Show>
                     </div>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </Show>
         </Show>
       </DockSection>
 
@@ -121,14 +169,14 @@ function DockSections(props: {
                     <span class="ml-auto flex gap-1">
                       <button
                         class="pressable px-1.5 py-0 rounded text-2xs border border-[var(--border)] text-[var(--text-dim)]"
-                        onClick={() => void taskRestart(t.id).then(reloadTasks)}
+                        onClick={() => restartTask(t.id)}
                       >
                         重启
                       </button>
                       <Show when={t.status === "running"}>
                         <button
                           class="pressable px-1.5 py-0 rounded text-2xs border border-[var(--border)] text-[var(--err)]"
-                          onClick={() => void taskKill(t.id).then(reloadTasks)}
+                          onClick={() => killTask(t.id)}
                         >
                           终止
                         </button>
@@ -159,7 +207,8 @@ function DockSections(props: {
 
 export default function Dock() {
   const [goal, setGoal] = createSignal<GoalInfo | null>(null);
-  const [changes, setChanges] = createSignal<AgentDiffEntry[]>([]);
+  // 会话改动三态数据源（loading/err/真空可区分，实现见 lib/agent-diff.ts）
+  const agentDiff = createAgentDiff(activeSessionId);
   const [tasks, setTasks] = createSignal<TaskInfo[]>([]);
   const [openDiff, setOpenDiff] = createSignal<{ path: string; text: string } | null>(null);
   let unlisten: (() => void) | undefined;
@@ -181,16 +230,14 @@ export default function Dock() {
       // 事件/轮询驱动：本轮失败保留旧值，下一轮重拉
     }
   };
-  const reloadDiff = async () => {
-    const sid = activeSessionId();
-    if (!sid) {
-      setChanges([]);
-      return;
+  const reloadDiff = agentDiff.reload;
+  const reloadTasks = async () => {
+    try {
+      setTasks(await taskList());
+    } catch {
+      // 事件/轮询驱动：本轮失败保留旧值，下一轮重拉（同 reloadGoal 模式）
     }
-    const next = await agentDiffStatus(sid);
-    if (activeSessionId() === sid) setChanges(next);
   };
-  const reloadTasks = async () => setTasks(await taskList());
 
   // 切换会话立即重拉会话口径数据：否则上一会话的 goal/diff 会残留到下个事件或轮询
   createEffect(() => {
@@ -221,16 +268,20 @@ export default function Dock() {
     if (timer) clearInterval(timer);
   });
 
-  const act = (action: GoalAction) => {
+  // 返回是否成功：「提高预算并继续」需在 adjust 成功后触发续跑提示（goal 状态迁移不等于 run 续跑）
+  const act = (action: GoalAction): Promise<boolean> => {
     const g = goal();
-    if (!g) return;
-    void goalAction.run(
-      async () => {
-        await goalTransit(g.id, action);
-        await reloadGoal();
-      },
-      { errPrefix: "goal 操作失败" },
-    );
+    if (!g) return Promise.resolve(false);
+    return goalAction
+      .run(
+        async () => {
+          await goalTransit(g.id, action);
+          await reloadGoal();
+          return true;
+        },
+        { errPrefix: "goal 操作失败" },
+      )
+      .then((ok) => ok === true);
   };
 
   const toggleDiff = async (path: string) => {
@@ -238,8 +289,13 @@ export default function Dock() {
       setOpenDiff(null);
       return;
     }
-    const text = await agentDiffFile(activeSessionId(), path);
-    setOpenDiff({ path, text });
+    // 失败不吞成空 diff（与「无改动」同形）：原因走 flashErr
+    const r = await fetchAgentDiffFile(activeSessionId(), path);
+    if (r.state === "err") {
+      flashErr(`加载 diff 失败：${r.message}`);
+      return;
+    }
+    setOpenDiff({ path, text: r.text });
   };
 
   return (
@@ -248,7 +304,8 @@ export default function Dock() {
         goal={goal()}
         act={act}
         acting={goalAction.pending}
-        changes={changes()}
+        diffStatus={agentDiff.status}
+        reloadDiff={() => void agentDiff.reload()}
         openDiff={openDiff()}
         toggleDiff={toggleDiff}
         tasks={tasks()}

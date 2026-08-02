@@ -94,6 +94,33 @@ async fn retryable_error_recovers_on_next_attempt() {
     assert_eq!(calls.load(Ordering::SeqCst), 2, "429 应触发一次重试");
 }
 
+/// abort 在重试退避期立即生效（P2 回归：旧实现退避是裸 sleep，abort 最长延迟 3.2s+jitter）。
+/// 判定信号：退避期取消后不得发起第二次 LLM 请求（旧实现睡满退避才在下一轮 stream select 响应取消）。
+#[tokio::test]
+async fn abort_during_retry_backoff_interrupts_immediately() {
+    goals_dir_isolation();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream = scripted(
+        vec![vec![Delta::Error("xai HTTP 429: too many requests".into())], vec![Delta::Text("should-not-reach".into()), Delta::Done]],
+        calls.clone(),
+    );
+    let token = kxen_app::agent::cancel::CancelToken::new();
+    let mut ctx = test_ctx(stream, "run-abort-backoff");
+    ctx.cancel = Some(token.clone());
+    let mut messages = Vec::new();
+    let run = tokio::spawn(async move { run_turn(&mut ctx, &mut messages).await });
+    // 首次 LLM 请求发出（calls==1）即取消：此刻 run 必在「错误处理 -> 退避」窗口内，
+    // 比固定 sleep 稳（固定时延在高负载下可能睡过整个退避窗口造成假失败）。
+    while calls.load(Ordering::SeqCst) == 0 && !run.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    token.cancel();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), run).await.expect("abort 不得卡在退避期").expect("join");
+    assert!(out.aborted, "退避期 abort 必须生效");
+    assert!(matches!(out.terminal, AgentEvent::Aborted));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "退避期取消后不得发起第二次 LLM 请求");
+}
+
 /// 预算分支：本轮 usage 超 goal tokens 预算 -> BudgetLimited 终态并落盘。
 #[tokio::test]
 async fn token_budget_limited_terminates_run() {
@@ -123,4 +150,63 @@ async fn token_budget_limited_terminates_run() {
     let saved = kxen_app::core::goal::Goal::load(&dir, "run-budget-goal").expect("load");
     assert_eq!(saved.status, kxen_app::core::goal::GoalStatus::BudgetLimited, "预算超限必须落盘 BudgetLimited");
     let _ = std::fs::remove_file(dir.join("run-budget-goal.json"));
+}
+
+/// P2-6 部分产出保留：流中途不可重试错误，已流出文本进终态文本与历史（附错误标记），不得整段丢弃。
+#[tokio::test]
+async fn stream_error_keeps_partial_output() {
+    goals_dir_isolation();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let stream = scripted(vec![vec![Delta::Text("partial answer".into()), Delta::Error("stream reset by peer".into())]], calls.clone());
+    let mut ctx = test_ctx(stream, "run-partial");
+    let mut messages = Vec::new();
+    let out = run_turn(&mut ctx, &mut messages).await;
+    assert!(out.final_text.starts_with("partial answer"), "部分产出必须进终态文本: {}", out.final_text);
+    assert!(out.final_text.contains("(错误: stream reset by peer)"), "错误标记必须附后: {}", out.final_text);
+    assert!(matches!(out.terminal, AgentEvent::Error { .. }));
+    assert!(
+        messages.iter().any(|m| m.role == kxen_app::llm::types::Role::Assistant && m.content == "partial answer"),
+        "部分产出必须进历史"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "部分产出后不得重试");
+}
+
+/// P2-1 暂停分支：run 在飞期间 goal 被暂停（流闭包内落盘模拟 RPC/工具暂停），
+/// 轮末记账发现非 Active 必须落终态停出，不得继续下一轮 LLM 请求。
+#[tokio::test]
+async fn paused_goal_terminates_in_flight_run() {
+    let dir = goals_dir_isolation();
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut goal = kxen_app::core::goal::Goal::create(
+        kxen_app::core::goal::GoalContract {
+            objective: "o".into(),
+            completion_criteria: "c".into(),
+            constraints: None,
+            budget: kxen_app::core::goal::GoalBudget::default(),
+        },
+        "run-pause-goal".into(),
+    )
+    .expect("create");
+    goal.activate().expect("activate");
+    goal.session_id = Some("run-pause".into());
+    goal.save(&dir).expect("save");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pause_dir = dir.clone();
+    let call_count = calls.clone();
+    let stream: StreamFn = Arc::new(move |_model, _messages, _tools, _store| {
+        call_count.fetch_add(1, Ordering::SeqCst);
+        // 模拟 run 在飞期间用户暂停 goal（RPC/工具暂停的同一落盘形态）
+        let mut g = kxen_app::core::goal::Goal::load(&pause_dir, "run-pause-goal").expect("load");
+        g.pause().expect("pause");
+        g.save(&pause_dir).expect("save");
+        Box::pin(futures::stream::iter(vec![Delta::Text("partial".into()), Delta::Usage { input: 10, output: 5 }, Delta::Done]))
+    });
+    let mut ctx = test_ctx(stream, "run-pause");
+    let mut messages = Vec::new();
+    let out = run_turn(&mut ctx, &mut messages).await;
+    assert!(out.final_text.contains("已暂停"), "终态文本须带暂停原因: {}", out.final_text);
+    assert!(matches!(out.terminal, AgentEvent::Error { .. }), "暂停终态必须是 Error: {:?}", out.terminal);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "暂停后不得发起下一轮 LLM 请求");
+    let _ = std::fs::remove_file(dir.join("run-pause-goal.json"));
 }

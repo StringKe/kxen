@@ -27,7 +27,6 @@ pub(crate) fn restore_queues(app: AppHandle) {
                 }
             };
             let stream_id = super::protocol::stream_id("run");
-            kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), sid.clone());
             tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
         }
     });
@@ -51,7 +50,6 @@ pub(crate) fn kick_session(app: AppHandle, sid: String) {
             }
         };
         let stream_id = super::protocol::stream_id("run");
-        kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), sid.clone());
         tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
     });
 }

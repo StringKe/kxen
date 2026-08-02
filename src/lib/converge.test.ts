@@ -76,6 +76,22 @@ describe("converge 失败兜底", () => {
     await flush();
     expect(c.lastQueue()).toEqual([]);
   });
+
+  it("clearQueue RPC 失败：flash 错误反馈，UI 保持原队列（不静默、不重载）", async () => {
+    const c = setup();
+    h.sessionPendingList.mockResolvedValue(["B"]);
+    c.converge("s1");
+    await flush();
+    expect(c.lastQueue()).toEqual(["B"]);
+
+    h.sessionPendingClear.mockRejectedValueOnce(new Error("rpc down"));
+    await c.clearQueue();
+    await flush();
+    expect(h.flashErr).toHaveBeenCalledTimes(1);
+    expect(String(h.flashErr.mock.calls[0]?.[0])).toContain("清空队列失败");
+    expect(String(h.flashErr.mock.calls[0]?.[0])).toContain("rpc down");
+    expect(c.lastQueue()).toEqual(["B"]); // 队列保持原样，用户可重试
+  });
 });
 
 describe("pop 窗口保留", () => {

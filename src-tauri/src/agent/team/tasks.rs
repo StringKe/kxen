@@ -189,7 +189,14 @@ fn cascade_terminal(state: &Arc<TeamState>, root: u64, status: TeamTaskStatus) -
 
 fn persist_tasks(state: &Arc<TeamState>) {
     let tasks = lock(&state.tasks).clone();
-    let _ = std::fs::write(state.dir.join("tasks.json"), serde_json::to_string_pretty(&tasks).unwrap_or_default());
+    // tmp+rename 原子写：崩溃不留半截 tasks（重启 restore 按此重建任务板）
+    let path = state.dir.join("tasks.json");
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) =
+        std::fs::write(&tmp, serde_json::to_string_pretty(&tasks).unwrap_or_default()).and_then(|_| std::fs::rename(&tmp, &path))
+    {
+        tracing::warn!(session = state.session_id, error = %e, "team tasks.json persist failed");
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +308,25 @@ mod tests {
         let got = statuses(&state);
         assert!(got.contains(&(t2.id, TeamTaskStatus::Canceled)));
         assert!(got.contains(&(t3.id, TeamTaskStatus::Canceled)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn persist_writes_are_atomic_and_complete() {
+        // P2-4 回归：config.json / tasks.json 走 tmp+rename——文件完整可解析、不留 .tmp 残骸
+        let (state, dir) = state("persist");
+        let t1 = create_task(&state, "root", vec![]);
+        super::super::types::persist_config(&state);
+        persist_tasks(&state);
+
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state.dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["session_id"], serde_json::json!("s1"));
+        let tasks: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(state.dir.join("tasks.json")).unwrap()).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], serde_json::json!(t1.id));
+        for f in ["config.json.tmp", "tasks.json.tmp"] {
+            assert!(!state.dir.join(f).exists(), "{f} 必须已 rename 走");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

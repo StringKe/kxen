@@ -22,10 +22,8 @@ struct InboxEntry {
 static INBOX_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 fn lock_for(path: &Path) -> Arc<Mutex<()>> {
-    INBOX_LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("inbox locks")
+    // shared::lock 容错取锁（P2-7）：持锁线程 panic 毒化不代表数据损坏，expect 会把整个 team 收件通道打死
+    crate::core::shared::lock(INBOX_LOCKS.get_or_init(|| Mutex::new(HashMap::new())))
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
@@ -172,12 +170,27 @@ mod tests {
         append_inbox(&second, "lead", "worker", "two").unwrap();
 
         drop_session_locks(&first);
-        let locks = INBOX_LOCKS.get().unwrap().lock().unwrap();
+        let locks = crate::core::shared::lock(INBOX_LOCKS.get().unwrap());
         assert!(!locks.keys().any(|path| path.starts_with(&first)));
         assert!(locks.keys().any(|path| path.starts_with(&second)));
         drop(locks);
 
         drop_session_locks(&second);
         std::fs::remove_dir_all(base).ok();
+    }
+
+    /// P2-7 poison 容错回归：锁表被持锁 panic 毒化后，lock_for 不得 panic（expect 版会把
+    /// team 收件通道永久打死）。本测试把全局锁表毒化留在进程内：其余触及该表的路径必须全部
+    /// 走 shared::lock（drop_session_locks 与上方回收测试同口径），否则并发下会被本测试拖挂。
+    #[test]
+    fn poisoned_locks_map_still_usable() {
+        let locks = INBOX_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::core::shared::lock(locks);
+            panic!("poison inbox locks map");
+        }));
+        assert!(locks.is_poisoned(), "前置：锁表必须已毒化");
+        let lock = lock_for(Path::new("/tmp/kxen-inbox-poison-test.json"));
+        let _guard = crate::core::shared::lock(&lock);
     }
 }

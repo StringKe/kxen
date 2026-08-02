@@ -37,16 +37,33 @@ impl UsageAcc {
     }
 }
 
+/// 锁内记账临界区（并发回归测试的直接打击点）：锁内重读拿到最新计数再入账落盘；
+/// save 失败 warn（旧实现 let _ = 静默吞掉，预算失真无迹可寻）。
+/// goal 非 Active（pause/cancel 与在飞 run 竞态）：不入账直接返回当前 goal，
+/// 由 record_goal_turn 落终态停 run——丢账以本轮增量为界（P2-1）。
+fn charge_goal(dir: &std::path::Path, goal_id: &str, tokens: u64, blocked_reason: Option<&str>) -> Option<crate::core::goal::Goal> {
+    let lock = crate::core::goal::write_lock(goal_id);
+    let _guard = crate::core::shared::lock(&lock);
+    let mut goal = crate::core::goal::Goal::load(dir, goal_id).ok()?;
+    if goal.status != crate::core::goal::GoalStatus::Active {
+        return Some(goal);
+    }
+    goal.record_turn(tokens, blocked_reason, false).ok()?;
+    if let Err(e) = goal.save(dir) {
+        tracing::warn!(target: "goal", "goal {goal_id} 记账落盘失败：{e}");
+    }
+    Some(goal)
+}
+
 /// goal 记账：按 goal_delta 增量入账（累计值重复记会虚耗预算）。
 /// 返回终态消息（BudgetLimited/Blocked）时调用方必须落终态文本并停。
 pub(super) fn record_goal_turn(ctx: &mut AgentContext, acc: &mut UsageAcc, blocked_reason: Option<String>) -> Option<String> {
     // session 粒度：只推进本会话 goal，多会话并发不误伤
-    let mut goal = crate::core::goal::Goal::focus_for(&crate::core::paths::goals_dir(), ctx.session_id.as_deref())?;
+    let dir = crate::core::paths::goals_dir();
+    // 锁外 focus 定位、锁内重读入账：并发会话的 load-modify-save 由 per-id 锁串行化
+    let goal_id = crate::core::goal::Goal::focus_for(&dir, ctx.session_id.as_deref())?.id;
     let tokens = acc.goal_delta();
-    if goal.record_turn(tokens, blocked_reason.as_deref(), false).is_err() {
-        return None;
-    }
-    let _ = goal.save(&crate::core::paths::goals_dir());
+    let goal = charge_goal(&dir, &goal_id, tokens, blocked_reason.as_deref())?;
     match goal.status {
         crate::core::goal::GoalStatus::BudgetLimited => {
             if let Some(bus) = &ctx.bus {
@@ -61,6 +78,10 @@ pub(super) fn record_goal_turn(ctx: &mut AgentContext, acc: &mut UsageAcc, block
             let reason = goal.block_reason.clone().unwrap_or_default();
             Some(format!("goal 连续阻塞已标记 Blocked：{reason}"))
         }
+        // 暂停/取消的在飞 run 停出（P2-1）：goal_tool 暂停走本路径在轮末停出；
+        // RPC 暂停/取消另由 goal_rpc 直接 cancel run 令牌即时停
+        crate::core::goal::GoalStatus::Paused => Some("goal 已暂停（Paused），停止执行——resume 后发送「继续」接着做".to_string()),
+        crate::core::goal::GoalStatus::Canceled => Some("goal 已取消（Canceled），停止执行".to_string()),
         _ => None,
     }
 }
@@ -88,8 +109,14 @@ impl GoalWallCache {
 }
 
 /// session 焦点 goal 的 wall 预算是否已超（P2-07 轮内检查点；仅 Active 才计费）。
+/// Paused 同样判停（P2-1）：暂停不烧 wall 预算，但在飞 run 必须停出，终态文本由
+/// wall_stop 分支的 record_goal_turn 给出（「goal 已暂停」），不是预算耗尽。
 pub(super) fn goal_wall_over(ctx: &AgentContext, cache: &mut GoalWallCache) -> bool {
-    cache.goal(ctx.session_id.as_deref()).is_some_and(|g| g.status == crate::core::goal::GoalStatus::Active && g.wall_exceeded())
+    cache.goal(ctx.session_id.as_deref()).is_some_and(|g| match g.status {
+        crate::core::goal::GoalStatus::Active => g.wall_exceeded(),
+        crate::core::goal::GoalStatus::Paused => true,
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -119,6 +146,90 @@ mod tests {
         g.activate().expect("activate");
         g.session_id = Some("wall-sess".into());
         g
+    }
+
+    /// P1-1 并发记账回归：多线程并发推进同一 goal，turns/tokens 必须全计
+    /// （无锁 load-modify-save 会互相覆盖丢更新）。独立目录：不走全局 goals_dir_isolation，
+    /// 避免与 wall cache 测试的清目录动作互相踩踏。
+    #[test]
+    fn concurrent_charge_never_loses_updates() {
+        let dir = std::env::temp_dir().join(format!("kxen-conc-goal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let id = "conc-goal";
+        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        let mut g = Goal::create(
+            GoalContract { objective: "o".into(), completion_criteria: "c".into(), constraints: None, budget: Default::default() },
+            id.into(),
+        )
+        .expect("create");
+        g.activate().expect("activate");
+        g.save(&dir).expect("save");
+
+        const THREADS: usize = 8;
+        const ROUNDS: u64 = 25;
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let dir = dir.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    charge_goal(&dir, id, 10, None);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        let saved = Goal::load(&dir, id).expect("load");
+        assert_eq!(saved.turns_used, (THREADS as u64 * ROUNDS) as u32, "并发记账不得丢更新");
+        assert_eq!(saved.tokens_used, THREADS as u64 * ROUNDS * 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-2 并发回归：charge 与 goal RPC/工具写路径（load-modify-save 走同一 per-id write_lock）
+    /// 并发不互相覆盖——两边串行化后总账必须精确（无共享锁时两半各丢一半更新）。
+    #[test]
+    fn concurrent_charge_and_locked_write_never_loses_updates() {
+        let dir = std::env::temp_dir().join(format!("kxen-conc-goal-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let id = "conc-goal-lock";
+        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        let mut g = Goal::create(
+            GoalContract { objective: "o".into(), completion_criteria: "c".into(), constraints: None, budget: Default::default() },
+            id.into(),
+        )
+        .expect("create");
+        g.activate().expect("activate");
+        g.save(&dir).expect("save");
+
+        const THREADS: usize = 8;
+        const ROUNDS: u64 = 25;
+        let mut handles = Vec::new();
+        for half in 0..2 {
+            for _ in 0..THREADS / 2 {
+                let dir = dir.clone();
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        if half == 0 {
+                            charge_goal(&dir, id, 10, None);
+                        } else {
+                            // 与 goal_rpc::transit / goal_tool 写分支同形态：锁内 load-modify-save
+                            let lock = crate::core::goal::write_lock(id);
+                            let _guard = crate::core::shared::lock(&lock);
+                            let mut goal = Goal::load(&dir, id).expect("load");
+                            goal.record_turn(10, None, false).expect("record");
+                            goal.save(&dir).expect("save");
+                        }
+                    }
+                }));
+            }
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        let saved = Goal::load(&dir, id).expect("load");
+        assert_eq!(saved.turns_used, (THREADS as u64 * ROUNDS) as u32, "两路并发写不得丢更新");
+        assert_eq!(saved.tokens_used, THREADS as u64 * ROUNDS * 10);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

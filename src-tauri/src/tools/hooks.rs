@@ -12,6 +12,9 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct HookRunner {
     hooks: std::sync::RwLock<HashMap<String, Vec<CompiledHook>>>,
+    /// workspace 工作目录：hook 的 spawn current_dir 与 safety 评估 cwd 必须同口径，
+    /// 否则相对路径 hook 在 "/" 下执行且按 "/" 判定（与 exec 的 cwd 语义一致）。
+    workdir: std::path::PathBuf,
 }
 
 #[derive(Clone)]
@@ -21,8 +24,8 @@ struct CompiledHook {
 }
 
 impl HookRunner {
-    pub fn from_config(config: &Config) -> Self {
-        Self { hooks: std::sync::RwLock::new(compile_hooks(config)) }
+    pub fn from_config(config: &Config, workdir: &std::path::Path) -> Self {
+        Self { hooks: std::sync::RwLock::new(compile_hooks(config)), workdir: workdir.to_path_buf() }
     }
 
     /// 热重载（workspace 切换时按信任门换入/换出项目 hooks，无需重建 AppState）。
@@ -103,7 +106,8 @@ impl HookRunner {
         payload: &Value,
         approval: Option<&crate::tools::exec::ApprovalCtx<'_>>,
     ) -> Result<(), String> {
-        match evaluate_shell_command(&hook.command, "/") {
+        let cwd = self.workdir.to_string_lossy().into_owned();
+        match evaluate_shell_command(&hook.command, &cwd) {
             Verdict::Deny { rule_id, reason, .. } => {
                 return Err(format!("hook blocked by safety rule {rule_id}: {reason}"));
             }
@@ -128,6 +132,7 @@ impl HookRunner {
             tokio::process::Command::new("/bin/zsh")
                 .arg("-c")
                 .arg(&hook.command)
+                .current_dir(&self.workdir)
                 .env("KXEN_EVENT", event)
                 .env("KXEN_TOOL", tool)
                 .env("KXEN_PAYLOAD", &payload_str)
@@ -171,8 +176,30 @@ mod tests {
     use serde_json::json;
 
     fn runner(toml_str: &str) -> HookRunner {
+        runner_in(toml_str, std::path::Path::new("/"))
+    }
+
+    fn runner_in(toml_str: &str, workdir: &std::path::Path) -> HookRunner {
         let config: Config = toml::from_str(toml_str).unwrap();
-        HookRunner::from_config(&config)
+        HookRunner::from_config(&config, workdir)
+    }
+
+    #[tokio::test]
+    async fn hook_runs_in_workspace_dir() {
+        // 含相对路径的 hook 必须在项目目录执行（旧实现 cwd="/" 时 test -f 必败、产物落到 /）
+        let dir = std::env::temp_dir().join(format!("kxen-hook-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "x").unwrap();
+        let r = runner_in(
+            r#"
+[[hooks.pre_tool_use]]
+command = "test -f marker.txt && touch hook_ran.txt"
+"#,
+            &dir,
+        );
+        assert!(r.run_pre("exec", &json!({})).await.is_ok());
+        assert!(dir.join("hook_ran.txt").exists(), "hook 产物必须落在 workspace 目录");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

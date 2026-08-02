@@ -1,11 +1,19 @@
 import { createEffect, createSignal, For, Show, onCleanup, onMount } from "solid-js";
 import { ChevronRight } from "lucide-solid";
 import { onTopic } from "../lib/chat";
+import { client } from "../lib/client";
 import { agentsTranscript, type TranscriptEntry } from "../lib/team";
 import { statusDot } from "../lib/variants";
 import { kindBadge, statusText, statusTone } from "../lib/agent-display";
 import { formatError } from "../lib/error-text";
-import { activeAgentFocus, activeSessionId, agents, setActiveAgentFocus } from "../lib/state";
+import {
+  activeAgentFocus,
+  activeSessionId,
+  agents,
+  agentsLoadFailed,
+  refreshAgents,
+  setActiveAgentFocus,
+} from "../lib/state";
 import { AgentRunActionButtons, useAgentRunActions } from "./agent-run";
 import Dock from "./Dock";
 
@@ -15,6 +23,18 @@ export default function RightColumn() {
   const { stopping, stopAgent, dismissAgent } = useAgentRunActions();
   return (
     <div class="w-full h-full flex flex-col bg-[var(--bg-raised)]">
+      {/* 名单加载失败与真空区分：失败给重试条（3s 轮询仍在跑，成功自动复位） */}
+      <Show when={agents().length === 0 && agentsLoadFailed()}>
+        <div class="shrink-0 border-b border-[var(--border)] px-3 py-2 flex items-center gap-2">
+          <span class="text-2xs text-[var(--err)]">加载 agent 名单失败</span>
+          <button
+            class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-2xs text-[var(--text-dim)]"
+            onClick={() => void refreshAgents()}
+          >
+            重试
+          </button>
+        </div>
+      </Show>
       {/* 子代理窗格区 */}
       <Show when={agents().length > 0}>
         <div class="shrink-0 border-b border-[var(--border)]" style={{ "max-height": "45%" }}>
@@ -65,14 +85,19 @@ function AgentPane(props: {
   let off: (() => void) | undefined;
   let current: string | undefined;
 
-  onMount(async () => {
+  const loadPreview = async () => {
     const t = await agentsTranscript(activeSessionId(), props.name).catch(
       () => [] as TranscriptEntry[],
     );
     const last = [...t].reverse().find((e) => previewEntry(e));
     const entry = last && previewEntry(last);
     if (entry) setPreview({ text: entry.text.slice(-120), kind: entry.kind });
-  });
+  };
+
+  onMount(() => void loadPreview());
+
+  // resync（bus lag / 断线重连）：preview 增量可能有缺口，重拉转录对账（与其它面板一致）
+  const offResync = client.onResync(() => void loadPreview());
 
   // 订阅自带 session topic：stream ACL 只把带 session_id 的帧发给 session:<id> 订阅者，
   // 裸订 llm.delta 是靠 Session 常驻订阅隐式放行（Session 一变这里静默断流）。切换会话退旧订新。
@@ -96,7 +121,10 @@ function AgentPane(props: {
       if (entry) setPreview({ text: entry.text.slice(-120), kind: entry.kind });
     });
   });
-  onCleanup(() => off?.());
+  onCleanup(() => {
+    off?.();
+    offResync();
+  });
 
   return (
     <div class="group relative border-b border-[var(--border)]/50">

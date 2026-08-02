@@ -29,16 +29,16 @@ const hasHeadings = headings.length > 0;
   hasHeadings && (
     <nav
       data-nb-mobile-toc
-      aria-label="On this page"
+      aria-label="本页目录"
       class={cn("relative", className)}
       {...attrs}
     >
       <select
         data-nb-mobile-toc-select
-        aria-label="Jump to section"
+        aria-label="跳转到章节"
         class="w-full appearance-none rounded-md border border-border bg-background py-2.5 pl-3 pr-9 text-sm font-medium text-foreground transition-colors hover:border-foreground/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
       >
-        <option value="_top">Overview</option>
+        <option value="_top">概览</option>
         {headings.map((heading) => (
           <option value={heading.slug}>
             {`${" ".repeat(Math.max(0, heading.depth - 2))}${heading.text}`}

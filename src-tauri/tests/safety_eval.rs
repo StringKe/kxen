@@ -94,6 +94,31 @@ fn f5_bypass() {
 }
 
 #[test]
+fn env_assignment_prefix_does_not_bypass() {
+    // 前导 VAR=value 赋值不是命令本身：跳过赋值后的真命令照样进删除判定
+    assert!(denied("X=1 rm -rf ~"));
+    assert!(denied("A=1 B=2 rm -rf /private/etc"));
+    assert!(denied("sudo X=1 rm -rf /usr"));
+    assert!(allowed("X=1 ls -la"));
+}
+
+#[test]
+fn nested_substitutions_are_evaluated() {
+    // 平衡括号：嵌套 $() 的内层命令同样进评估（非嵌套正则只捕到残缺外层）
+    assert!(denied("echo $(cat $(rm -rf /private/etc))"));
+    assert!(denied("echo $(ls $(rm -rf ~))"));
+    assert!(allowed("echo $(ls $(pwd))"));
+}
+
+#[test]
+fn f2_credential_list_matches_path_policy() {
+    // 与 path_policy::sensitive_reason 同一清单：任一漏项都是删除凭证的绕过通道
+    for dot in [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".codex", ".claude", ".grok", ".kimi-code"] {
+        assert!(denied(&format!("rm -rf ~/{dot}")), "~/{dot} 应被拒绝");
+    }
+}
+
+#[test]
 fn trash_recoverable() {
     assert!(matches!(evaluate_shell_command("trash ./dist", CWD), Verdict::Recoverable));
     assert!(denied("trash .git"));

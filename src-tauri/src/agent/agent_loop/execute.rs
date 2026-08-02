@@ -325,6 +325,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 return Err("workflow unavailable: mrm not configured".into());
             };
             let run_id = args.get("run_id").and_then(Value::as_str);
+            // run_id 是模型参数，不能直通 journal：run_tool 内按 session 派生命名空间（open_scoped）
             Box::pin(crate::agent::workflow::run_tool(script, deps, ctx, run_id)).await
         }
         other if other.starts_with("mcp__") => {

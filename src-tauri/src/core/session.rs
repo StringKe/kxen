@@ -118,6 +118,12 @@ fn compaction_path(dir: &Path, id: &str) -> PathBuf {
 
 pub fn create(dir: &Path, directory: &str) -> std::io::Result<Session> {
     std::fs::create_dir_all(dir)?;
+    // 会话含对话全文：目录 0700 仅属主可进（与 auth.json 0600、shadow repo 0700 同一加固口径）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let now = now_ms();
     let session = Session {
         id: crate::core::ids::new_id("ses"),

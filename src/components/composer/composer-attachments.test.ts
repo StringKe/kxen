@@ -8,12 +8,17 @@ const rpcMock = vi.hoisted(() => ({
   impl: (_method: string, _params?: unknown) =>
     Promise.reject(new Error("unexpected call")) as Promise<unknown>,
 }));
+const stateMock = vi.hoisted(() => ({
+  ensure: vi.fn(async () => "s1"),
+  flashErr: vi.fn(),
+}));
 vi.mock("../../lib/client", () => ({
   client: { rpc: (method: string, params?: unknown) => rpcMock.impl(method, params) },
 }));
 vi.mock("../../lib/state", () => ({
-  ensureActiveSession: () => Promise.resolve("s1"),
+  ensureActiveSession: stateMock.ensure,
 }));
+vi.mock("../../lib/flash", () => ({ flashErr: stateMock.flashErr }));
 vi.mock("./image-scale", () => ({
   fileToImageDataUrl: vi.fn(),
 }));
@@ -27,7 +32,21 @@ function harness() {
 
 afterEach(() => {
   rpcMock.impl = () => Promise.reject(new Error("unexpected call"));
+  stateMock.ensure.mockReset().mockResolvedValue("s1");
+  stateMock.flashErr.mockClear();
   vi.mocked(fileToImageDataUrl).mockReset();
+});
+
+describe("attachPaths 会话创建失败", () => {
+  it("ensureActiveSession 失败：flashErr 上屏，不出 chip、不浮 unhandled rejection", async () => {
+    stateMock.ensure.mockRejectedValueOnce(new Error("create boom"));
+    const { chips, attachPaths } = harness();
+    await attachPaths(["/w/a.txt"]);
+    expect(stateMock.flashErr).toHaveBeenCalledTimes(1);
+    expect(String(stateMock.flashErr.mock.calls[0]?.[0])).toContain("添加附件失败");
+    expect(String(stateMock.flashErr.mock.calls[0]?.[0])).toContain("create boom");
+    expect(chips.length).toBe(0);
+  });
 });
 
 describe("attachPaths 失败 err chip", () => {

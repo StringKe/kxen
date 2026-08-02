@@ -73,6 +73,40 @@ describe("ScheduleSection 展示", () => {
   });
 });
 
+describe("ScheduleSection 删除确认", () => {
+  it("删除先出行内确认条：未确认不发 RPC，确认后失败 flashErr", async () => {
+    h.list.mockResolvedValue([JOB({})]);
+    h.remove.mockRejectedValue(new Error("job busy"));
+    const dispose = render(() => <ScheduleSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("删除"));
+    btnByText("删除").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("确认删除定时任务"));
+    expect(h.remove).not.toHaveBeenCalled(); // 未确认不发 RPC
+
+    btnByText("确认删除").click();
+    await vi.waitFor(() => {
+      const err = flash.msgs().find((m) => m.kind === "err");
+      expect(err?.text).toContain("删除失败");
+      expect(err?.text).toContain("job busy");
+    });
+    expect(h.remove).toHaveBeenCalledWith("j1");
+    expect(document.body.textContent).not.toContain("确认删除定时任务"); // 确认后条收起
+    dispose();
+  });
+
+  it("取消确认条不发 RPC 且收起", async () => {
+    h.list.mockResolvedValue([JOB({})]);
+    const dispose = render(() => <ScheduleSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("删除"));
+    btnByText("删除").click();
+    await vi.waitFor(() => expect(document.body.textContent).toContain("确认删除定时任务"));
+    btnByText("取消").click();
+    await vi.waitFor(() => expect(document.body.textContent).not.toContain("确认删除定时任务"));
+    expect(h.remove).not.toHaveBeenCalled();
+    dispose();
+  });
+});
+
 describe("ScheduleSection 操作失败", () => {
   it("toggle 失败 flashErr，不刷新伪装成功", async () => {
     h.list.mockResolvedValue([JOB({})]);
@@ -86,20 +120,6 @@ describe("ScheduleSection 操作失败", () => {
       expect(err?.text).toContain("store locked");
     });
     expect(h.list).toHaveBeenCalledTimes(1); // 失败不触发 reload
-    dispose();
-  });
-
-  it("remove 失败 flashErr", async () => {
-    h.list.mockResolvedValue([JOB({})]);
-    h.remove.mockRejectedValue(new Error("job busy"));
-    const dispose = render(() => <ScheduleSection />, document.body);
-    await vi.waitFor(() => expect(document.body.textContent).toContain("删除"));
-    btnByText("删除").click();
-    await vi.waitFor(() => {
-      const err = flash.msgs().find((m) => m.kind === "err");
-      expect(err?.text).toContain("删除失败");
-      expect(err?.text).toContain("job busy");
-    });
     dispose();
   });
 });

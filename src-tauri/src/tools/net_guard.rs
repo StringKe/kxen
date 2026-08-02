@@ -8,10 +8,16 @@ use std::net::IpAddr;
 const MAX_REDIRECT_HOPS: u32 = 5;
 
 /// 单个 IP 是否命中拒绝段。
-/// v4：loopback / RFC1918 / link-local（169.254.0.0/16，含云 metadata）/ 0.0.0.0
+/// v4：loopback / RFC1918 / CGNAT（100.64.0.0/10，运营商内网与 Tailscale 网段）/ link-local（169.254.0.0/16，含云 metadata）/ 0.0.0.0
 /// v6：::1 / fc00::/7（ULA）/ fe80::/10（link-local）/ ::
 pub fn is_blocked_ip(ip: &IpAddr) -> bool {
     is_blocked_ip_with(ip, false)
+}
+
+/// 100.64.0.0/10（CGNAT，RFC6598）：is_private 不覆盖，须单列。
+fn is_cgnat(v4: &std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    o[0] == 100 && (64..=127).contains(&o[1])
 }
 
 /// allow_loopback=true 只放行 loopback（127/8、::1 及其 v4-mapped），RFC1918/link-local 等仍拒。
@@ -23,7 +29,7 @@ fn is_blocked_ip_with(ip: &IpAddr, allow_loopback: bool) -> bool {
             if allow_loopback && v4.is_loopback() {
                 return false;
             }
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+            v4.is_loopback() || v4.is_private() || is_cgnat(v4) || v4.is_link_local() || v4.is_unspecified()
         }
         IpAddr::V6(v6) => {
             if allow_loopback && v6.is_loopback() {
@@ -120,12 +126,26 @@ mod tests {
             v4(192, 168, 0, 1),
             v4(169, 254, 169, 254), // 云 metadata
             v4(0, 0, 0, 0),
+            v4(100, 64, 0, 1),      // CGNAT 100.64.0.0/10 下界
+            v4(100, 127, 255, 254), // CGNAT 上界
+            v4(100, 100, 100, 100), // CGNAT 中段（Tailscale 网段）
         ] {
             assert!(is_blocked_ip(&ip), "{ip} 应被拒绝");
         }
-        for ip in [v4(8, 8, 8, 8), v4(172, 15, 0, 1), v4(172, 32, 0, 1), v4(1, 1, 1, 1)] {
+        for ip in [v4(8, 8, 8, 8), v4(172, 15, 0, 1), v4(172, 32, 0, 1), v4(1, 1, 1, 1), v4(100, 63, 255, 1), v4(100, 128, 0, 1)] {
             assert!(!is_blocked_ip(&ip), "{ip} 应放行");
         }
+    }
+
+    #[test]
+    fn blocks_cgnat_v6_mapped() {
+        // v4-mapped CGNAT 回 v4 重判，不得绕过
+        assert!(is_blocked_ip(&"::ffff:100.64.0.1".parse().unwrap()));
+        assert!(!is_blocked_ip(&"::ffff:100.128.0.1".parse().unwrap()));
+        // allow_loopback 例外只放行 loopback，CGNAT 仍拒
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let err = rt.block_on(check_url_allow_loopback("http://100.64.0.1:8080/")).unwrap_err();
+        assert!(err.contains("blocked"), "{err}");
     }
 
     #[test]

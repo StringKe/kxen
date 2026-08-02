@@ -114,7 +114,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
       initialized = true;
       return true;
     } catch {
-      emptyState.textContent = "Search is available after a production build.";
+      emptyState.textContent = "搜索在生产构建后可用。";
       return false;
     }
   }
@@ -125,7 +125,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
     const signal = activeController.signal;
 
     emptyState.style.display = "";
-    emptyState.textContent = "Searching…";
+    emptyState.textContent = "搜索中…";
     clearResults();
 
     if (!(await ensureInitialized()) || signal.aborted) return;
@@ -139,7 +139,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
 
       if (results.length === 0) {
         emptyState.style.display = "";
-        emptyState.textContent = "No results found.";
+        emptyState.textContent = "未找到结果。";
         return;
       }
 
@@ -150,7 +150,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
       if (signal.aborted) return;
       clearResults();
       emptyState.style.display = "";
-      emptyState.textContent = "Search is temporarily unavailable.";
+      emptyState.textContent = "搜索暂时不可用。";
     }
   }
 
@@ -162,7 +162,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
         activeController?.abort();
         clearResults();
         emptyState.style.display = "";
-        emptyState.textContent = "Type to search…";
+        emptyState.textContent = "输入关键词以搜索…";
         return;
       }
       void runSearch(query);
@@ -201,7 +201,7 @@ export function initSearch(config: SearchConfig): SearchInstance {
       activeIndex = -1;
       clearResults();
       emptyState.style.display = "";
-      emptyState.textContent = "Type to search…";
+      emptyState.textContent = "输入关键词以搜索…";
       await ensureInitialized();
     },
     destroy() {

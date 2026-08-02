@@ -44,7 +44,7 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
             let task_id = kxen_app::tools::dev_server::restart_task(id, &state.registry).await.map_err(|e| e.to_string())?;
             Ok(json!({ "task_id": task_id }))
         }
-        m if m.starts_with("goal.") => crate::goal_rpc::call(m, params, &app.state::<Arc<AppState>>().bus),
+        m if m.starts_with("goal.") => crate::goal_rpc::call(m, params, &app.state::<Arc<AppState>>()),
         "workspace.list" => Ok(json!(kxen_app::core::workspace::list(&kxen_app::core::paths::data_dir()))),
         "session.list" => {
             // 全量返回（侧栏树按 workspace 分组，过滤在前端）；附运行中标记
@@ -175,15 +175,16 @@ pub(super) async fn rpc_call(method: &str, params: Value, app: &AppHandle) -> Re
                     state.bus.publish(kxen_app::core::event::Event::notify(format!("运行中，消息已排队（第 {n} 条）"), Some(p.session_id)));
                     return Ok(json!({ "queued": true }));
                 }
-                if let Some(token) = kxen_app::core::shared::lock(&state.active_runs).get(&p.session_id).cloned() {
+                // interrupt：摘除旧 entry 再 cancel——新 run 入口的原子占位要抢到槽（旧 entry 在场会被判
+                // 落败退回队列）；旧 run 收尾的摘除按代际匹配，不会误删新 run 的 token（P1-3）
+                if let Some(token) = kxen_app::core::shared::lock(&state.active_runs).remove(&p.session_id) {
                     token.cancel();
                 }
             }
-            // 分配 run 流 id（JSON-RPC 3.0：增量走 stream chunk 下发）
+            // stream_id 仅作增量帧身份注入 llm.delta 双写通道（独立 run 流通道已删，前端按 topic 消费）
             let stream_id = super::protocol::stream_id("run");
-            kxen_app::core::shared::lock(&state.run_streams).insert(stream_id.clone(), p.session_id.clone());
-            tokio::spawn(run_llm(stream_id.clone(), p.session_id, p.text, p.context, p.images, None, app.clone()));
-            Ok(json!({ "stream_id": stream_id }))
+            tokio::spawn(run_llm(stream_id, p.session_id, p.text, p.context, p.images, None, app.clone()));
+            Ok(json!({}))
         }
         "session.abort" => {
             let id = params.get("session_id").and_then(Value::as_str).ok_or("missing session_id")?;

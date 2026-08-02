@@ -132,12 +132,20 @@ fn write_auth_file_unlocked(path: &Path, store: &AuthStore) -> crate::core::Resu
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(store)?)?;
+    let text = serde_json::to_string_pretty(store)?;
     #[cfg(unix)]
     {
+        // 带 0600 创建：先 write 再 chmod 的旧写法留了一个 0644 可读窗口
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        // 兼容存量：tmp 可能由上轮 0644 创建，OpenOptions 的 mode 只作用于新建
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
