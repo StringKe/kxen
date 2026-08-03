@@ -20,7 +20,12 @@ vi.mock("./session-model", () => ({
   applyDraftModel: vi.fn(() => Promise.resolve()),
   resetDraftModel: vi.fn(),
 }));
-vi.mock("./drafts", () => ({ migrateNewDraft: vi.fn() }));
+// state.ts 的草稿善后链（clearDraft/composer-restore 的 draftKey）也走本模块：
+// 部分 mock 会让传递依赖取不到绑定，铺开真实实现只桩迁移副作用
+vi.mock("./drafts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./drafts")>()),
+  migrateNewDraft: vi.fn(),
+}));
 
 import { mountShortcuts } from "./shortcuts";
 import { flash } from "./flash";

@@ -8,6 +8,9 @@ import { formatError } from "../lib/error-text";
 import { createAction, createSeqGuard } from "../lib/async-guard";
 import { activeSessionId, agents, setActiveAgentFocus } from "../lib/state";
 
+const pendingDrafts = new Map<string, string>();
+const draftKey = (sid: string, name: string) => `${sid}\0${name}`;
+
 /** 选中 agent 时的 PrimaryContent：状态头 + 全量转录 +（teammate 可对话输入）。
  *  转录是主内容，独占主区呈现，不塞进右栏窄栏。 */
 export default function AgentFocusView(props: { name: string }) {
@@ -20,34 +23,62 @@ export default function AgentFocusView(props: { name: string }) {
   const sendAction = createAction();
   // 转录加载竞态守卫：慢响应晚于切换/重试落地即丢弃，旧 agent 的数据不得覆盖新窗格
   const guard = createSeqGuard();
+  let activeLoad = 0;
+  let dirtyLoad = 0;
   let off: (() => void) | undefined;
   let current: string | undefined;
+  let currentDraftKey = "";
   let listRef: HTMLDivElement | undefined;
 
   const activity = () => agents().find((a) => a.name === props.name);
   const scroll = () => queueMicrotask(() => listRef && (listRef.scrollTop = listRef.scrollHeight));
 
-  createEffect(() => {
-    const name = props.name;
-    const sid = activeSessionId();
-    retryTick(); // 「点击重试」的触发点：tick 变化重跑本 effect
-    // 切换即清空：旧 agent 的转录不得在新窗格残留到加载完成
-    setEntries([]);
-    setLoadFailed(false);
-    setLoading(true);
+  const loadTranscript = (sid: string, name: string, reset: boolean) => {
+    if (reset) {
+      // 切换即清空：旧 agent 的转录不得在新窗格残留到加载完成
+      setEntries([]);
+      setLoadFailed(false);
+      setLoading(true);
+    }
     const id = guard.next();
-    agentsTranscript(sid, name)
-      .then((t) => {
+    activeLoad = id;
+    dirtyLoad = 0;
+    void agentsTranscript(sid, name)
+      .then((transcript) => {
         if (!guard.isCurrent(id)) return;
-        setEntries(mergeDeltas(t));
+        activeLoad = 0;
+        if (dirtyLoad === id) {
+          // 在飞 snapshot 期间收到 live 帧：保留即时内容，再拉一次能包含完整历史的快照。
+          loadTranscript(sid, name, false);
+          return;
+        }
+        setEntries(mergeDeltas(transcript));
+        setLoadFailed(false);
         setLoading(false);
         scroll();
       })
       .catch(() => {
         if (!guard.isCurrent(id)) return;
+        activeLoad = 0;
+        if (dirtyLoad === id) {
+          loadTranscript(sid, name, false);
+          return;
+        }
         setLoadFailed(true);
         setLoading(false);
       });
+  };
+
+  createEffect(() => {
+    const name = props.name;
+    const sid = activeSessionId();
+    const nextDraftKey = draftKey(sid, name);
+    if (nextDraftKey !== currentDraftKey) {
+      currentDraftKey = nextDraftKey;
+      setDraft(pendingDrafts.get(nextDraftKey) ?? "");
+    }
+    retryTick(); // 「点击重试」的触发点：tick 变化重跑本 effect
+    loadTranscript(sid, name, true);
   });
 
   // 订阅自带 session topic：后端 stream ACL 只把带 session_id 的帧发给 session:<id> 订阅者，
@@ -61,8 +92,8 @@ export default function AgentFocusView(props: { name: string }) {
     off = onTopic(sid ? ["llm.delta", `session:${sid}`] : ["llm.delta"], (_topic, payload) => {
       const p = payload as TranscriptEntry & { agent?: string; session_id?: string };
       if (p.agent !== props.name || p.session_id !== activeSessionId()) return;
-      // live 帧比先前发起的 snapshot 新，先让旧 snapshot 失效，避免稍后倒灌覆盖。
-      guard.next();
+      // 不丢在飞 snapshot：标记它结束后再拉一次完整历史，期间 live 帧保持即时可见。
+      if (activeLoad) dirtyLoad = activeLoad;
       setLoadFailed(false);
       setLoading(false);
       setEntries((prev) => {
@@ -77,16 +108,7 @@ export default function AgentFocusView(props: { name: string }) {
   });
   // resync（bus lag / 断线重连）：增量订阅可能有缺口，重拉转录对账（不闪 loading/不动失败标记）
   const offResync = client.onResync(() => {
-    const id = guard.next();
-    agentsTranscript(activeSessionId(), props.name)
-      .then((t) => {
-        if (!guard.isCurrent(id)) return;
-        setEntries(mergeDeltas(t));
-        setLoadFailed(false);
-      })
-      .catch(() => {
-        if (guard.isCurrent(id)) setLoadFailed(true);
-      }); // 失败保留现有转录，但必须显式标记 stale
+    loadTranscript(activeSessionId(), props.name, false);
   });
   onCleanup(() => {
     off?.();
@@ -96,14 +118,23 @@ export default function AgentFocusView(props: { name: string }) {
   const send = () => {
     const text = draft().trim();
     if (!text) return;
+    const sid = activeSessionId();
+    const name = props.name;
+    const owner = draftKey(sid, name);
+    pendingDrafts.delete(owner);
     setDraft("");
-    void sendAction.run(() => teamMessage(activeSessionId(), props.name, text), {
-      errPrefix: `发送给 ${props.name} 失败`,
+    void sendAction.run(() => teamMessage(sid, name, text), {
+      errPrefix: `发送给 ${name} 失败`,
       // 失败恢复草稿：pending 期间输入框禁用，恢复不会覆盖用户新输入
-      onErr: () => setDraft(text),
+      onErr: () => {
+        pendingDrafts.set(owner, text);
+        if (activeSessionId() === sid && props.name === name) setDraft(text);
+      },
       onOk: () => {
+        if (activeSessionId() !== sid || props.name !== name) return;
         // 本地即时 echo：后端 send() 只落转录不发事件，live 视图靠这条；
         // kind=user 隔开流式 text delta（否则回复首帧会被合并规则拼进 echo 行）
+        if (activeLoad) dirtyLoad = activeLoad;
         setEntries((prev) => [...prev.slice(-199), { kind: "user", text: `[user] ${text}` }]);
         scroll();
       },
@@ -185,7 +216,11 @@ export default function AgentFocusView(props: { name: string }) {
             placeholder={`对 ${props.name} 说话…`}
             value={draft()}
             disabled={sendAction.pending()}
-            onInput={(e) => setDraft(e.currentTarget.value)}
+            onInput={(e) => {
+              const value = e.currentTarget.value;
+              pendingDrafts.set(draftKey(activeSessionId(), props.name), value);
+              setDraft(value);
+            }}
             onKeyDown={(e) => {
               if (e.key === "Enter") send();
             }}

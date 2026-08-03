@@ -2,6 +2,7 @@ import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ModelIdentity, PendingApproval, RunStats, StoredMessage } from "../lib/chat";
 import type { ToolEvent } from "../lib/delta";
+import { RpcError } from "../lib/client-types";
 import { clickButton, flush, mountStreamingSession, sleep } from "./Session.test-components";
 
 const h = vi.hoisted(() => ({
@@ -77,6 +78,7 @@ vi.mock("../lib/client", async (importOriginal) => {
 vi.mock("../components/composer/TextComposer", async () => ({
   default: (await import("./Session.test-components")).ComposerMock,
 }));
+vi.mock("../components/StorageRecoveryPanel", () => ({ default: () => null }));
 
 vi.mock("../components/UserItem", async () => ({
   default: (await import("./Session.test-components")).UserItemMock,
@@ -89,7 +91,6 @@ import Session from "./Session";
 import { flash } from "../lib/flash";
 import { setActiveSessionId } from "../lib/state";
 
-/** 进入 streaming：活跃会话 s1 就绪后点发送（sendMessage 默认 queued:false 首发成功）。 */
 const mountStreaming = () => mountStreamingSession(Session, setActiveSessionId);
 
 afterEach(() => {
@@ -106,7 +107,6 @@ afterEach(() => {
   h.sendMessage.mockImplementation(async () => ({ queued: false }));
   for (const message of flash.msgs()) flash.dismiss(message.id);
 });
-
 describe("Session 时间线加载", () => {
   it("approval.pending 快照恢复为等待审批卡", async () => {
     h.approvalPending.mockImplementation(async () => [
@@ -141,7 +141,6 @@ describe("Session 时间线加载", () => {
     dispose();
   });
 });
-
 describe("Session 流式与对账", () => {
   it("statusline 尚未返回时已同步注册 delta 订阅", () => {
     h.statusline.mockImplementationOnce(() => new Promise(() => {}));
@@ -331,7 +330,7 @@ describe("Session 发送链路", () => {
   });
 
   it("发送失败挂失败态，点击重发撤下原气泡走完整发送链", async () => {
-    h.sendMessage.mockRejectedValueOnce(new Error("boom"));
+    h.sendMessage.mockRejectedValueOnce(new RpcError("boom", -32000));
     setActiveSessionId("s1");
     const dispose = render(() => <Session />, document.body);
     await flush();

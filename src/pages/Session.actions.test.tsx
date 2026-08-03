@@ -78,12 +78,13 @@ vi.mock("../lib/state", async (importOriginal) => {
 });
 
 vi.mock("../components/composer/TextComposer", () => ({ default: () => null }));
+vi.mock("../components/StorageRecoveryPanel", () => ({ default: () => null }));
 
 vi.mock("../components/UserItem", () => ({
   default: (props: {
     item: MsgItem;
     onFork: () => void;
-    onEditResend: (text: string) => void;
+    onEditResend: (text: string) => Promise<boolean>;
     onRewind: () => void;
   }) => (
     <div>

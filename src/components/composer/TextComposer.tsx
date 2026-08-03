@@ -1,10 +1,10 @@
 // TextComposer：Cline 式 textarea 整卡输入（IME/undo/选区全原生免疫）。
 // @/# 任意位置 + / 行首触发弹层（光标前切片判定）+ 框外 row chip + 大粘贴折叠占位 + 语音 PTT + 每会话草稿。
-import { createEffect, createSignal, Show, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, Show, onCleanup, onMount, untrack } from "solid-js";
 import { Send, Square } from "lucide-solid";
-import { commandList, type CommandInfo, type ContextItem } from "../../lib/chat";
+import { commandList, type CommandInfo } from "../../lib/chat";
 import { activeSessionId } from "../../lib/state";
-import { clearDraft, getDraft, setDraft, stripTruncMark } from "../../lib/drafts";
+import { getDraft, setDraft, stripTruncMark } from "../../lib/drafts";
 import { createInFlight, createSeqGuard } from "../../lib/async-guard";
 import { flashErr } from "../../lib/flash";
 import { errText } from "../err-text";
@@ -18,24 +18,22 @@ import { createTokenEstimate } from "./token-estimate";
 import { listenComposerDragDrop } from "./drag-drop";
 import { createTriggerCheck } from "./trigger-check";
 import { handlePopupKey } from "./popup-keys";
-import { buildSendParts } from "./send-payload";
+import { createComposerSubmit, type ComposerSend } from "./composer-submit";
 import AttachMenu from "./AttachMenu";
 import ComposerPopup from "./ComposerPopup";
 import MicControl from "./MicControl";
 import ModelPicker from "./ModelPicker";
 import RowChips, { type RowChip } from "./RowChips";
 import { sendBtn } from "../../lib/variants";
+import { composerRestoreVersion, takeComposerRestore } from "../../lib/composer-restore";
 
 let chipSeq = 0;
 const MAX_HEIGHT = 176; // styles 里 max-h-44 同值
 
 export default function TextComposer(props: {
   streaming: () => boolean;
-  onSend: (
-    text: string,
-    context: ContextItem[],
-    images: Array<{ media_type: string; data: string }>,
-  ) => void;
+  disabled?: () => boolean;
+  onSend: ComposerSend;
   onStop: () => void;
   focusTick: () => number;
 }) {
@@ -54,6 +52,7 @@ export default function TextComposer(props: {
     [dragOver, setDragOver] = createSignal(false);
   let ta: HTMLTextAreaElement | undefined;
   let imeLockUntil = 0; // Safari compositionend 先于 commit keydown（WebKit #165231），50ms 锁窗吞尾随 Enter
+  let alive = true;
   const images = new Map<string, { media_type: string; data: string }>();
   const pastes = createPasteStore();
   const commandsGuard = createSeqGuard();
@@ -135,19 +134,28 @@ export default function TextComposer(props: {
 
   createEffect(() => {
     props.focusTick();
-    activeSessionId();
+    ta?.focus();
+  });
+
+  createEffect(() => {
+    const sid = activeSessionId();
     void reloadCommands();
     // 切会话：停掉在录/启动中的语音，终稿 discard——base 属旧会话，落进新会话输入框是串台；
     // 旧会话已上屏的 partial 不走终稿，草稿已随 setValue 持续落盘，不丢
     void voiceCtl.stop("discard");
     // 每会话草稿：切走前已持续落盘，切回恢复；row chip 不跨会话保留
-    const d = getDraft(activeSessionId());
-    setRowChips([]);
+    const d = getDraft(sid);
+    const restore = takeComposerRestore<RowChip>(sid);
+    setRowChips(restore?.chips ?? []);
     images.clear();
+    for (const [ref, image] of restore?.images ?? []) images.set(ref, image);
     pastes.clear();
     setPopup(null);
     setValue(stripTruncMark(d));
     ta?.focus();
+  });
+  onCleanup(() => {
+    alive = false;
   });
 
   const voiceCtl = createVoicePtt({
@@ -161,6 +169,20 @@ export default function TextComposer(props: {
     onStarted: setActiveVoice,
   });
   onCleanup(voiceCtl.dispose);
+
+  // 旧 Composer 卸载后才收到准入失败时，restore version 会唤醒同会话的新实例立即消费附件。
+  let seenRestoreVersion = composerRestoreVersion();
+  createEffect(() => {
+    const version = composerRestoreVersion();
+    if (version === seenRestoreVersion) return;
+    seenRestoreVersion = version;
+    const sid = untrack(activeSessionId);
+    const restore = takeComposerRestore<RowChip>(sid);
+    if (!restore) return;
+    for (const [ref, image] of restore.images) images.set(ref, image);
+    setRowChips((current) => [...restore.chips, ...current]);
+    setValue(stripTruncMark(getDraft(sid)));
+  });
 
   function updatePopupPos() {
     setPopupPos(caretPopupPos(ta));
@@ -199,11 +221,13 @@ export default function TextComposer(props: {
     triggerCheck.run();
   });
 
-  const { attachFiles, attachPaths } = createAttachments({
+  const attachments = createAttachments({
     images,
     pushChip,
     scope: activeSessionId,
   });
+  const { attachFiles, attachPaths } = attachments;
+  createEffect(() => attachments.updateScope(activeSessionId()));
 
   function onPaste(e: ClipboardEvent) {
     const { files, text, manual, large } = planPaste(e);
@@ -232,26 +256,19 @@ export default function TextComposer(props: {
     voiceCtl.onSpaceDown(e);
   }
 
-  async function send() {
-    voiceCtl.cancelPendingActivation(); // 快速 Enter（按住不足 400ms）不走 stop：废未决激活计时，防发送后触发开录
-    // 录音中发送：先等语音收尾（终稿并入输入框），连终稿一起发——
-    // 不 await 发出去的是旧 partial，终稿会倒灌已清空的输入框。
-    // 仅启动中（权限弹窗未决）取消不等待：此刻没有终稿可等，发送不能被弹窗卡住。
-    if (recording()) await voiceCtl.stop();
-    else if (voiceCtl.starting()) void voiceCtl.stop();
-    const value = pastes.expand(text()).trim();
-    // err chip 只是装配失败的告示（可点 X 移除），不进发送载荷：仅剩 err chip 时按空输入处理
-    const payloadChips = rowChips().filter((c) => c.kind !== "err");
-    if (!value && payloadChips.length === 0) return;
-    const { context, imageParts } = buildSendParts(payloadChips, images);
-    props.onSend(value, context, imageParts);
-    pastes.clear();
-    setValue("", 0);
-    // setValue 会落草稿，清草稿必须在其后，否则空串又写回去
-    clearDraft(activeSessionId());
-    setRowChips([]);
-    images.clear(); // 图片数据已随 imageParts 消费，不留到下一轮
-  }
+  const send = createComposerSubmit({
+    alive: () => alive,
+    voice: voiceCtl,
+    recording,
+    text,
+    setValue,
+    rowChips,
+    setRowChips,
+    images,
+    pastes,
+    attachments,
+    onSend: (...args) => props.onSend(...args),
+  });
 
   // 等语音终稿期间连按 Enter/连点发送键不得双发：in-flight 去重共享同一 Promise
   const sendDedupe = createInFlight();
@@ -281,6 +298,7 @@ export default function TextComposer(props: {
           class="w-full resize-none bg-transparent px-3 py-2.5 text-sm outline-none placeholder:text-[var(--text-faint)]"
           style="overflow-y: auto;"
           placeholder="输入消息，@ 引用 · / 命令 · # 知识 · 长按空格语音"
+          disabled={props.disabled?.() ?? false}
           onInput={() => {
             if (ta) setText(ta.value);
             setDraft(activeSessionId(), ta?.value ?? "");
@@ -312,8 +330,9 @@ export default function TextComposer(props: {
           <button
             class={sendBtn({ intent: props.streaming() ? "danger" : "primary" })}
             classList={{ "send-ready": !props.streaming() }}
+            disabled={(props.disabled?.() ?? false) && !props.streaming()}
             onClick={() => (props.streaming() ? props.onStop() : sendGuarded())}
-            title={props.streaming() ? "停止" : "发送"}
+            title={props.streaming() ? "停止" : props.disabled?.() ? "先完成会话存储恢复" : "发送"}
           >
             {props.streaming() ? <Square size={13} /> : <Send size={14} />}
           </button>

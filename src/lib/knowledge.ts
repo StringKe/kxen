@@ -68,6 +68,33 @@ export function knowledgeInjectionPreview(sessionId?: string): Promise<Injection
   return client.rpc("knowledge.injection_preview", sessionId ? { session_id: sessionId } : {});
 }
 
+export interface BlockedConsolidationAttempt {
+  session_id: string;
+  status: "provider_result_unknown";
+  reason: string;
+  message_revision: number | null;
+  usage_unknown: boolean;
+  metering_settled: boolean;
+}
+
+export interface AcknowledgeUnknownResult {
+  session_id: string;
+  checkpointed_revision: number | null;
+  usage_unknown_recorded: boolean;
+  diagnostics: string[];
+}
+
+export function knowledgeConsolidationBlocked(): Promise<BlockedConsolidationAttempt[]> {
+  return client.rpc("knowledge.consolidation_blocked");
+}
+
+export function knowledgeAcknowledgeUnknown(sessionId: string): Promise<AcknowledgeUnknownResult> {
+  return client.rpc("knowledge.consolidation_acknowledge_unknown", {
+    session_id: sessionId,
+    confirm_unknown: true,
+  });
+}
+
 export interface CodingRulesInfo {
   enabled: boolean;
   content: string;

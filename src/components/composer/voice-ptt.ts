@@ -3,6 +3,7 @@
 import { COMPOSER_INTERRUPT_EVENT } from "../../lib/composer-bus";
 import { startVoiceSession, type VoiceSession } from "../../lib/voice";
 import { errText } from "../err-text";
+import { createTranscriptRange } from "./transcript-range";
 
 export interface VoiceController {
   toggle: () => void;
@@ -12,13 +13,15 @@ export interface VoiceController {
    * discard：丢弃终稿（切会话——base 属旧会话，并入新会话输入框就是串台）。
    */
   stop: (mode?: "merge" | "discard") => Promise<void>;
+  /** 等当前主动 stop/final flight 落定；没有 stop 在飞时立即完成。 */
+  settle: () => Promise<void>;
   /** 废掉未决的 PTT 激活计时：按住不足 400ms 直接发送时不走 stop，计时留存会在发送后触发开录。 */
   cancelPendingActivation: () => void;
   /** 启动中（权限弹窗/引擎未决）：发送方据此区分「等终稿」还是「取消不等」。 */
   starting: () => boolean;
   onSpaceDown: (e: KeyboardEvent) => void;
   onSpaceUp: (e: KeyboardEvent) => void;
-  /** 卸载时摘除 window 级监听（blur/visibilitychange/浮层打断）与错误消退计时，防重挂载后重复挂听。 */
+  /** 卸载时摘除监听并丢弃终稿地停止 active/starting session，防后台继续占用麦克风。 */
   dispose: () => void;
 }
 
@@ -55,15 +58,17 @@ export function createVoicePtt(opts: {
   let session: VoiceSession | null = null;
   let starting = false;
   let cancelled = false;
-  let base = "";
-  // 已上屏 partial 长度：新 partial 只替换尾部该区间，保住录音中手打的内容
-  let partialLen = 0;
+  const transcript = createTranscriptRange(opts);
   // 启动 flight 句柄：stop 在启动中调用时靠它等启动落定，否则取消请求被 start 守卫吞掉
   let startFlight: Promise<void> | null = null;
+  let stopFlight: Promise<void> | null = null;
   let pttTimer: ReturnType<typeof setTimeout> | undefined;
   let pttActive = false;
   let spaceCountAtDown = 0;
   let errTimer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
+  // 每次启动和 discard 都换代。旧 partial、启动结果或 stop 终稿只能写回创建它的 generation。
+  let generation = 0;
 
   function clearPttTimer() {
     if (pttTimer) {
@@ -74,6 +79,7 @@ export function createVoicePtt(opts: {
 
   // 错误统一入口：空串即清；非空到时自动消退
   function reportError(msg: string) {
+    if (disposed) return;
     if (errTimer) clearTimeout(errTimer);
     if (!msg) {
       opts.setError("");
@@ -85,40 +91,37 @@ export function createVoicePtt(opts: {
 
   async function start() {
     if (session || starting) return;
+    const currentGeneration = ++generation;
     starting = true;
     cancelled = false;
     reportError("");
-    base = opts.getText();
-    partialLen = 0;
+    transcript.reset();
     try {
       const s = await startSession(
         opts.engine(),
         (partial) => {
           // 取消/停止后迟到的 partial 不上屏（发送已清空、会话已切换）
-          if (cancelled) return;
-          // 只替换上次上屏的 partial 区间，其后手打的内容保留
-          const tail = opts.getText().slice(base.length + partialLen);
-          partialLen = partial.length;
-          opts.setText(base + partial + tail);
-          opts.afterChange();
+          if (cancelled || disposed || currentGeneration !== generation) return;
+          transcript.render(partial);
         },
         (msg) => {
+          if (disposed || currentGeneration !== generation) return;
           reportError(msg);
           void stop();
         },
         opts.sessionId?.() ?? "",
       );
-      if (cancelled) {
+      if (cancelled || disposed || currentGeneration !== generation) {
         // 启动落定前已被取消（启动中 toggle/send/切会话）：自停；
-        // 停失败必须上报——引擎停不掉会一直占麦
-        s.stop().catch((e) => reportError(errText(e)));
+        // 非卸载取消的停失败上屏；卸载后 UI 已销毁，但仍等待 stop 完成再结束 flight。
+        await s.stop().catch((e) => reportError(errText(e)));
         return;
       }
       session = s;
       opts.setRecording(true);
       opts.onStarted?.(s.engine);
     } catch (e) {
-      reportError(errText(e));
+      if (!cancelled && !disposed && currentGeneration === generation) reportError(errText(e));
       // 失败复位：PTT 不留激活态（继续按住只剩普通空格键，keyup 自然结束）；
       // 激活计时一并清——repeat 分支靠 pttTimer 判激活期，留着会把继续按住的 repeat 空格全吞掉
       pttActive = false;
@@ -129,34 +132,43 @@ export function createVoicePtt(opts: {
   }
 
   function launch() {
-    if (session || starting) return;
+    if (disposed || session || starting) return;
     startFlight = start();
   }
 
-  async function stop(mode: "merge" | "discard" = "merge") {
+  async function stopOnce(mode: "merge" | "discard", currentGeneration: number) {
+    // 启动中取消：等启动落定（cancelled 已置，start 落定后自停，session 保持 null）
+    if (starting) await startFlight;
+    const s = session;
+    session = null;
+    // starting 状态在卸载后才落定时不再写已销毁 UI；active dispose 仍同步收回 recording。
+    if (!disposed || s) opts.setRecording(false);
+    if (!s) return;
+    const finalText = await s.stop().catch((e) => {
+      if (currentGeneration === generation) reportError(errText(e));
+      return null;
+    });
+    // discard（切会话）：终稿属旧会话，落进当前输入框就是串台
+    if (mode === "discard" || disposed || currentGeneration !== generation || !finalText) return;
+    transcript.render(finalText);
+  }
+
+  function stop(mode: "merge" | "discard" = "merge"): Promise<void> {
+    if (mode === "discard") generation++;
+    const currentGeneration = generation;
     cancelled = true;
     pttActive = false;
     // 停 PTT 必须废掉未决的激活计时：否则计时随后触发 launch，
     // 面板打断/启动中取消等「概念上已结束」的路径会莫名重新开录
     clearPttTimer();
-    // 启动中取消：等启动落定（cancelled 已置，start 落定后自停，session 保持 null）
-    if (starting) await startFlight;
-    const s = session;
-    session = null;
-    opts.setRecording(false);
-    const plen = partialLen;
-    partialLen = 0;
-    if (!s) return;
-    const finalText = await s.stop().catch((e) => {
-      reportError(errText(e));
-      return null;
+    // 同一 session 已被主动 stop 并等待 final 时，共享原 flight。否则第二次 stop 会因 session 已清空而
+    // 提前完成，使紧随 keyup 的 Enter 把 partial 先发出，随后终稿再倒灌输入框。
+    if (stopFlight && !session) return stopFlight;
+    const flight = stopOnce(mode, currentGeneration).finally(() => {
+      if (stopFlight === flight) stopFlight = null;
     });
-    // discard（切会话）：终稿属旧会话，落进当前输入框就是串台
-    if (mode === "discard" || !finalText) return;
-    // 终稿替换 partial 区间，保住录音中手打的内容（同 partial 上屏规则）
-    const tail = opts.getText().slice(base.length + plen);
-    opts.setText(base + finalText + tail);
-    opts.afterChange();
+    stopFlight = flight;
+    return flight;
   }
 
   // 失焦/切后台视同 keyup：窗口失焦后空格 keyup 丢失，pttActive 卡 true 会把之后所有空格吞掉
@@ -179,15 +191,18 @@ export function createVoicePtt(opts: {
 
   return {
     toggle: () => {
+      if (disposed) return;
       // starting 也算「已触发」：启动中再按 = 取消
       // （只查 session 会把取消吞掉，权限弹窗期间不可取消）
       if (session || starting) void stop();
       else launch();
     },
     stop,
+    settle: () => stopFlight ?? Promise.resolve(),
     cancelPendingActivation: clearPttTimer,
     starting: () => starting,
     onSpaceDown: (e) => {
+      if (disposed) return;
       if (e.key !== " ") return;
       // PTT 已激活或启动中：空格一律不入字（防连打）
       if (pttActive || session || starting) {
@@ -211,14 +226,22 @@ export function createVoicePtt(opts: {
       }, 400);
     },
     onSpaceUp: (e) => {
+      if (disposed) return;
       if (e.key !== " ") return;
       releasePtt();
     },
     dispose: () => {
+      if (disposed) return;
+      disposed = true;
       window.removeEventListener("blur", onWindowBlur);
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener(COMPOSER_INTERRUPT_EVENT, onInterrupt);
-      if (errTimer) clearTimeout(errTimer);
+      if (errTimer) {
+        clearTimeout(errTimer);
+        errTimer = undefined;
+      }
+      // cleanup 不能 await，但 stop 会立即取消计时/partial，并在 start 落定后关闭迟到的 session。
+      void stop("discard");
     },
   };
 }

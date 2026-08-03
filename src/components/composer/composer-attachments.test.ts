@@ -4,6 +4,14 @@ import { createAttachments } from "./composer-attachments";
 import { fileToImageDataUrl } from "./image-scale";
 import type { RowChip } from "./RowChips";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const rpcMock = vi.hoisted(() => ({
   impl: (_method: string, _params?: unknown) =>
     Promise.reject(new Error("unexpected call")) as Promise<unknown>,
@@ -28,7 +36,15 @@ function harness() {
   const images = new Map<string, { media_type: string; data: string }>();
   let scope = "s1";
   const api = createAttachments({ images, pushChip: (c) => chips.push(c), scope: () => scope });
-  return { chips, images, setScope: (next: string) => (scope = next), ...api };
+  return {
+    chips,
+    images,
+    setScope: (next: string) => {
+      scope = next;
+      api.updateScope(next);
+    },
+    ...api,
+  };
 }
 
 afterEach(() => {
@@ -103,16 +119,38 @@ describe("attachFiles 图片失败 err chip", () => {
   });
 
   it("图片读取期间切换会话：迟到结果不插入新会话", async () => {
-    let resolve!: (value: string) => void;
-    vi.mocked(fileToImageDataUrl).mockImplementation(
-      () => new Promise<string>((done) => (resolve = done)),
-    );
-    const { chips, images, setScope, attachFiles } = harness();
+    const encoded = deferred<string>();
+    vi.mocked(fileToImageDataUrl).mockReturnValue(encoded.promise);
+    const { chips, images, setScope, attachFiles, pending, settle } = harness();
     attachFiles([new File([new Uint8Array([1])], "late.png", { type: "image/png" })]);
+    expect(pending()).toBe(true);
+    const settling = settle();
     setScope("s2");
-    resolve("data:image/png;base64,TEFURQ==");
+    expect(stateMock.flashErr).toHaveBeenCalledWith(expect.stringContaining("会话已切换"));
+    setScope("s1");
+    await expect(settling).resolves.toBe(false);
+    encoded.resolve("data:image/png;base64,TEFURQ==");
     await Promise.resolve();
     expect(chips).toEqual([]);
     expect(images.size).toBe(0);
+    expect(pending()).toBe(false);
+  });
+
+  it("fsResolveName flight 纳入 pending/settle，落定后文件 chip 才可被发送快照读取", async () => {
+    const resolved = deferred<unknown>();
+    rpcMock.impl = (method) => {
+      if (method === "fs.resolve_name") return resolved.promise;
+      return Promise.reject(new Error("unexpected call"));
+    };
+    const { chips, attachFiles, pending, settle } = harness();
+    attachFiles([new File(["abc"], "note.txt", { type: "text/plain" })]);
+    expect(pending()).toBe(true);
+    const settling = settle();
+    resolved.resolve([{ path: "docs/note.txt", size: 3 }]);
+    await expect(settling).resolves.toBe(true);
+    expect(chips).toEqual([
+      expect.objectContaining({ kind: "file", ref: "docs/note.txt", label: "note.txt" }),
+    ]);
+    expect(pending()).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { A } from "@solidjs/router";
 import { ArrowLeft } from "lucide-solid";
 import KnowledgeSection from "../components/settings/KnowledgeSection";
@@ -11,7 +11,7 @@ import UsageSection from "../components/settings/UsageSection";
 import VoiceSection from "../components/settings/VoiceSection";
 import GeneralSection from "../components/settings/GeneralSection";
 import { client } from "../lib/client";
-import { configGet, currentModel, doctor } from "../lib/chat";
+import { configGet, doctor } from "../lib/chat";
 import { flashErr, flashOk } from "../lib/flash";
 import { onDragStart } from "../lib/drag";
 
@@ -40,7 +40,6 @@ export default function Settings() {
     provider: null as boolean | null,
     routing: null as boolean | null,
   });
-  const [distillModel, setDistillModel] = createSignal("当前默认 Provider");
   const [configLoaded, setConfigLoaded] = createSignal(false);
   const [configErr, setConfigErr] = createSignal("");
   const [policySaving, setPolicySaving] = createSignal(false);
@@ -71,41 +70,43 @@ export default function Settings() {
     }
   };
 
-  onMount(() => {
-    void Promise.allSettled([configGet(), doctor(), currentModel()]).then(
-      ([cfgResult, reportResult, modelResult]) => {
-        const cfg = cfgResult.status === "fulfilled" ? cfgResult.value : null;
-        const report = reportResult.status === "fulfilled" ? reportResult.value : null;
-        const model = modelResult.status === "fulfilled" ? modelResult.value : null;
-        if (cfg) applyConfig(cfg);
-        else {
-          setConfigLoaded(false);
-          setConfigErr(
-            cfgResult.status === "rejected"
-              ? cfgResult.reason instanceof Error
-                ? cfgResult.reason.message
-                : String(cfgResult.reason)
-              : "UNKNOWN",
-          );
-        }
-        if (model?.provider && model?.model) setDistillModel(`${model.provider}/${model.model}`);
-        const availableProviders = new Set(
-          report?.entries
-            ?.filter((entry) => ["ok", "imported"].includes(entry.status))
-            .map((entry) => entry.provider) ?? [],
-        );
-        setReadiness({
-          workspace: report ? Boolean(report.system?.lsp_root) : null,
-          provider: report ? availableProviders.size > 0 : null,
-          routing:
-            report && cfg
-              ? Object.values(cfg.roles ?? {}).some((binding) =>
-                  availableProviders.has(binding.provider),
-                )
-              : null,
-        });
-      },
+  // config/doctor/readiness 合并为一次概览重拉：onMount 首拉 + 断线 resync 对账（同 KnowledgeBlockedPanel 模式）
+  const reloadOverview = async () => {
+    const [cfgResult, reportResult] = await Promise.allSettled([configGet(), doctor()]);
+    const cfg = cfgResult.status === "fulfilled" ? cfgResult.value : null;
+    const report = reportResult.status === "fulfilled" ? reportResult.value : null;
+    if (cfg) applyConfig(cfg);
+    else {
+      setConfigLoaded(false);
+      setConfigErr(
+        cfgResult.status === "rejected"
+          ? cfgResult.reason instanceof Error
+            ? cfgResult.reason.message
+            : String(cfgResult.reason)
+          : "UNKNOWN",
+      );
+    }
+    const availableProviders = new Set(
+      report?.entries
+        ?.filter((entry) => ["ok", "imported"].includes(entry.status))
+        .map((entry) => entry.provider) ?? [],
     );
+    setReadiness({
+      workspace: report ? Boolean(report.system?.lsp_root) : null,
+      provider: report ? availableProviders.size > 0 : null,
+      routing:
+        report && cfg
+          ? Object.values(cfg.roles ?? {}).some((binding) =>
+              availableProviders.has(binding.provider),
+            )
+          : null,
+    });
+  };
+
+  onMount(() => {
+    void reloadOverview();
+    const offResync = client.onResync(() => void reloadOverview());
+    onCleanup(offResync);
   });
 
   const setPolicy = async (p: string) => {
@@ -238,12 +239,12 @@ export default function Settings() {
                       [
                         "automatic_knowledge_distillation",
                         "自动知识沉淀",
-                        `每 30 分钟把近 24 小时活跃 Session 各自最近 20 条文本和注入上下文发送给 ${distillModel()}，只写个人知识库`,
+                        "每 30 分钟按各 Session 所属 Workspace 的模型路由，把近 24 小时活跃 Session 各自最近 20 条文本和注入上下文发送给对应 Provider，只写个人知识库",
                       ],
                       [
                         "browser_automation",
                         "Browser automation",
-                        "页面后续导航和全部子资源尚不能形成完整 SSRF 边界",
+                        "允许 Agent 驱动本机 Chrome；全部 HTTP/S 和 WebSocket 请求经过受控代理，网页数据可能发送给 Provider",
                       ],
                       [
                         "remote_mcp",

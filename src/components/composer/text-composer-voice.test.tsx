@@ -17,6 +17,7 @@ const voiceMock = vi.hoisted(() => ({
     { id: "openai", label: "OpenAI 转写", status: "ready", detail: "" },
   ],
   setVoiceEngine: vi.fn(async () => {}),
+  stopImpl: () => Promise.resolve(null as string | null),
 }));
 
 vi.mock("../../lib/voice", () => ({
@@ -27,7 +28,7 @@ vi.mock("../../lib/voice", () => ({
       engine: "apple",
       stop: () => {
         voiceMock.stopped++;
-        return Promise.resolve(null as string | null);
+        return voiceMock.stopImpl();
       },
     };
   },
@@ -60,6 +61,7 @@ afterEach(() => {
   voiceMock.started = 0;
   voiceMock.stopped = 0;
   voiceMock.lastEngine = undefined;
+  voiceMock.stopImpl = () => Promise.resolve(null);
   voiceMock.setVoiceEngine.mockClear();
   clearDraft("");
   setActiveSessionId("");
@@ -109,6 +111,41 @@ describe("TextComposer 语音引擎 override (webkit)", () => {
     expect(voiceMock.lastEngine).toBe("openai");
     space(el, "keyup");
     await new Promise((r) => setTimeout(r, 50));
+    dispose();
+  });
+
+  it("keyup 已主动 stop 但终稿仍在飞时，紧接 Enter 等待终稿后只发送一次", async () => {
+    let resolveFinal!: (value: string | null) => void;
+    voiceMock.stopImpl = () =>
+      new Promise((resolve) => {
+        resolveFinal = resolve;
+      });
+    const sent = vi.fn();
+    const [tick] = createSignal(0);
+    const dispose = render(
+      () => (
+        <TextComposer streaming={() => false} onSend={sent} onStop={() => {}} focusTick={tick} />
+      ),
+      document.body,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const el = document.querySelector<HTMLTextAreaElement>("textarea")!;
+    el.value = "前缀";
+    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+
+    space(el, "keydown");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    space(el, "keyup");
+    el.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+    await Promise.resolve();
+    expect(sent).not.toHaveBeenCalled();
+
+    resolveFinal("终稿");
+    await vi.waitFor(() => expect(sent).toHaveBeenCalledOnce());
+    expect(sent.mock.calls[0]?.[0]).toBe("前缀终稿");
+    expect(el.value).toBe("");
     dispose();
   });
 });

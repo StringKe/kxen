@@ -285,7 +285,7 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
         </div>
         <input
           class="form-mono"
-          placeholder="base_url（API 根，如 https://relay.example.com/v1）"
+          placeholder="base_url（远程必须 HTTPS；本机 HTTP 仅 localhost/loopback）"
           value={baseUrl()}
           onInput={(e) => setBaseUrl(e.currentTarget.value)}
         />

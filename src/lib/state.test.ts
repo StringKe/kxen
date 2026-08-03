@@ -1,4 +1,3 @@
-// deleteSession 善后（P0-6）：活跃会话被删后 activeSessionId 不得悬死指向死会话。
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionMeta } from "./chat";
 import type { AgentActivity } from "./team";
@@ -41,12 +40,15 @@ vi.mock("./session-model", () => ({
   applyDraftModel: mocks.applyDraftModel,
   resetDraftModel: mocks.resetDraftModel,
 }));
-vi.mock("./drafts", () => ({ migrateNewDraft: vi.fn() }));
+vi.mock("./drafts", () => ({
+  clearDraft: vi.fn(),
+  draftKey: (sessionId: string) => sessionId || "draft:new",
+  migrateNewDraft: vi.fn(),
+}));
 
 import {
   activeSessionId,
   agents,
-  deleteSession,
   ensureActiveSession,
   mountSessionEvents,
   newSession,
@@ -77,71 +79,65 @@ beforeEach(() => {
   setActiveSessionId("");
 });
 
-describe("deleteSession 善后切换", () => {
-  it("删活跃会话：切到同目录下一条", async () => {
-    setSessions([meta("a", "/p"), meta("b", "/p"), meta("c", "/q")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockResolvedValue([meta("b", "/p"), meta("c", "/q")]);
-    await deleteSession("a");
-    expect(mocks.sessionDelete).toHaveBeenCalledWith("a");
-    expect(activeSessionId()).toBe("b");
-  });
-
-  it("同目录无下一条：切列表首条", async () => {
-    setSessions([meta("a", "/p"), meta("c", "/q")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockResolvedValue([meta("c", "/q")]);
-    await deleteSession("a");
-    expect(activeSessionId()).toBe("c");
-  });
-
-  it("列表删空：回草稿态（activeSessionId 置空）", async () => {
-    setSessions([meta("a", "/p")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockResolvedValue([]);
-    await deleteSession("a");
-    expect(activeSessionId()).toBe("");
-  });
-
-  it("删非活跃会话：活跃会话不动", async () => {
-    setSessions([meta("a", "/p"), meta("b", "/p")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockResolvedValue([meta("a", "/p")]);
-    await deleteSession("b");
-    expect(activeSessionId()).toBe("a");
-  });
-
-  it("删除失败：错误上抛不静默（调用方负责 flashErr）", async () => {
-    setSessions([meta("a", "/p")]);
-    setActiveSessionId("a");
-    mocks.sessionDelete.mockRejectedValueOnce(new Error("io boom"));
-    await expect(deleteSession("a")).rejects.toThrow("io boom");
-  });
-
-  it("删除已提交但列表刷新失败：本地移除死 id，返回对账警告而非谎报删除失败", async () => {
-    setSessions([meta("a", "/p"), meta("b", "/p")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockRejectedValue(new Error("list offline"));
-
-    const result = await deleteSession("a");
-    expect(result.warning).toContain("会话列表刷新失败");
-    expect(sessions().map((session) => session.id)).toEqual(["b"]);
-    expect(activeSessionId()).toBe("b");
-  });
-
-  it("删除已提交但后续激活失败：activeSessionId 留空，不悬挂到已删除会话", async () => {
-    setSessions([meta("a", "/p"), meta("b", "/p")]);
-    setActiveSessionId("a");
-    mocks.sessionList.mockResolvedValue([meta("b", "/p")]);
-    mocks.rpc.mockRejectedValue(new Error("activate failed"));
-
-    const result = await deleteSession("a");
-    expect(result.warning).toContain("后续会话切换失败");
-    expect(activeSessionId()).toBe("");
-  });
-});
-
 describe("ensureActiveSession 并发去重", () => {
+  it("目标会话激活在飞时拒绝把新消息准入旧会话", async () => {
+    setActiveSessionId("s1");
+    let finish!: () => void;
+    mocks.rpc.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const switching = switchSession("s2");
+    await vi.waitFor(() =>
+      expect(mocks.rpc).toHaveBeenCalledWith("session.activate", { id: "s2" }),
+    );
+    await expect(ensureActiveSession()).rejects.toThrow("会话正在切换");
+    expect(mocks.applyDraftModel).not.toHaveBeenCalled();
+    finish();
+    await switching;
+    expect(activeSessionId()).toBe("s2");
+  });
+
+  it("目标会话激活失败后允许继续使用仍活跃的旧会话", async () => {
+    setActiveSessionId("s1");
+    mocks.rpc.mockRejectedValueOnce(new Error("activate failed"));
+    await expect(switchSession("s2")).rejects.toThrow("activate failed");
+    await expect(ensureActiveSession()).resolves.toBe("s1");
+  });
+
+  it("既有会话模型写入在飞时发生切换：旧会话准入失效", async () => {
+    setActiveSessionId("s1");
+    let finishModel!: () => void;
+    mocks.applyDraftModel.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishModel = resolve;
+        }),
+    );
+    const admission = ensureActiveSession();
+    await vi.waitFor(() => expect(mocks.applyDraftModel).toHaveBeenCalledWith("s1", false));
+    await switchSession("s2");
+    finishModel();
+    await expect(admission).rejects.toThrow("会话已切换");
+    expect(activeSessionId()).toBe("s2");
+  });
+
+  it("草稿创建在飞时用户切到其他会话：新建会话不抢回激活", async () => {
+    mocks.sessionCreate.mockReset();
+    let finishCreate!: (session: SessionMeta) => void;
+    mocks.sessionCreate.mockImplementationOnce(
+      () => new Promise<SessionMeta>((resolve) => (finishCreate = resolve)),
+    );
+    mocks.sessionList.mockResolvedValue([meta("s-new", "/p"), meta("s2", "/p")]);
+    const admission = ensureActiveSession();
+    await switchSession("s2");
+    finishCreate(meta("s-new", "/p"));
+    await expect(admission).rejects.toThrow("新建会话未自动激活");
+    expect(activeSessionId()).toBe("s2");
+  });
+
   it("并发首发共享同一次创建：只建一个会话，两路拿到同一 id", async () => {
     mocks.sessionCreate.mockReset();
     let release!: (m: SessionMeta) => void;

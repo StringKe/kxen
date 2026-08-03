@@ -21,6 +21,7 @@ vi.mock("./token-estimate", () => ({
 vi.mock("./voice-ptt", () => ({
   createVoicePtt: () => ({
     stop: async () => null,
+    settle: async () => {},
     dispose: () => {},
     onSpaceDown: () => {},
     onSpaceUp: () => {},
@@ -36,11 +37,21 @@ import { setActiveSessionId } from "../../lib/state";
 const DOCTOR: CommandInfo = { name: "doctor", description: "环境自检", kind: "builtin" };
 const NEW_COMMAND: CommandInfo = { name: "new-command", description: "新命令", kind: "builtin" };
 
-function mount() {
+function mount(options?: {
+  streaming?: () => boolean;
+  disabled?: () => boolean;
+  onStop?: () => void;
+}) {
   const [tick] = createSignal(0);
   const dispose = render(
     () => (
-      <TextComposer streaming={() => false} onSend={() => {}} onStop={() => {}} focusTick={tick} />
+      <TextComposer
+        streaming={options?.streaming ?? (() => false)}
+        {...(options?.disabled ? { disabled: options.disabled } : {})}
+        onSend={() => {}}
+        onStop={options?.onStop ?? (() => {})}
+        focusTick={tick}
+      />
     ),
     document.body,
   );
@@ -74,6 +85,17 @@ afterEach(() => {
 });
 
 describe("TextComposer 补全数据源失败", () => {
+  it("存储阻塞期间仍允许停止正在运行的会话", async () => {
+    const stop = vi.fn();
+    const { dispose } = mount({ streaming: () => true, disabled: () => true, onStop: stop });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const button = document.querySelector<HTMLButtonElement>('button[title="停止"]')!;
+    expect(button.disabled).toBe(false);
+    button.click();
+    expect(stop).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
   it("命令清单首载失败显示 UNKNOWN，选择重试后恢复真实命令", async () => {
     h.commandList.mockRejectedValueOnce(new Error("commands offline"));
     const { dispose, textarea } = mount();

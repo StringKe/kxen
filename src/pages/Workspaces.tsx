@@ -1,5 +1,5 @@
 // 工作看板：workspace = 并行任务运行单元，一列一个 workspace。
-// 列内分区：运行中会话 / 隔离树 / goal / 排队与 cron 计数；8s 轮询 + goal/task 事件即时刷新 + resync 对账。
+// 列内分区：运行中会话 / 隔离树 / goal / 排队与 cron 计数；8s 轮询 + goal/task 事件 250ms 去抖刷新 + resync 对账。
 import { createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { A } from "@solidjs/router";
 import { ArrowLeft, FolderGit2, GitBranch, Play, Target } from "lucide-solid";
@@ -29,6 +29,7 @@ export default function Workspaces() {
   let unlisten: (() => void) | undefined;
   let offResync: (() => void) | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let eventTimer: ReturnType<typeof setTimeout> | undefined;
 
   const reload = async () => {
     const request = reloadGuard.next();
@@ -45,9 +46,18 @@ export default function Workspaces() {
     setLoaded(true);
   };
 
+  // goal.update/task.update 连发帧（批量状态迁移）250ms 去抖合并成一次全量重拉，同会话列表刷新模式
+  const bump = () => {
+    if (eventTimer) clearTimeout(eventTimer);
+    eventTimer = setTimeout(() => {
+      eventTimer = undefined;
+      void reload();
+    }, 250);
+  };
+
   onMount(() => {
     void reload();
-    unlisten = onTopic(["goal.update", "task.update"], () => void reload());
+    unlisten = onTopic(["goal.update", "task.update"], bump);
     // goal.update/task.update 丢帧后 topic 流不自愈：resync 信号按真源重拉（同 Dock 模式）
     offResync = client.onResync(() => void reload());
     timer = setInterval(() => void reload(), 8000);
@@ -56,6 +66,7 @@ export default function Workspaces() {
     unlisten?.();
     offResync?.();
     if (timer) clearInterval(timer);
+    if (eventTimer) clearTimeout(eventTimer);
   });
 
   const open = async (path: string, sessionId?: string) => {

@@ -5,7 +5,7 @@ import { CircleAlert, Image as ImageIcon, X } from "lucide-solid";
 export interface RowChip {
   id: string;
   /** err = 附件装配失败（授权/读取/超限），仅展示原因不进发送载荷 */
-  kind: "image" | "knowledge" | "file" | "dir" | "web" | "docs" | "err";
+  kind: "image" | "knowledge" | "file" | "dir" | "web" | "docs" | "note" | "err";
   ref: string;
   label: string;
   /** tooltip 展示完整路径/URL（label 只显示 basename，路径长在 chip 上放不下）；err chip 放失败原因。 */

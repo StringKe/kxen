@@ -3,11 +3,15 @@
 import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import "../../styles.css";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { userEvent } from "@vitest/browser/context";
 import TextComposer from "./TextComposer";
 import { setActiveSessionId } from "../../lib/state";
-import { clearDraft } from "../../lib/drafts";
+import { clearDraft, getDraft, setDraft } from "../../lib/drafts";
+
+const imageMock = vi.hoisted(() => ({ encode: vi.fn() }));
+
+vi.mock("./image-scale", () => ({ fileToImageDataUrl: imageMock.encode }));
 
 vi.mock("../../lib/chat", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../lib/chat")>();
@@ -48,16 +52,31 @@ vi.mock("../../lib/models", async (importOriginal) => {
   };
 });
 
+beforeEach(() => {
+  imageMock.encode.mockReset().mockResolvedValue("data:image/png;base64,WA==");
+});
+
 afterEach(() => {
   clearDraft("");
   clearDraft("s9");
+  clearDraft("s1");
+  clearDraft("s2");
   localStorage.removeItem("kxen:draft:s9");
   setActiveSessionId("");
   // 失败用例没跑到 dispose 时清场：残留 composer 会让下一个用例的 ta() 抓到旧 textarea
   document.body.innerHTML = "";
 });
 
-function mount(onSend: (text: string, images?: Array<unknown>) => void = () => {}) {
+function mount(
+  onSend: (
+    text: string,
+    images?: Array<unknown>,
+  ) =>
+    | boolean
+    | void
+    | { admitted: boolean; sessionId: string }
+    | Promise<boolean | void | { admitted: boolean; sessionId: string }> = () => {},
+) {
   const [tick, setTick] = createSignal(0);
   const dispose = render(
     () => (
@@ -80,9 +99,41 @@ function pasteFile(ta: HTMLTextAreaElement, dt: DataTransfer) {
 }
 
 describe("TextComposer 粘贴/附件 (webkit)", () => {
+  it("图片编码未决时立即重复 Enter：等待附件后只发送一次完整图片载荷", async () => {
+    let resolveImage!: (value: string) => void;
+    imageMock.encode.mockReturnValue(
+      new Promise((resolve) => {
+        resolveImage = resolve;
+      }),
+    );
+    const sent = vi.fn();
+    setActiveSessionId("s1");
+    const { dispose, ta } = mount((text, images) => sent(text, images));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const data = new DataTransfer();
+    data.items.add(new File(["x"], "late.png", { type: "image/png" }));
+    pasteFile(ta(), data);
+    ta().value = "附图";
+    ta().dispatchEvent(new InputEvent("input", { bubbles: true }));
+    const enter = () =>
+      ta().dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+      );
+    enter();
+    enter();
+    await Promise.resolve();
+    expect(sent).not.toHaveBeenCalled();
+
+    resolveImage("data:image/png;base64,TEFURQ==");
+    await vi.waitFor(() => expect(sent).toHaveBeenCalledOnce());
+    expect(sent).toHaveBeenCalledWith("附图", [{ media_type: "image/png", data: "TEFURQ==" }]);
+    expect(ta().value).toBe("");
+    dispose();
+  });
+
   it("图片 chip 移除后发送不再携带图片数据（images 随 chip 释放）", async () => {
     let imgs: unknown[] = [];
-    const { dispose, ta } = mount((_t, i) => (imgs = i ?? []));
+    const { dispose, ta } = mount((_t, i) => void (imgs = i ?? []));
     await new Promise((r) => setTimeout(r, 100));
     const dt = new DataTransfer();
     dt.items.add(new File(["x"], "a.png", { type: "image/png" }));
@@ -100,6 +151,90 @@ describe("TextComposer 粘贴/附件 (webkit)", () => {
     await userEvent.keyboard("hi{Enter}");
     expect(imgs.length).toBe(0);
     dispose();
+  });
+
+  it("会话准入失败：图片 chip 与文本一起恢复，不丢附件", async () => {
+    let rejectAdmission!: () => void;
+    const admission = new Promise<boolean>((resolve) => {
+      rejectAdmission = () => resolve(false);
+    });
+    setActiveSessionId("s9");
+    const { dispose, ta } = mount(() => admission);
+    await new Promise((r) => setTimeout(r, 100));
+    const dt = new DataTransfer();
+    dt.items.add(new File(["x"], "a.png", { type: "image/png" }));
+    pasteFile(ta(), dt);
+    await vi.waitFor(() =>
+      expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png"),
+    );
+    ta().focus();
+    await userEvent.keyboard("附图说明{Enter}");
+    expect(ta().value).toBe("");
+    await userEvent.keyboard("，继续补充");
+    rejectAdmission();
+    await vi.waitFor(() => expect(ta().value).toBe("附图说明\n，继续补充"));
+    expect(getDraft("s9")).toBe("附图说明\n，继续补充");
+    expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png");
+    dispose();
+  });
+
+  it("准入期间切会话：旧文本和图片只恢复到原会话", async () => {
+    let rejectAdmission!: () => void;
+    const admission = new Promise<{ admitted: boolean; sessionId: string }>((resolve) => {
+      rejectAdmission = () => resolve({ admitted: false, sessionId: "s1" });
+    });
+    setActiveSessionId("s1");
+    const { dispose, setTick, ta } = mount(() => admission);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const data = new DataTransfer();
+    data.items.add(new File(["x"], "a.png", { type: "image/png" }));
+    pasteFile(ta(), data);
+    await vi.waitFor(() =>
+      expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png"),
+    );
+    ta().focus();
+    await userEvent.keyboard("旧会话内容{Enter}");
+    setActiveSessionId("s2");
+    setTick(1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // 同一旧会话可由另一个 Composer/窗口继续产生草稿；失败恢复必须保留清晰消息边界。
+    setDraft("s1", "旧会话在途新输入");
+    rejectAdmission();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(ta().value).toBe("");
+    expect(document.querySelector(".composer-card")?.textContent).not.toContain("图片 png");
+    expect(getDraft("s1")).toBe("旧会话内容\n旧会话在途新输入");
+    setActiveSessionId("s1");
+    setTick(2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(ta().value).toBe("旧会话内容\n旧会话在途新输入");
+    expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png");
+    dispose();
+  });
+
+  it("旧 Composer 卸载后准入才失败：同会话新实例立即恢复附件", async () => {
+    let rejectAdmission!: () => void;
+    const admission = new Promise<boolean>((resolve) => {
+      rejectAdmission = () => resolve(false);
+    });
+    setActiveSessionId("s1");
+    const old = mount(() => admission);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const data = new DataTransfer();
+    data.items.add(new File(["x"], "a.png", { type: "image/png" }));
+    pasteFile(old.ta(), data);
+    await vi.waitFor(() =>
+      expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png"),
+    );
+    old.ta().focus();
+    await userEvent.keyboard("卸载后恢复{Enter}");
+    old.dispose();
+    const current = mount();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    rejectAdmission();
+    await vi.waitFor(() => expect(current.ta().value).toBe("卸载后恢复"));
+    expect(document.querySelector(".composer-card")?.textContent).toContain("图片 png");
+    current.dispose();
   });
 
   it("混合剪贴板（图片+文本）：文本随附件一起上屏，不被 files 吞掉", async () => {

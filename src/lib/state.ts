@@ -5,11 +5,22 @@ import { agentsList, type AgentActivity } from "./team";
 import { sessionCreate, sessionDelete, sessionList, type SessionMeta } from "./chat";
 import { applyDraftModel, resetDraftModel } from "./session-model";
 import { createInFlight, createSeqGuard } from "./async-guard";
-import { migrateNewDraft } from "./drafts";
+import { clearDraft, migrateNewDraft } from "./drafts";
 import { formatError } from "./error-text";
+import { clearComposerRestore } from "./composer-restore";
+import { clearSessionMessageEditDrafts } from "./message-edit-drafts";
 
 export const [sessions, setSessions] = createSignal<SessionMeta[]>([]);
-export const [activeSessionId, setActiveSessionId] = createSignal<string>("");
+const [activeSessionIdValue, setActiveSessionIdValue] = createSignal<string>("");
+export const activeSessionId = activeSessionIdValue;
+let sessionIntentRevision = 0;
+let desiredSessionId = "";
+/** 测试和同步调用方直接切换时也必须换代，使所有在飞的会话准入失效。 */
+export function setActiveSessionId(id: string): void {
+  sessionIntentRevision++;
+  desiredSessionId = id;
+  setActiveSessionIdValue(id);
+}
 /** 活跃会话是否已有对话内容（驱动右 dock 滑入/滑出）。 */
 export const [hasConversation, setHasConversation] = createSignal(false);
 /** 子代理名单（teammate/subagent/workflow 统一视图）。 */
@@ -20,6 +31,33 @@ export const [agentsLoadFailed, setAgentsLoadFailed] = createSignal(false);
 export const [activeAgentFocus, setActiveAgentFocus] = createSignal<string>("");
 const sessionsGuard = createSeqGuard();
 const agentsGuard = createSeqGuard();
+
+export class SessionAdmissionError extends Error {
+  constructor(
+    message: string,
+    readonly restoreSessionId: string,
+  ) {
+    super(message);
+    this.name = "SessionAdmissionError";
+  }
+}
+
+function intentChanged(revision: number): boolean {
+  return revision !== sessionIntentRevision;
+}
+
+/** 长 RPC 完成前验证用户仍停留在发起动作时的会话意图。 */
+export function captureSessionIntent(): number {
+  return sessionIntentRevision;
+}
+
+export function isSessionIntentCurrent(revision: number, sessionId: string): boolean {
+  return (
+    revision === sessionIntentRevision &&
+    activeSessionId() === sessionId &&
+    desiredSessionId === sessionId
+  );
+}
 
 /** 当前选中是否为主会话。 */
 export function isMainFocus(): boolean {
@@ -117,12 +155,23 @@ const ensureInflight = createInFlight();
 /** 草稿态首条消息：先落库成会话再激活。返回活跃会话 id。 */
 export async function ensureActiveSession(): Promise<string> {
   const existing = activeSessionId();
+  const originRevision = sessionIntentRevision;
+  if (desiredSessionId !== existing) {
+    throw new SessionAdmissionError("会话正在切换，消息未发送", existing);
+  }
   if (existing) {
     // 草稿模型写失败后选择已归属到这个 session；重试发送前必须先补写，仍失败就继续阻断发送。
-    await applyDraftModel(existing, false);
+    try {
+      await applyDraftModel(existing, false);
+    } catch (error) {
+      throw new SessionAdmissionError(formatError(error), existing);
+    }
+    if (intentChanged(originRevision) || activeSessionId() !== existing) {
+      throw new SessionAdmissionError("会话已切换，消息未发送", existing);
+    }
     return existing;
   }
-  return ensureInflight("create", async () => {
+  return ensureInflight(`create:${originRevision}`, async () => {
     const created = await sessionCreate();
     let modelError: unknown;
     try {
@@ -131,28 +180,41 @@ export async function ensureActiveSession(): Promise<string> {
       modelError = error;
     }
     await refreshSessions();
+    if (intentChanged(originRevision) || activeSessionId() !== "") {
+      throw new SessionAdmissionError("会话已切换，新建会话未自动激活", "");
+    }
     // 先迁移草稿键再激活：激活触发的 composer 恢复要读到迁移后的内容
     migrateNewDraft(created.id);
     await switchSession(created.id);
-    if (modelError) throw modelError;
+    if (activeSessionId() !== created.id) {
+      throw new SessionAdmissionError("会话已切换，新建会话未自动激活", "");
+    }
+    if (modelError) throw new SessionAdmissionError(formatError(modelError), created.id);
     return created.id;
   });
 }
 
-let desiredSessionId = "";
 let activationTail: Promise<void> = Promise.resolve();
 
 export async function switchSession(id: string): Promise<void> {
   if (!activeSessionId()) resetDraftModel();
+  const intent = ++sessionIntentRevision;
   desiredSessionId = id;
   const activation = activationTail.then(async () => {
     await client.rpc("session.activate", { id });
   });
   activationTail = activation.catch(() => {});
-  await activation;
+  try {
+    await activation;
+  } catch (error) {
+    if (desiredSessionId === id && intent === sessionIntentRevision) {
+      desiredSessionId = activeSessionId();
+    }
+    throw error;
+  }
   // 快速连续切换按调用顺序提交给后端，只让最后一次意图更新前端。
-  if (desiredSessionId !== id) return;
-  setActiveSessionId(id);
+  if (desiredSessionId !== id || intent !== sessionIntentRevision) return;
+  setActiveSessionIdValue(id);
   setActiveAgentFocus("");
   // 先清旧名单再立即拉目标会话：等 3s 轮询会把上一会话的 agent 卡在新界面
   setAgents([]);
@@ -163,20 +225,32 @@ export async function switchSession(id: string): Promise<void> {
 /** 删除会话并善后（SessionTree 行删除与 Cmd+W 共用）：错误上抛由调用方提示；
  *  删的是活跃会话则切同目录下一条，同目录无则切列表首条，全无回草稿态——activeSessionId 不得悬死。 */
 export async function deleteSession(id: string, distill = false): Promise<{ warning?: string }> {
-  const wasActive = activeSessionId() === id;
+  // 删除一个仍在激活队列中的目标时，删除意图优先，先让迟到的 activate 结果失效。
+  if (desiredSessionId === id && activeSessionId() !== id) {
+    sessionIntentRevision++;
+    desiredSessionId = activeSessionId();
+  }
+  const deleteIntent = sessionIntentRevision;
   const dir = sessions().find((s) => s.id === id)?.directory;
   if (distill) await sessionDelete(id, true);
   else await sessionDelete(id);
+  clearComposerRestore(id);
+  clearDraft(id);
+  clearSessionMessageEditDrafts(id);
   // 删除已经提交后，后续刷新/切换失败不能把 UI 留在死 id，也不能再对用户谎称“删除失败”。
   setSessions((current) => current.filter((session) => session.id !== id));
-  if (wasActive) setActiveSessionId("");
+  const removedCurrent = activeSessionId() === id;
+  if (removedCurrent) setActiveSessionIdValue("");
   const warnings: string[] = [];
   try {
     await refreshSessions();
   } catch (error) {
     warnings.push(`会话列表刷新失败：${formatError(error)}`);
   }
-  if (!wasActive) return warnings[0] ? { warning: warnings[0] } : {};
+  // session.list 也可能很慢，整个删除善后期间的任意新导航都优先于自动替代项。
+  if (!removedCurrent || sessionIntentRevision !== deleteIntent || desiredSessionId !== id) {
+    return warnings[0] ? { warning: warnings[0] } : {};
+  }
   const next = sessions().find((s) => s.directory === dir) ?? sessions()[0];
   if (next) {
     try {

@@ -7,6 +7,7 @@ import type { JSX } from "solid-js";
 const h = vi.hoisted(() => ({
   cfg: vi.fn(async () => ({ roles: {}, send_when_running: "queue" }) as unknown),
   rpc: vi.fn((_method: string, _params?: unknown) => Promise.resolve({}) as Promise<unknown>),
+  resync: new Set<() => void>(),
 }));
 
 vi.mock("../lib/chat", async (importOriginal) => {
@@ -14,7 +15,15 @@ vi.mock("../lib/chat", async (importOriginal) => {
   return { ...orig, configGet: h.cfg };
 });
 
-vi.mock("../lib/client", () => ({ client: { rpc: h.rpc } }));
+vi.mock("../lib/client", () => ({
+  client: {
+    rpc: h.rpc,
+    onResync: (cb: () => void) => {
+      h.resync.add(cb);
+      return () => h.resync.delete(cb);
+    },
+  },
+}));
 
 // <A> 依赖 Router 上下文：测试无路由装配，桩成普通锚
 vi.mock("@solidjs/router", () => ({
@@ -43,6 +52,7 @@ beforeEach(() => {
   h.cfg.mockResolvedValue({ roles: {}, send_when_running: "queue" });
   h.rpc.mockReset();
   h.rpc.mockResolvedValue({});
+  h.resync.clear();
 });
 
 afterEach(() => {
@@ -95,6 +105,21 @@ describe("Settings 运行中发送", () => {
     await vi.waitFor(() => expect(btnByText("打断").className).toContain("border-[var(--accent)]"));
     expect(flash.msgs().some((m) => m.kind === "err")).toBe(false);
     dispose();
+  });
+
+  it("断线 resync 重拉 config/doctor 概览，卸载后退订", async () => {
+    const doctorCalls = () => h.rpc.mock.calls.filter(([method]) => method === "doctor").length;
+    const dispose = render(() => <Settings />, document.body);
+    await vi.waitFor(() => expect(h.cfg).toHaveBeenCalledTimes(1));
+    expect(doctorCalls()).toBe(1);
+    expect(h.resync.size).toBe(1);
+
+    h.resync.forEach((cb) => cb());
+    await vi.waitFor(() => expect(h.cfg).toHaveBeenCalledTimes(2));
+    expect(doctorCalls()).toBe(2);
+
+    dispose();
+    expect(h.resync.size).toBe(0);
   });
 });
 
@@ -224,7 +249,7 @@ describe("Settings 实验能力与诊断导出", () => {
     dispose();
   });
 
-  it("展示实际蒸馏模型，启用实验能力并成功导出诊断", async () => {
+  it("展示逐 Session Workspace 路由边界，启用实验能力并成功导出诊断", async () => {
     h.cfg.mockResolvedValue({
       roles: {},
       send_when_running: "interrupt",
@@ -236,9 +261,6 @@ describe("Settings 实验能力与诊断导出", () => {
     });
     h.rpc.mockImplementation((method: string) => {
       if (method === "doctor") return Promise.resolve({ entries: [], system: null });
-      if (method === "current_model") {
-        return Promise.resolve({ provider: "xai", model: "grok-4" });
-      }
       if (method === "diagnostics.export") {
         return Promise.resolve({ path: "/tmp/kxen-diagnostics.md" });
       }
@@ -246,7 +268,16 @@ describe("Settings 实验能力与诊断导出", () => {
     });
     const dispose = render(() => <Settings />, document.body);
     btnByText("高级").click();
-    await vi.waitFor(() => expect(document.body.textContent).toContain("发送给 xai/grok-4"));
+    // hint 文案是静态的，必须等配置读回（toggle 解禁）后再点，否则点击被 disabled 吞掉
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("按各 Session 所属 Workspace 的模型路由");
+      const disabledToggles = [...document.body.querySelectorAll("button")].filter(
+        (button) => button.textContent === "已关闭",
+      );
+      expect(disabledToggles).toHaveLength(3);
+      expect(disabledToggles.every((button) => !button.disabled)).toBe(true);
+    });
+    expect(h.rpc.mock.calls.some(([method]) => method === "current_model")).toBe(false);
     const toggles = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
       (button) => button.textContent === "已关闭",
     );

@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   transcript: vi.fn<(sid: string, name: string) => Promise<TranscriptEntry[]>>(),
   message: vi.fn<(sid: string, name: string, text: string) => Promise<void>>(),
   topicCalls: [] as string[][],
+  topicHandler: null as null | ((topic: string, payload: unknown) => void),
 }));
 vi.mock("../lib/team", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../lib/team")>();
@@ -21,9 +22,12 @@ vi.mock("../lib/chat", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../lib/chat")>();
   return {
     ...orig,
-    onTopic: (topics: string[]) => {
+    onTopic: (topics: string[], handler: (topic: string, payload: unknown) => void) => {
       mocks.topicCalls.push(topics);
-      return () => {};
+      mocks.topicHandler = handler;
+      return () => {
+        if (mocks.topicHandler === handler) mocks.topicHandler = null;
+      };
     },
   };
 });
@@ -70,6 +74,7 @@ beforeEach(() => {
   mocks.transcript.mockReset();
   mocks.message.mockReset();
   mocks.topicCalls.length = 0;
+  mocks.topicHandler = null;
   setActiveSessionId("s1");
 });
 
@@ -173,6 +178,37 @@ describe("AgentFocusView", () => {
     dispose();
   });
 
+  it("初始快照在飞时的 live delta 不丢历史，也不被旧响应覆盖", async () => {
+    setAgents([run("w", "working")]);
+    const first = deferred<TranscriptEntry[]>();
+    const reconciled = deferred<TranscriptEntry[]>();
+    mocks.transcript.mockReturnValueOnce(first.promise).mockReturnValueOnce(reconciled.promise);
+    const { dispose, body } = mount("w");
+    await tick();
+    mocks.topicHandler?.("llm.delta", {
+      kind: "text",
+      text: "live 新片段",
+      agent: "w",
+      session_id: "s1",
+    });
+    expect(body()).toContain("live 新片段");
+
+    first.resolve([{ kind: "text", text: "旧响应中的历史" }]);
+    await tick();
+    expect(mocks.transcript).toHaveBeenCalledTimes(2);
+    expect(body()).toContain("live 新片段");
+    expect(body()).not.toContain("旧响应中的历史");
+
+    reconciled.resolve([
+      { kind: "text", text: "完整历史。" },
+      { kind: "text", text: "live 新片段" },
+    ]);
+    await tick();
+    expect(body()).toContain("完整历史。");
+    expect(body()).toContain("live 新片段");
+    dispose();
+  });
+
   it("初始加载：连续同 kind delta 合并渲染（转录按 delta 逐条落库，不合并会逐词竖排）", async () => {
     setAgents([run("w", "working")]);
     mocks.transcript.mockResolvedValue([
@@ -222,6 +258,58 @@ describe("AgentFocusView", () => {
     await tick();
     expect(body()).toContain("recovered");
     expect(body()).not.toContain("刷新失败");
+    dispose();
+  });
+
+  it("本地 echo 不被在飞旧 transcript 覆盖", async () => {
+    setAgents([run("w", "working")]);
+    const stale = deferred<TranscriptEntry[]>();
+    const reconciled = deferred<TranscriptEntry[]>();
+    mocks.transcript.mockReturnValueOnce(stale.promise).mockReturnValueOnce(reconciled.promise);
+    mocks.message.mockResolvedValue();
+    const { dispose, input, body } = mount("w");
+    await tick();
+    type(input()!, "新的指令");
+    enter(input()!);
+    await tick();
+    expect(body()).toContain("[user] 新的指令");
+    stale.resolve([{ kind: "text", text: "旧快照" }]);
+    await tick();
+    expect(body()).toContain("[user] 新的指令");
+    expect(body()).not.toContain("旧快照");
+    reconciled.resolve([{ kind: "user", text: "[user] 新的指令" }]);
+    await tick();
+    expect(body()).toContain("[user] 新的指令");
+    dispose();
+  });
+
+  it("旧 agent 发送完成后不污染新 agent，失败草稿回到原 owner", async () => {
+    setAgents([run("a", "working"), run("b", "working")]);
+    mocks.transcript.mockResolvedValue([]);
+    const first = deferred<void>();
+    const second = deferred<void>();
+    mocks.message.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const { dispose, setName, input, body } = mount("a");
+    await tick();
+    type(input()!, "a 成功消息");
+    enter(input()!);
+    setName("b");
+    await tick();
+    first.resolve();
+    await tick();
+    expect(body()).not.toContain("[user] a 成功消息");
+    setName("a");
+    await tick();
+    type(input()!, "a 失败草稿");
+    enter(input()!);
+    setName("b");
+    await tick();
+    second.reject(new Error("offline"));
+    await tick();
+    expect(input()!.value).toBe("");
+    setName("a");
+    await tick();
+    expect(input()!.value).toBe("a 失败草稿");
     dispose();
   });
 });

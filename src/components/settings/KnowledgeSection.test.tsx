@@ -1,9 +1,16 @@
 import { render } from "solid-js/web";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KnowledgeEntry } from "../../lib/knowledge";
+import type { BlockedConsolidationAttempt, KnowledgeEntry } from "../../lib/knowledge";
 
 const h = vi.hoisted(() => ({
+  acknowledge: vi.fn(async () => ({
+    session_id: "ses_blocked",
+    checkpointed_revision: 4,
+    usage_unknown_recorded: true,
+    diagnostics: [],
+  })),
   add: vi.fn(async () => {}),
+  blocked: vi.fn(async () => [] as BlockedConsolidationAttempt[]),
   list: vi.fn(async () => [] as KnowledgeEntry[]),
   move: vi.fn(async () => {}),
   preview: vi.fn(async () => ({ block: "injected knowledge" })),
@@ -15,7 +22,9 @@ vi.mock("../../lib/knowledge", async (importOriginal) => {
   const original = await importOriginal<typeof import("../../lib/knowledge")>();
   return {
     ...original,
+    knowledgeAcknowledgeUnknown: h.acknowledge,
     knowledgeAdd: h.add,
+    knowledgeConsolidationBlocked: h.blocked,
     knowledgeInjectionPreview: h.preview,
     knowledgeList: h.list,
     knowledgeMove: h.move,
@@ -70,6 +79,15 @@ function buttonByText(text: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  h.acknowledge.mockReset();
+  h.acknowledge.mockResolvedValue({
+    session_id: "ses_blocked",
+    checkpointed_revision: 4,
+    usage_unknown_recorded: true,
+    diagnostics: [],
+  });
+  h.blocked.mockReset();
+  h.blocked.mockResolvedValue([]);
   h.list.mockReset();
   h.list.mockResolvedValue(entries);
   h.preview.mockReset();
@@ -209,6 +227,38 @@ describe("KnowledgeSection 生命周期", () => {
     document.body.querySelector<HTMLButtonElement>("button[title='停用（注入即刻跳过）']")?.click();
     await vi.waitFor(() => expect(document.body.textContent).toContain("refresh failed"));
     expect(document.body.textContent).toContain("共享规则");
+    dispose();
+  });
+
+  it("blocked attempt 需要二次确认，失败时保持可恢复状态", async () => {
+    h.blocked.mockResolvedValue([
+      {
+        session_id: "ses_blocked",
+        status: "provider_result_unknown",
+        reason: "Provider 结果未 durable 落盘",
+        message_revision: 4,
+        usage_unknown: true,
+        metering_settled: false,
+      },
+    ]);
+    h.acknowledge.mockRejectedValueOnce(new Error("checkpoint failed"));
+    const dispose = render(() => <KnowledgeSection />, document.body);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("自动沉淀待确认"));
+
+    buttonByText("处理 UNKNOWN").click();
+    expect(h.acknowledge).not.toHaveBeenCalled();
+    buttonByText("确认 UNKNOWN 并跳过快照").click();
+    await vi.waitFor(() => expect(h.acknowledge).toHaveBeenCalledWith("ses_blocked"));
+    await vi.waitFor(() => expect(document.body.textContent).toContain("ses_blocked"));
+    expect(flash.msgs().some((message) => message.text.includes("attempt 已保留"))).toBe(true);
+
+    // 失败后的重新对账在飞时按钮处于 busy 禁用态，等解禁后再发起第二次确认
+    await vi.waitFor(() => expect(buttonByText("确认 UNKNOWN 并跳过快照").disabled).toBe(false));
+    buttonByText("确认 UNKNOWN 并跳过快照").click();
+    await vi.waitFor(() => expect(h.acknowledge).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(flash.msgs().some((message) => message.text.includes("只有新消息 cursor"))).toBe(true),
+    );
     dispose();
   });
 });

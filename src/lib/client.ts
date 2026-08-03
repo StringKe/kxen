@@ -9,6 +9,7 @@ import {
 } from "./client-types";
 import { rpcTimeoutMs } from "./client-timeouts";
 import { getEndpoint, resetEndpoint } from "./client-endpoint";
+import type { ActiveConnection, Pending, Subscription } from "./client-state";
 import { createSubChunkHandler, restoreSubscriptions } from "./client-subscriptions";
 
 export { RpcError, TopicStream } from "./client-types";
@@ -21,32 +22,6 @@ const RESYNC_STREAM_ID = "sys.resync";
 const RECONNECT_DELAY_MS = 1_000;
 const SUBSCRIPTION_RETRY_MAX_MS = 30_000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-
-interface ActiveConnection {
-  ws: WebSocket;
-  generation: number;
-  heartbeat: ReturnType<typeof setInterval> | null;
-  heartbeatPending: boolean;
-  removeListener: () => void;
-}
-
-interface Pending {
-  connection: ActiveConnection;
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-interface Subscription {
-  localId: string;
-  topics: string[];
-  handler: (chunk: StreamChunk) => void;
-  remoteId?: string;
-  remoteGeneration?: number;
-  opening?: { generation: number; promise: Promise<void> };
-  retryTimer?: ReturnType<typeof setTimeout>;
-  retryAttempt?: number;
-}
 
 let active: ActiveConnection | null = null;
 let connecting: Promise<ActiveConnection> | null = null;

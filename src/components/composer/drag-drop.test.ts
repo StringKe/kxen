@@ -1,6 +1,19 @@
 // 拖拽载荷分流：enter/over 悬停开、leave 关、drop 出路径；空 paths 的 drop 只复位 hover。
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { dragEffect, listenComposerDragDrop } from "./drag-drop";
+
+const webviewMock = vi.hoisted(() => ({
+  listen: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ onDragDropEvent: webviewMock.listen }),
+}));
+
+beforeEach(() => {
+  webviewMock.listen.mockReset();
+  webviewMock.listen.mockResolvedValue(() => {});
+});
 
 describe("dragEffect", () => {
   it("enter/over 开悬停高亮", () => {
@@ -30,12 +43,30 @@ describe("dragEffect", () => {
 });
 
 describe("listenComposerDragDrop", () => {
-  it("非 tauri 运行时（无 __TAURI_INTERNALS__.metadata）不炸，返回可调的注销函数", () => {
+  it("注册失败不炸，返回可调的注销函数", () => {
     const un = listenComposerDragDrop(
       () => {},
       () => {},
     );
     expect(typeof un).toBe("function");
     expect(() => un()).not.toThrow();
+  });
+
+  it("注册 Promise 落定前 cleanup：迟到的 unlisten 立即执行", async () => {
+    let resolveListen!: (unlisten: () => void) => void;
+    webviewMock.listen.mockReturnValue(
+      new Promise((resolve) => {
+        resolveListen = resolve;
+      }),
+    );
+    const lateUnlisten = vi.fn();
+    const cleanup = listenComposerDragDrop(
+      () => {},
+      () => {},
+    );
+
+    cleanup();
+    resolveListen(lateUnlisten);
+    await vi.waitFor(() => expect(lateUnlisten).toHaveBeenCalledOnce());
   });
 });

@@ -36,6 +36,7 @@ export function listenComposerDragDrop(
   onDrop: (paths: string[]) => void,
 ): () => void {
   let unlisten: (() => void) | undefined;
+  let cleaned = false;
   try {
     void getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -46,10 +47,17 @@ export function listenComposerDragDrop(
           onDrop(eff.paths);
         }
       })
-      .then((un) => (unlisten = un))
+      .then((un) => {
+        if (cleaned) un();
+        else unlisten = un;
+      })
       .catch((e: unknown) => console.warn("drag-drop listener unavailable:", e));
   } catch {
     // 非 tauri 运行时（vitest 桩无 __TAURI_INTERNALS__.metadata）：注册即抛，拖拽不可用属预期
   }
-  return () => unlisten?.();
+  return () => {
+    cleaned = true;
+    unlisten?.();
+    unlisten = undefined;
+  };
 }

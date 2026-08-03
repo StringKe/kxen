@@ -88,6 +88,45 @@ describe("toItems 落盘审批决定（Part approval）", () => {
 });
 
 describe("toItems 完整消息还原", () => {
+  it("恢复 typed context sources；旧 Context 快照明确标记不可恢复", () => {
+    const typed: StoredMessage = {
+      id: "typed",
+      session_id: "s1",
+      role: "user",
+      created_at: 0,
+      parts: [
+        { type: "text", text: "带引用" },
+        {
+          type: "context_sources",
+          items: [
+            { type: "file", path: "src/main.ts" },
+            { type: "web", url: "https://example.com/docs" },
+          ],
+        },
+        { type: "context", text: "<expanded>snapshot</expanded>" },
+      ],
+    };
+    const legacy: StoredMessage = {
+      id: "legacy",
+      session_id: "s1",
+      role: "user",
+      created_at: 1,
+      parts: [
+        { type: "text", text: "旧引用" },
+        { type: "context", text: "<expanded>legacy</expanded>" },
+      ],
+    };
+
+    const [restored, old] = toItems([typed, legacy]) as MsgItem[];
+    expect(restored?.context).toEqual([
+      { type: "file", path: "src/main.ts" },
+      { type: "web", url: "https://example.com/docs" },
+    ]);
+    expect(restored?.contextUnavailable).toBe(false);
+    expect(old?.context).toBeUndefined();
+    expect(old?.contextUnavailable).toBe(true);
+  });
+
   it("相邻 Assistant 消息不合并，并各自保留实际模型", () => {
     const messages: StoredMessage[] = [
       {

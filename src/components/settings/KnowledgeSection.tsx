@@ -2,6 +2,7 @@ import { createSignal, For, onMount, Show } from "solid-js";
 import { ChevronDown, ChevronRight, Eye, Trash2 } from "lucide-solid";
 import EmptyLine from "../EmptyLine";
 import CodingRulesBlock from "./CodingRulesBlock";
+import KnowledgeBlockedPanel from "./KnowledgeBlockedPanel";
 import {
   knowledgeAdd,
   knowledgeInjectionPreview,
@@ -40,7 +41,6 @@ const KIND_ORDER: KnowledgeKind[] = [
   "history",
 ];
 const NOTE_TYPES = ["correction", "convention", "pitfall", "preference", "note"];
-
 export default function KnowledgeSection() {
   const [entries, setEntries] = createSignal<KnowledgeEntry[]>([]);
   const [preview, setPreview] = createSignal<string | null>(null);
@@ -118,7 +118,6 @@ export default function KnowledgeSection() {
     await reload();
     flashOk(`已晋升到 ${to === "project" ? "项目" : "个人"}`);
   };
-
   const remove = async (e: KnowledgeEntry) => {
     try {
       await knowledgeRemove(e.scope, e.slug);
@@ -147,6 +146,7 @@ export default function KnowledgeSection() {
   return (
     <>
       <CodingRulesBlock />
+      <KnowledgeBlockedPanel />
 
       <Show when={listErr()}>
         <div class="text-xs text-[var(--err)]">

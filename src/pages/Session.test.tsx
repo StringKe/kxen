@@ -41,6 +41,7 @@ vi.mock("../lib/chat", async (importOriginal) => {
 
 // Composer（语音/命令 RPC）与 AssistantItem（shiki）与本测试无关，桩掉保持用例聚焦
 vi.mock("../components/composer/TextComposer", () => ({ default: () => null }));
+vi.mock("../components/StorageRecoveryPanel", () => ({ default: () => null }));
 vi.mock("../components/AssistantItem", () => ({ default: () => null }));
 
 import Session from "./Session";

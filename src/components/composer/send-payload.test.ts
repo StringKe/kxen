@@ -7,6 +7,18 @@ function chip(kind: RowChip["kind"], ref: string): RowChip {
 }
 
 describe("buildSendParts", () => {
+  it("保留编辑重发恢复出的原始 note context", () => {
+    const note: RowChip = {
+      id: "note-1",
+      kind: "note",
+      ref: "原始上下文注记",
+      label: "上下文注记",
+    };
+    expect(buildSendParts([note], new Map()).context).toEqual([
+      { type: "note", text: "原始上下文注记" },
+    ]);
+  });
+
   it("maps every non-image chip kind to its transport context", () => {
     const result = buildSendParts(
       [
@@ -29,7 +41,6 @@ describe("buildSendParts", () => {
       { type: "docs", url: "https://example.test/docs" },
       { type: "dir", path: "/repo/src" },
       { type: "file", path: "/repo/README.md" },
-      { type: "file", path: "failed.txt" },
     ]);
     expect(result.imageParts).toEqual([]);
   });

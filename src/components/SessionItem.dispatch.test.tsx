@@ -22,7 +22,7 @@ vi.mock("./AssistantItem", () => ({
 vi.mock("./UserItem", () => ({
   default: (props: {
     onFork: () => void;
-    onEditResend: (text: string) => void;
+    onEditResend: (text: string) => Promise<boolean>;
     onRewind: () => void;
     onRetry: () => void;
     onImageLoad: () => void;
@@ -56,7 +56,7 @@ describe("SessionItem 分派", () => {
   it("分派 tool、approval、phase、compacted、user 和 assistant", () => {
     const callbacks = {
       onForkId: vi.fn(),
-      onEditResend: vi.fn(),
+      onEditResend: vi.fn(async () => true),
       onRewindId: vi.fn(),
       onRetryItem: vi.fn(),
       onRerun: vi.fn(),
@@ -65,8 +65,10 @@ describe("SessionItem 分派", () => {
       onRespondApproval: vi.fn(async () => {}),
     };
     const common = {
+      sessionId: () => "s1",
       streaming: () => false,
       live: () => true,
+      retrying: () => false,
       ...callbacks,
     };
     const items: Item[] = [

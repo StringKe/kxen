@@ -65,6 +65,9 @@ export function createConverge(deps: {
       });
   };
 
+  /** 后续 live 帧已经写入：作废仍在飞的旧快照，不得回头覆盖新 run。 */
+  const invalidate = () => guard.next();
+
   /** 用户显式动作（abort/清空）作废窗口保留：消失是用户本意，不许被保留逻辑捞回成幽灵气泡。 */
   const resetHold = () => {
     guard.next();
@@ -85,5 +88,5 @@ export function createConverge(deps: {
     converge(sid); // 真源重载（乐观上屏的排队消息随快照撤下）
   };
 
-  return { converge, clearQueue, resetHold };
+  return { converge, clearQueue, resetHold, invalidate };
 }

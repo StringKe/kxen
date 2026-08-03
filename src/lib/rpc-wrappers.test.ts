@@ -22,6 +22,7 @@ vi.mock("./client", () => ({
 import * as chatOps from "./chat-ops";
 import * as knowledge from "./knowledge";
 import * as provider from "./provider";
+import * as recovery from "./recovery";
 
 beforeEach(() => {
   h.fail.clear();
@@ -144,11 +145,27 @@ describe("RPC wrappers", () => {
     await knowledge.knowledgeMove("personal", "slug", "project");
     await knowledge.knowledgeInjectionPreview();
     await knowledge.knowledgeInjectionPreview("s1");
+    await knowledge.knowledgeConsolidationBlocked();
+    await knowledge.knowledgeAcknowledgeUnknown("s1");
     await knowledge.codingRulesGet();
     await knowledge.codingRulesSet(true);
 
     expect(h.rpc).toHaveBeenCalledWith("knowledge.injection_preview", {});
     expect(h.rpc).toHaveBeenCalledWith("knowledge.injection_preview", { session_id: "s1" });
+    expect(h.rpc).toHaveBeenCalledWith("knowledge.consolidation_acknowledge_unknown", {
+      session_id: "s1",
+      confirm_unknown: true,
+    });
     expect(h.rpc).toHaveBeenCalledWith("coding_rules.set", { enabled: true });
+  });
+
+  it("storage recovery wrappers 使用稳定 session identity", async () => {
+    await recovery.inspectStorageRecovery("s1");
+    await recovery.repairStorageRecovery("s1");
+    await recovery.clearStorageRecoveryBlock("s1");
+
+    expect(h.rpc).toHaveBeenCalledWith("recovery.inspect", { session_id: "s1" });
+    expect(h.rpc).toHaveBeenCalledWith("recovery.repair", { session_id: "s1" });
+    expect(h.rpc).toHaveBeenCalledWith("recovery.clear", { session_id: "s1" });
   });
 });

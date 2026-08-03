@@ -103,7 +103,7 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
-function mount(onSend: (text: string) => void = () => {}) {
+function mount(onSend: (text: string) => boolean | void | Promise<boolean | void> = () => {}) {
   const [tick, setTick] = createSignal(0);
   const dispose = render(
     () => (
@@ -122,7 +122,7 @@ function mount(onSend: (text: string) => void = () => {}) {
 describe("TextComposer (webkit)", () => {
   it("原生键入上字 + Enter 发送", async () => {
     let sent = "";
-    const { dispose, ta } = mount((t) => (sent = t));
+    const { dispose, ta } = mount((t) => void (sent = t));
     await new Promise((r) => setTimeout(r, 100));
     ta().focus();
     await userEvent.keyboard("hello composer");
@@ -135,7 +135,7 @@ describe("TextComposer (webkit)", () => {
 
   it("IME 提交 Enter 不发送（compositionend 后 50ms 锁窗）", async () => {
     let sent = "";
-    const { dispose, ta } = mount((t) => (sent = t));
+    const { dispose, ta } = mount((t) => void (sent = t));
     await new Promise((r) => setTimeout(r, 100));
     const el = ta();
     el.focus();
@@ -152,7 +152,7 @@ describe("TextComposer (webkit)", () => {
 
   it("大粘贴折叠为占位，发送时展开全文", async () => {
     let sent = "";
-    const { dispose, ta } = mount((t) => (sent = t));
+    const { dispose, ta } = mount((t) => void (sent = t));
     await new Promise((r) => setTimeout(r, 100));
     const el = ta();
     el.focus();
@@ -263,7 +263,7 @@ describe("TextComposer (webkit)", () => {
 
   it("录音中发送：等终稿并入后连发，终稿不倒灌已清空输入框", async () => {
     let sent = "";
-    const { dispose, ta } = mount((t) => (sent = t));
+    const { dispose, ta } = mount((t) => void (sent = t));
     await new Promise((r) => setTimeout(r, 100));
     const el = ta();
     el.focus();
@@ -293,7 +293,7 @@ describe("TextComposer (webkit)", () => {
 
   it("快速 Enter（空格按住不足 400ms）发送：未决激活计时作废，不莫名开录", async () => {
     let sent = "";
-    const { dispose, ta } = mount((t) => (sent = t));
+    const { dispose, ta } = mount((t) => void (sent = t));
     await new Promise((r) => setTimeout(r, 100));
     const el = ta();
     el.focus();

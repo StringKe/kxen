@@ -214,7 +214,7 @@ export async function sessionUpdateMeta(
 }
 
 export interface StoredPart {
-  type: "text" | "context" | "tool_call" | "reasoning" | "image" | "approval";
+  type: "text" | "context" | "context_sources" | "tool_call" | "reasoning" | "image" | "approval";
   text?: string;
   name?: string;
   input?: unknown;
@@ -225,6 +225,7 @@ export interface StoredPart {
   command?: string; // approval 块：被审批的命令
   reason?: string; // approval 块：审批原因
   decision?: string; // approval 块：allow/deny/timeout/cancel
+  items?: ContextItem[]; // context_sources：可逆的原始 typed @ 引用
 }
 
 export interface StoredMessage {

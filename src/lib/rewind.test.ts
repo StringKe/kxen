@@ -309,4 +309,31 @@ describe("createSessionRewind 确认框上下文通道", () => {
     expect(rewindPendingInfo()).toBeNull();
     dispose();
   });
+
+  it("切会话时旧 rewind 仍在飞：迟到 dirty 不得重开旧会话确认条", async () => {
+    const [sid, setSid] = createSignal("s1");
+    let reject!: (error: unknown) => void;
+    const { r, dispose } = createRoot((d) => ({
+      r: createSessionRewind({
+        sessionId: sid,
+        onDone: () => {},
+        call: () =>
+          new Promise((_, fail) => {
+            reject = fail;
+          }),
+      }),
+      dispose: d,
+    }));
+    const request = r.flow.request("m-9");
+    expect(r.flow.busy()).toBe(true);
+    setSid("s2");
+    await new Promise((res) => setTimeout(res, 0));
+    expect(r.flow.busy()).toBe(false);
+    reject(DIRTY);
+    await request;
+    expect(r.pending()).toBeNull();
+    expect(rewindPendingInfo()).toBeNull();
+    expect(r.note()).toBe("");
+    dispose();
+  });
 });

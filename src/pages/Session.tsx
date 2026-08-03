@@ -1,5 +1,5 @@
-import { createEffect, createSignal, For, Show, onCleanup } from "solid-js";
-import { onLlmDelta, sessionAbort, sessionExport } from "../lib/chat";
+import { createEffect, createSignal, Show, onCleanup } from "solid-js";
+import { onLlmDelta, sessionAbort } from "../lib/chat";
 import type { ModelIdentity } from "../lib/chat";
 import { createConverge } from "../lib/converge";
 import { createDeltaBatcher } from "../lib/delta-batch";
@@ -9,21 +9,21 @@ import { editResend as editResendImpl, forkAt, rerun as rerunImpl } from "../lib
 import { createSendFlow } from "../lib/send";
 import { createSessionRewind } from "../lib/rewind";
 import { createStreamingReconcile } from "../lib/streaming-reconcile";
-import SessionItem from "../components/SessionItem";
 import PendingQueue from "../components/PendingQueue";
 import RewindConfirm from "../components/RewindConfirm";
 import { activeSessionId, sessions, setHasConversation } from "../lib/state";
 import type { OrbState } from "../lib/orb";
-import EmptyHero from "../components/EmptyHero";
-import AgentRunCards from "../components/AgentRunCards";
 import Composer from "../components/composer/TextComposer";
 import SessionHeader from "../components/SessionHeader";
-import { ArrowDown } from "lucide-solid";
+import StorageRecoveryPanel from "../components/StorageRecoveryPanel";
 import type { Item } from "../lib/items";
 import { formatError } from "../lib/error-text";
 import { createAutoScroll } from "../lib/auto-scroll";
 import { flashErr } from "../lib/flash";
 import { createSessionLoader, mountDraftWorkdir } from "../lib/session-loader";
+import { restoreFailedEdit } from "../components/composer/edit-restore";
+import { createSessionExport } from "../lib/session-export";
+import SessionTimeline from "../components/SessionTimeline";
 
 export default function Session() {
   const [items, setItems] = createSignal<Item[]>([]);
@@ -31,6 +31,7 @@ export default function Session() {
   const [orbPhase, setOrbPhase] = createSignal<OrbState>("thinking");
   const [focusTick, setFocusTick] = createSignal(0);
   const [draftWorkdir, setDraftWorkdir] = createSignal("");
+  const [storageBlocked, setStorageBlocked] = createSignal(false);
   let listRef: HTMLDivElement | undefined;
   let liveModel: ModelIdentity | undefined;
   // null 哨兵 = 组件首跑强制重载时间线；仅 ""（草稿->激活首发）跳过保住乐观上屏
@@ -51,8 +52,44 @@ export default function Session() {
   // 有对话内容才驱动右 dock 滑入
   createEffect(() => setHasConversation(items().length > 0));
 
-  const { loadErr, timelineLoading, loadQueue, loadTimeline, retryLoad, resetLoad } =
-    createSessionLoader({ activeSessionId, setItems, setPendingQueue, scroll });
+  const {
+    loadErr,
+    timelineLoading,
+    loadQueue,
+    loadTimeline,
+    retryLoad,
+    resetLoad,
+    invalidateTimeline,
+    invalidateQueue,
+    reloadAll,
+  } = createSessionLoader({ activeSessionId, items, setItems, setPendingQueue, scroll });
+  // loader 是 queue 的唯一例外写入者；其他真源/本地写入都先作废在飞的旧 loader snapshot。
+  const setExternalPendingQueue: typeof setPendingQueue = (next) => {
+    invalidateQueue();
+    return setPendingQueue(next);
+  };
+  /** Done 对账（实现见 lib/converge.ts）：快照权威 + 队列真源。 */
+  const {
+    converge,
+    clearQueue,
+    resetHold,
+    invalidate: invalidateConverge,
+  } = createConverge({
+    setItems,
+    setPendingQueue: setExternalPendingQueue,
+    scroll: () => scroll(),
+  });
+  const invalidateSnapshots = () => {
+    invalidateTimeline(true);
+    invalidateConverge();
+  };
+  const recoverLoadedSession = () => {
+    const sid = activeSessionId();
+    if (!sid) return;
+    invalidateConverge();
+    resetHold();
+    reloadAll(sid);
+  };
 
   // 待刷新 delta 必须绑定收到它时的 session + 实际模型。定时器触发时
   // 再读 activeSessionId/liveModel 会把旧会话文本写进新会话，或把旧模型文本重标为新模型。
@@ -77,6 +114,7 @@ export default function Session() {
   const appendAssistant = (field: "content" | "reasoning", text: string) => {
     const sid = activeSessionId();
     if (!sid) return;
+    invalidateSnapshots();
     if (batchSid && batchSid !== sid) discardPendingDelta();
     if (batchSid === sid && !sameModel(batchModel, liveModel)) batcher.flushNow();
     batchSid = sid;
@@ -115,12 +153,6 @@ export default function Session() {
     loadTimeline(id);
   });
 
-  /** Done 对账（实现见 lib/converge.ts）：快照权威 + 队列真源。 */
-  const { converge, clearQueue, resetHold } = createConverge({
-    setItems,
-    setPendingQueue,
-    scroll: () => scroll(),
-  });
   // streaming 收放按运行真源对账（lib/streaming-reconcile.ts）：done/存亡广播/resync 只是扳机
   const { reconcile, mountSource } = createStreamingReconcile({
     activeSessionId,
@@ -140,6 +172,7 @@ export default function Session() {
       // Done 对账：存储快照为最终权威（含终态文本），stats/error 尾注重挂；
       // streaming 不当场清：终态先于续跑 spawn 发布，按真源核对（RPC 失败按 run 已终收回）
       const sid = activeSessionId();
+      invalidateTimeline();
       converge(sid, { stats, error });
       if (sid) reconcile(sid, "clear");
       batchSid = "";
@@ -148,6 +181,7 @@ export default function Session() {
     },
     (event) => {
       // 工具/审批/压缩事件立即上屏，必须先排空更早到达的延迟文本。
+      invalidateSnapshots();
       batcher.flushNow();
       applyStreamEvent(event, { setItems, setOrbPhase, scroll });
     },
@@ -157,6 +191,7 @@ export default function Session() {
       batcher.flushNow();
       const sid = activeSessionId();
       if (!sid) return;
+      invalidateTimeline();
       converge(sid);
       reconcile(sid, "keep");
     },
@@ -171,8 +206,14 @@ export default function Session() {
   });
 
   // 发送链路实现见 lib/send.ts（乐观上屏 + 失败态标记/点击重发）
-  const { send, retry: retrySend } = createSendFlow({
+  const {
+    send,
+    submit,
+    retry: retrySend,
+    retrying: retryingSend,
+  } = createSendFlow({
     streaming,
+    onLocalMutation: invalidateSnapshots,
     onStreamStart: (sid) => {
       discardPendingDelta();
       liveModel = undefined;
@@ -180,12 +221,14 @@ export default function Session() {
       setOrbPhase("thinking");
     },
     onStreamStop: (sid) => {
+      // 旧会话 RPC 的迟到失败不得清掉当前会话已经缓冲的 delta/model。
+      if (activeSessionId() !== sid || streamingSid() !== sid) return;
       discardPendingDelta();
       liveModel = undefined;
-      if (streamingSid() === sid) setStreamingSid("");
+      setStreamingSid("");
     },
     setItems,
-    setPendingQueue,
+    setPendingQueue: setExternalPendingQueue,
     scroll,
   });
   const stop = () => {
@@ -195,7 +238,7 @@ export default function Session() {
       .then(() => {
         if (activeSessionId() !== sid) return;
         resetHold(); // 后端确认 abort+清队列后，作废 pop 窗口保留，避免把已清消息捞回
-        setPendingQueue([]);
+        setExternalPendingQueue([]);
       })
       .catch((error: unknown) => flashErr(`停止失败：${formatError(error)}`));
   };
@@ -204,12 +247,8 @@ export default function Session() {
     await respondApprovalImpl(setItems, id, allow);
   };
 
-  const [exportNote, setExportNote] = createSignal("");
-  const doExport = async () => {
-    const r = await sessionExport(activeSessionId()).catch(() => null);
-    setExportNote(r ? `已导出 ${r.path}` : "导出失败");
-    setTimeout(() => setExportNote(""), 3000);
-  };
+  const sessionExportFlow = createSessionExport(activeSessionId);
+  onCleanup(sessionExportFlow.dispose);
 
   const rerun = (idx: number) => rerunImpl(send, items(), idx);
 
@@ -226,69 +265,33 @@ export default function Session() {
         workdir={workdir}
         streaming={streaming}
         orbPhase={orbPhase}
-        exportNote={exportNote}
+        exportNote={sessionExportFlow.note}
         canExport={() => activeSessionId() !== ""}
-        onExport={() => void doExport()}
+        onExport={() => void sessionExportFlow.run()}
       />
 
-      <div
-        ref={(el) => (listRef = el)}
-        class="flex-1 overflow-auto px-4 py-5"
+      <SessionTimeline
+        items={items}
+        sessionId={activeSessionId}
+        streaming={streaming}
+        pinned={pinned}
+        loadErr={loadErr}
+        timelineLoading={timelineLoading}
+        setListRef={(element) => (listRef = element)}
         onScroll={onListScroll}
-      >
-        <div class="w-full space-y-4">
-          <For each={items()}>
-            {(item, i) => (
-              <SessionItem
-                item={item}
-                streaming={streaming}
-                live={() => streaming() && i() === items().length - 1}
-                onForkId={(id) => void forkAt(id)}
-                onEditResend={(text) => void editResendImpl(send, items(), i(), text)}
-                onRewindId={(id) => void rewindAt(id)}
-                onRetryItem={(m) => void retrySend(m)}
-                onRerun={() => void rerun(i())}
-                onContinue={() => void send("继续", [], [])}
-                onImageLoad={() => scroll()}
-                onRespondApproval={respondApproval}
-              />
-            )}
-          </For>
-
-          {/* agent 状态卡钉在时间线尾部：空会话恢复 agent 现场时也在 EmptyHero 上方可见 */}
-          <AgentRunCards />
-
-          {/* 首载失败给错误条 + 重试（Workspaces 同模式），不与 EmptyHero 同形 */}
-          <Show when={loadErr()}>
-            <div class="rounded-lg border border-[var(--err)]/50 bg-[var(--err)]/5 p-6 flex items-center gap-3">
-              <span class="text-xs text-[var(--err)]">加载会话失败：{loadErr()}</span>
-              <button
-                class="pressable px-2 py-0.5 rounded border border-[var(--border)] text-xs text-[var(--text-dim)]"
-                onClick={retryLoad}
-              >
-                重试
-              </button>
-            </div>
-          </Show>
-
-          <Show when={timelineLoading() && items().length === 0 && !loadErr()}>
-            <div class="text-xs text-[var(--text-faint)]">加载会话中…</div>
-          </Show>
-
-          <Show when={items().length === 0 && !loadErr() && !timelineLoading()}>
-            <EmptyHero />
-          </Show>
-        </div>
-      </div>
-
-      <Show when={!pinned()}>
-        <button
-          class="pressable absolute left-1/2 -translate-x-1/2 bottom-24 z-20 px-2.5 py-1 rounded-full text-2xs border border-[var(--border)] bg-[var(--bg-raised)] text-[var(--text-dim)] composer-popup flex items-center gap-1"
-          onClick={() => scroll(true)}
-        >
-          <ArrowDown size={11} /> 回到底部
-        </button>
-      </Show>
+        scroll={scroll}
+        retryLoad={retryLoad}
+        onForkId={(id) => void forkAt(id)}
+        onEditResend={(index, text) =>
+          editResendImpl(send, items(), index, text, restoreFailedEdit)
+        }
+        onRewindId={rewindAt}
+        onRetryItem={(item) => void retrySend(item)}
+        isRetrying={retryingSend}
+        onRerun={(index) => void rerun(index)}
+        onContinue={() => void send("继续", [], [])}
+        onRespondApproval={respondApproval}
+      />
 
       <div class="px-3 pb-3 composer-fade">
         <div class="w-full">
@@ -309,10 +312,26 @@ export default function Session() {
               onCancel={() => rewind.flow.cancel()}
             />
           </Show>
-          <PendingQueue queue={pendingQueue} onClear={() => void clearQueue()} />
+          <StorageRecoveryPanel
+            sessionId={activeSessionId}
+            onBlockedChange={setStorageBlocked}
+            onRecovered={recoverLoadedSession}
+          />
+          <PendingQueue
+            queue={pendingQueue}
+            onClear={() => {
+              const sid = activeSessionId();
+              if (!sid) return;
+              invalidateQueue();
+              void clearQueue().finally(() => {
+                if (activeSessionId() === sid) loadQueue(sid);
+              });
+            }}
+          />
           <Composer
             streaming={streaming}
-            onSend={(t, c, i) => void send(t, c, i)}
+            disabled={storageBlocked}
+            onSend={submit}
             onStop={stop}
             focusTick={focusTick}
           />

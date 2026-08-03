@@ -98,6 +98,7 @@ export function createRewindFlow(deps: {
   const call = deps.call ?? sessionRewind;
   const [busy, setBusy] = createSignal(false);
   let pendingId: string | null = null;
+  let requestEpoch = 0;
   const setPending = (id: string | null, payload?: RewindErrorPayload) => {
     pendingId = id;
     deps.onPendingChange?.(id);
@@ -123,12 +124,15 @@ export function createRewindFlow(deps: {
     if (busy()) return;
     const sid = deps.sessionId();
     if (!sid) return;
+    const request = ++requestEpoch;
     setBusy(true);
     try {
       await call(sid, messageId, confirm);
+      if (request !== requestEpoch || deps.sessionId() !== sid) return;
       setPending(null);
       deps.onDone?.();
     } catch (err) {
+      if (request !== requestEpoch || deps.sessionId() !== sid) return;
       const payload = parseRewindError(err);
       if (payload?.code === "dirty" && !confirm) {
         setPending(messageId, payload);
@@ -137,7 +141,8 @@ export function createRewindFlow(deps: {
       setPending(null);
       deps.onError?.(rewindErrorText(err));
     } finally {
-      setBusy(false);
+      // cancel 后可能已有新 session 的请求在飞，旧请求不得收掉新请求的 busy。
+      if (request === requestEpoch) setBusy(false);
     }
   };
 
@@ -149,7 +154,11 @@ export function createRewindFlow(deps: {
       const id = pendingId;
       if (id) await run(id, true);
     },
-    cancel: () => setPending(null),
+    cancel: () => {
+      requestEpoch++;
+      setBusy(false);
+      setPending(null);
+    },
   };
 }
 

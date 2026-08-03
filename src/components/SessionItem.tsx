@@ -9,12 +9,14 @@ import type { Item, MsgItem } from "../lib/items";
 
 export default function SessionItem(props: {
   item: Item;
+  sessionId: Accessor<string>;
   streaming: Accessor<boolean>;
   live: Accessor<boolean>;
   onForkId: (messageId: string) => void;
-  onEditResend: (text: string) => void;
+  onEditResend: (text: string) => Promise<boolean>;
   onRewindId: (messageId: string) => void;
   onRetryItem: (item: MsgItem) => void;
+  retrying: Accessor<boolean>;
   onRerun: () => void;
   onContinue: () => void;
   onImageLoad: () => void;
@@ -64,11 +66,13 @@ export default function SessionItem(props: {
     return (
       <UserItem
         item={item}
+        sessionId={props.sessionId}
         // 无 messageId 的乐观消息不可分叉：菜单入口已禁用，此处兜底替代非空断言
         onFork={() => item.messageId && props.onForkId(item.messageId)}
         onEditResend={props.onEditResend}
         onRewind={() => props.onRewindId(item.messageId!)}
         onRetry={() => props.onRetryItem(item)}
+        retrying={props.retrying}
         onImageLoad={props.onImageLoad}
       />
     );

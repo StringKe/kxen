@@ -14,11 +14,14 @@ export interface MsgItem {
   messageId?: string | undefined;
   /** 通知类 user 消息的来源小标（[teammate x] / [task notification] 前缀，与后端落盘文本同口径） */
   source?: string | undefined;
-  /** 发送失败标记（仅内存不落盘）：消息未到达后端，存储快照本就没有这条，
-   *  刷新/对账后气泡随乐观上屏一起消失（重发入口随之消失，可接受） */
+  /** 后端明确返回失败时的内存气泡；连接级 UNKNOWN 会撤下气泡并恢复到原会话 Composer。 */
   sendError?: string | undefined;
+  /** unknown 表示连接在响应前中断，后端是否已接收不可判定，禁止一键盲重发。 */
+  sendOutcome?: "failed" | "unknown" | undefined;
   /** 乐观气泡携带的 @ 引用原件：发送失败重发时原样带回，引用不丢 */
   context?: ContextItem[] | undefined;
+  /** 旧 JSONL 只有展开快照，没有可逆 typed 引用；rerun/edit 必须阻断而非静默丢引用。 */
+  contextUnavailable?: boolean | undefined;
 }
 export interface ToolItem {
   kind: "tool";
@@ -93,6 +96,33 @@ export function toItems(messages: StoredMessage[]): Item[] {
         }
       } else if (p.type === "reasoning" && p.text && m.role === "assistant") {
         reasoning += p.text;
+      } else if (p.type === "context_sources" && p.items?.length && m.role === "user") {
+        const last = items.at(-1);
+        if (last?.kind === "msg" && last.role === "user" && last.messageId === m.id) {
+          items[items.length - 1] = {
+            ...last,
+            context: [...(last.context ?? []), ...p.items],
+            contextUnavailable: false,
+          };
+        } else {
+          items.push({
+            kind: "msg",
+            role: "user",
+            content: "",
+            context: p.items,
+            messageId: m.id,
+          });
+        }
+      } else if (p.type === "context" && m.role === "user") {
+        const last = items.at(-1);
+        if (
+          last?.kind === "msg" &&
+          last.role === "user" &&
+          last.messageId === m.id &&
+          !last.context?.length
+        ) {
+          items[items.length - 1] = { ...last, contextUnavailable: true };
+        }
       } else if (p.type === "image" && p.media_type && p.data !== undefined) {
         const img = { media_type: p.media_type, data: p.data };
         const last = items.at(-1);
