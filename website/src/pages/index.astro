@@ -2,9 +2,19 @@
 import BaseLayout from "../layouts/BaseLayout.astro";
 import Header from "../components/Header.astro";
 import { homeDescription, homeTitle } from "../lib/home-content";
+import { jsonLd } from "../lib/json-ld";
+
+const softwareApplicationLd = jsonLd({
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: "kxen",
+  operatingSystem: "macOS 14+",
+  applicationCategory: "DeveloperApplication",
+  description: homeDescription,
+});
 ---
 
-<BaseLayout title={homeTitle} description={homeDescription}>
+<BaseLayout title={homeTitle} description={homeDescription} head={[softwareApplicationLd]}>
   <div class="flex flex-col min-h-screen">
     <Header />
     <main class="flex-1 mx-auto max-w-5xl w-full px-6 py-16 sm:py-24">

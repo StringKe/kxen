@@ -23,11 +23,11 @@ Slash Command 只在消息行首触发。正文中间的 `/` 不会展开成 Com
 - `/ultraplan`
 - `/ultrareview`
 - `/doctor`
-- `/clear`
-- `/model`
-- `/abort`
+- `/compact`
 
-每个内置 Command 拥有自己的处理逻辑，不从知识目录读取模板正文。
+这些内置项不从知识目录读取模板正文。`/doctor` 和 `/compact` 由后端精确识别并执行；`/write-goal` 与三个 `/ultra*` 模式进入普通 Agent run，再按内置 system prompt playbook 编排，因此仍需要可用模型。
+
+`/compact` 立即尝试把当前 Session 的较旧模型上下文压缩为持久摘要，不删除原始 Session JSONL。新建 Session、切换模型和中断运行分别使用「新会话」动作、Model Picker 或 Command Palette 和 Composer Stop 按钮，它们不是 Slash Command。
 
 ## 自定义 Command
 

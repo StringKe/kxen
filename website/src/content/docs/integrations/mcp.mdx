@@ -8,6 +8,8 @@ sidebar:
 
 MCP 让 kxen 接入外部工具、资源和 Prompt。每个 server 拥有独立 transport、认证、工具策略和运行状态。
 
+连接完成后，kxen 会按 MCP `nextCursor` 拉取 `tools/list`、`resources/list` 和 `prompts/list` 的后续页面，并按工具名、资源 URI 和 Prompt 名称去重。为避免异常 server 无限返回，单类清单最多读取 100 页和 10,000 个条目；cursor 循环或后续页面失败时保留此前已经验证的目录，并在诊断日志中记录原因。
+
 ## Transport
 
 kxen 支持:
@@ -16,15 +18,15 @@ kxen 支持:
 - Streamable HTTP。
 - SSE。
 
-stdio server 由本机命令启动。远端 server 使用 URL，并可以附带固定 header 或 OAuth 配置。
+stdio server 由本机命令启动，工作目录固定为当前 Workspace。子进程不会继承完整应用环境：kxen 先执行 `env_clear`，只继承 `HOME`、`LANG`、`LC_ALL`、`LC_CTYPE`、`LOGNAME`、`PATH`、`SHELL`、`TMPDIR` 和 `USER`，再覆盖配置显式声明的 env。远端 server 使用 URL，并可以附带固定 header 或 OAuth 配置。配置的 Remote MCP URL 和 OAuth metadata override 必须使用 `https://`，且 URL 不能内嵌 username 或 password。OAuth discovery 得到的授权、换票和动态注册 endpoint 同样拒绝公共明文 HTTP；只有本机协议测试允许 loopback HTTP。Remote MCP 默认不宣告 `roots` capability，也不会把当前 Workspace 路径发给远端；远端即使未经声明发送 `roots/list`，也只会收到空清单。
 
-Streamable HTTP 和 SSE 属于 Remote MCP，默认关闭，只有用户在个人 Settings 中显式开启后才会加载。项目配置不能替用户开启。远端调用会把工具参数发送给对应 server；关闭开关后，当前 Workspace 的 MCP runtime 会立即重载并移除远端 server。
+Streamable HTTP 和 SSE 属于 Remote MCP，默认关闭，只有用户在个人 Settings 或 `config.toml` 中显式开启后才会加载。项目配置不能替用户开启。远端调用会把工具参数发送给对应 server；关闭开关后，当前 Workspace 的 MCP runtime 会立即重载并移除远端 server。重载和重启会关闭旧 transport，并唤醒旧连接上仍在等待的调用。
 
 ## Scope
 
 用户 MCP 对所有 Workspace 可见。项目 MCP 属于当前 Workspace，同名项目 server 覆盖用户 server。
 
-项目 MCP 只在 Workspace 已信任时启动。未信任项目不能通过 MCP 配置让本机执行仓库提供的命令。
+项目 MCP 只在 Workspace 已信任时加载。对项目 `stdio` server，Workspace 信任之外还必须独立批准完整 canonical absolute `command`、`args`、`cwd` 和 env。`PATH`、`NODE_OPTIONS`、`PYTHONPATH`、`RUBYOPT`、`PERL5OPT`、`LD_*`、`DYLD_*` 等可改变可执行文件或 runtime 加载路径的 env 直接拒绝。审批面显示普通 env 的值，敏感 env 只显示 key 和 SHA-256 摘要。没有审批通道或用户拒绝时 fail closed。批准只在当前进程内按完整配置指纹复用，command、args、cwd 或任一 env 值变化都会重新询问。同名项目 server 未获批准时，仍可回落到用户级 server。
 
 ## 工具策略
 
@@ -36,14 +38,26 @@ Streamable HTTP 和 SSE 属于 Remote MCP，默认关闭，只有用户在个人
 
 ask 会在调用前进入 Approval。deny 工具不会因为模型请求而执行。MCP 工具还要经过角色权限和通用 Safety。
 
+MCP 配置采用 fail-closed 加载。server key 必须是 1 至 32 字节的 ASCII `[A-Za-z0-9_-]`，且不得包含 `__`。文件不可读、JSON 损坏、server 定义非法或 `toolPolicies` 不是 `allow`、`ask`、`deny` 时，本次 reload 明确失败并保留当前 runtime；不会把错误解释为空配置，也不会把非法 policy 回落为默认 `allow`。Remote `tools/list` 还会逐项验证 provider-safe tool name、description 大小和受限 `inputSchema`；非法项记录诊断并单独跳过，不会污染同批其他工具。
+
+## 资源与 Prompt
+
+声明 Resources capability 的 server 会提供只读目录和读取工具。资源目录按 cursor 分页，每页默认 20 条、最多 100 条，因此超过首批 20 条的资源仍可发现和读取。二进制资源不会直接展开进模型上下文。
+
+声明 Prompts capability 的 server 会提供 Prompt 目录和 `prompts/get` 工具。目录保留每个 Prompt 的 arguments 定义和 required 标记；调用前会校验 Prompt 是否存在、必填参数是否齐全，以及参数值是否为字符串。`prompts/get` 的 result 以 JSON 返回给 Agent，与其他 MCP 工具一样受单条输出 50,000 字符上限约束。
+
 ## 产品入口
 
-Settings 的高级区域显示 MCP server 状态、工具和资源数量。用户可以发起远端交互授权、轮询授权结果和手动重启 server。
+Settings 的高级区域显示 MCP server 状态、工具和资源数量。首次打开会等待当前 Workspace 的 MCP runtime 完成初始加载，不把尚未加载的空状态误报为未配置；若项目 stdio 正等待批准，常驻审批面会同时显示请求。用户可以发起远端交互授权、轮询授权结果和手动重启 server。
 
 ## 凭证
 
-远端 token、OAuth secret 和固定敏感 header 不应提交到项目仓库。项目配置可以描述连接，但 Secret 保存在本地安全位置。启用 Remote MCP 前需要确认 server 的运营方、数据保留和访问范围。
+远端 token、OAuth refresh token、OAuth client secret 和固定敏感 header 不应提交到项目仓库。OAuth 数据保存在应用数据目录的 `mcp-oauth.json`，文件权限为 `0600`，更新使用 fsync 和 rename；它是权限受限的本地 JSON，不是 macOS Keychain。token 按配置 scope、server 名和精确 canonical resource endpoint 绑定：host 大小写和默认 port 会规范化，URL fragment 会忽略，path 或 query 变化则不会复用。因而同名项目 server 不会继承用户级 token，换 host、port、path 或 query 需要重新授权。旧版只按 server 名或只按 URL origin 保存的 token 因缺少这些身份证据而 fail closed，需要重新授权。项目配置可以描述连接，但显式拒绝 `oauth.clientSecret` 和 Authorization、Cookie、API key、token、secret、credential 类 header；这些 Secret 只能保存在用户侧认证存储或个人配置。启用 Remote MCP 前需要确认 server 的运营方、数据保留和访问范围。
 
 ## 故障边界
 
 server 进程存在不等于 MCP 已完成握手。诊断时分别检查 transport、认证、初始化、工具清单和具体调用结果。
+
+普通请求默认等待 30 秒，initialize 默认等待 60 秒。timeout、用户停止 Session 或调用 future 被 drop 时，kxen 会移除本地 pending request，并 best-effort 发送 `notifications/cancelled`。这会停止本地等待，但不能保证 server 回滚已经发生的外部副作用。
+
+transport 关闭时，stdio 会先向独立进程组发 `SIGTERM`，超过 800 ms 后发 `SIGKILL`，并等待回收直接子进程，避免 shell 孙进程泄漏。Remote reader 会停止，Streamable HTTP 会 best-effort 删除 server session。网络或 server 故障仍可能使远端清理结果为 `UNKNOWN`。

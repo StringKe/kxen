@@ -20,7 +20,27 @@ Session 是用户与 Agent 协作的基本单位。它绑定一个工作目录�
 - 推理、图片和隐藏上下文。
 - 父 Session、Goal、Team、Schedule 和恢复点关联。
 
-Session 消息使用追加写历史。删除 Session 会停止活动 run，并进入 macOS 废纸篓。
+Session 消息使用追加写历史。模型输入、append、fork、rewind、compaction、export 和知识沉淀使用严格读取；JSONL 出现坏行时 fail closed，避免在残缺历史上继续写入。诊断视图可以保留已经解析的消息，但会明确记录坏行。meta 中的 `message_revision` 只在真实 append 或 rewrite 后单调推进，用于识别同一毫秒内的变化；完全相同的幂等 append 不推进 revision。
+
+等待队列为每条消息分配稳定 ID 和创建时间。claim、append 和 acknowledge 分步持久化，崩溃重放不会重复追加同一条用户消息，也不会重新解析已经提交的文件、URL、Context 或 Image snapshot。
+
+## 删除与恢复
+
+删除 Session 使用持久 tombstone 阻止新 run、queue admission 和新的 Knowledge 写入，并取消活动 run，最多等待 3 秒。随后等待该 Session 的 consolidation lease 释放。选择删除并沉淀时，蒸馏、usage 结算或 revision 校验失败都会停止删除。
+
+真正清理前，kxen 会建立 recovery bundle，包含 meta、messages、compaction、queue、artifacts、Team、Goal、Schedule 和 usage 关联状态。bundle stage 成功后才 purge 原数据，随后把 bundle 移入系统废纸篓。中间失败会精确回滚，或者保留 tombstone 供启动恢复，不会把部分删除报告为成功。
+
+从 Finder 恢复 `.kxen-session` bundle 后，应用启动扫描可以重新导入。目标路径冲突或 bundle 损坏时 fail closed，并保留恢复证据。
+
+## 存储一致性恢复
+
+当消息 JSONL 或 pending queue 处于 blocked、尾部不完整或损坏状态时，Composer 上方会显示存储恢复面板。健康 Session 不显示该面板。
+
+- 检查会分别报告消息日志和队列的完整性、写入阻塞和可证明恢复性。
+- 仅缺少最后换行的完整 JSON 记录会保留记录并追加换行。不完整最后一段只有在可证明是尾部时才可移出工作副本。
+- 修复 JSONL 前，kxen 会把原始字节完整备份到 `sessions/.recovery/`，权限为 `0600`，并在界面显示证据路径。
+- 中间坏行、重复 message ID、Session ID 不匹配或队列无法与期望快照对齐时不会自动修复。原文件保持不变，用户应先导出诊断包。
+- 恢复不会在 active run 期间执行。只有 Session 与 Queue 两个 store 都可证明恢复时，后端才会解除写入阻塞。
 
 ## 时间线操作
 
@@ -29,3 +49,7 @@ Session 消息使用追加写历史。删除 Session 会停止活动 run，并�
 ## 状态边界
 
 每个 run 必须结束为完成、取消或错误。界面停止流式更新不代表后端 run 已结束。活动状态、等待队列和 Approval 共同决定 Session 是否仍在运行。
+
+进入 Session 或手动重试时，界面会把请求开始时的 baseline、后端 snapshot 和加载期间收到的 live 事件按 message ID 与 Approval occurrence 对账。已经落盘的记录接管对应 optimistic 或 live 前缀，但只存在于 live 流中的新记录不会被旧 snapshot 抹掉。切换 Session、存储恢复或新的 queue 更新会使旧加载 generation 失效，迟到结果不能复活上一 Session 的时间线或队列。
+
+时间线和 queue 分别保留错误来源，可以单独重试。存储恢复成功后，界面取消旧 generation、清除旧加载错误并重新读取两者的后端真相。

@@ -10,19 +10,20 @@ Workflow 把多个 Agent 调用编排成可执行流程。它适合步骤之间�
 
 ## 运行方式
 
-模型生成 JavaScript，kxen 在 QuickJS 沙箱中执行。Workflow 使用受控原语描述执行关系，常用原语包括:
+模型生成 JavaScript，kxen 在 QuickJS 沙箱中执行。Workflow 使用受控原语和只读约束快照描述执行关系:
 
 - `agent()`
-- `pipeline()`
+- `parallel()`
 - `phase()`
-- `constraints()`
+- `log()`
+- `CONSTRAINTS`
 
 Workflow JavaScript 不能直接获得宿主文件系统或任意网络访问。实际修改仍由被派发 Agent 的工具和权限完成。
 
 ## 能够表达的结构
 
 - 多个独立 Agent 并行。
-- 有顺序的 pipeline。
+- 通过普通 JavaScript `await` 表达顺序依赖。
 - 带验证要求的 phase。
 - 基于中间结果的分支。
 - 有界循环和重试。

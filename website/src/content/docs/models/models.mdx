@@ -22,8 +22,8 @@ Composer 中的模型选择器可以为当前 Session 设置模型。选择结�
 
 ## 角色默认值
 
-没有显式 Session 覆盖时，主会话和各 Agent 角色使用模型路由中的绑定。Subagent、Workflow Agent 和 Team member 可以根据角色选择不同模型。
+没有显式 Session 覆盖时，主会话和各 Agent 角色使用 Session 所属 Workspace 有效配置中的模型路由绑定。Subagent、Workflow Agent 和 Team member 可以根据角色选择不同模型。前台切换到其他 Workspace 不会改变后台 Session 的默认绑定。
 
 ## 选择依据
 
-模型选择器显示 Provider、模型 ID 和上下文窗口。最终请求仍要经过账号可用性、并发、RPM、能力和 fallback 检查。
+模型选择器显示 Provider、模型 ID 和上下文窗口。显式选择会固定该 Session 的 Provider 和模型身份，但最终请求仍要经过所属 Workspace MRM 的账号解析、预算、Circuit、并发和 RPM admission，再由实际 Provider dispatch 验证该模型是否可用。角色默认路由允许 fallback；显式选择不可用时会返回错误，不会暗中改成其他模型。

@@ -13,9 +13,17 @@ kxen 使用 TOML 保存非敏感配置。
 - 用户配置: `file:///Users/you/.config/kxen/config.toml`
 - 项目配置: `file:///path/to/workspace/.kxen/config.toml`
 
-项目配置只在 Workspace 已信任时加载。项目级表项覆盖同名用户级表项，Hook 列表按事件追加。
+项目配置只在 Workspace 已信任时加载，并且只能包含以下顶层表项:
 
-## 示例
+- `roles`
+- `limits`
+- `hooks`
+
+这些表项按字段覆盖用户配置，Hook 列表按事件以 `user -> project` 顺序追加。项目配置出现其他顶层键时，整个 Workspace 配置加载失败并显示具体键名，不会静默忽略。
+
+`send_when_running`、`statusline`、`voice`、`embedding`、`search`、`coding_rules` 和 `experimental` 只允许出现在用户配置。项目不能改变个人交互偏好、开启数据外发能力或扩大宿主机能力面。
+
+## 用户配置示例
 
 ```toml
 send_when_running = "queue"
@@ -65,22 +73,55 @@ models = ["example-model"]
 capabilities = ["text"]
 ```
 
+`search.engine`、Google CSE、SearXNG、凭证来源和 fallback 行为见 [Web 与 Search](https://kxen.ai/integrations/web-search)。
+
+`voice.fallback` 不只是启动失败时的引擎顺序。当 `engine = "apple"` 时，把已配置的 cloud Provider 放入该数组也表示允许上传录音，用云端终稿升级本机识别。保存凭证本身不会授权上传；纯本地模式应保持 `fallback = []`。需要云转写的音频有 5 分钟和固定缓冲大小上限，超限时不会上传。
+
+## 项目配置示例
+
+受信任 Workspace 可以在 `.kxen/config.toml` 中提供项目所需的角色、资源策略和 Hook:
+
+```toml
+[roles.execution]
+provider = "custom:example"
+model = "example-model"
+
+[limits.providers."custom:example"]
+concurrent = 2
+rpm = 30
+
+[hooks]
+pre_tool_use = [{ matcher = "exec", command = "./scripts/check-command.sh" }]
+```
+
+`custom_providers` 只允许出现在用户配置。项目不能新增或覆盖自定义 endpoint，避免把用户保存的 `custom:<name>` API key 和会话内容重定向到项目控制的地址。项目 `roles` 可以引用用户已经定义的 custom Provider。
+
+用户自定义远程端点必须使用 `https://`；`http://` 只允许明确的 `localhost` 或 loopback IP。URL 不能内嵌 username 或 password。API key 和 OAuth token 只能来自用户认证存储。`models` 至少包含一个无空白身份，`capabilities` 只能使用 `text`、`vision` 或 `audio`。
+
+`embedding.base_url` 使用相同的传输安全边界。显式 loopback OpenAI-compatible 或 Ollama endpoint 可以使用 HTTP；其他 endpoint 必须使用 HTTPS。
+
+## 网络代理
+
+Provider、OAuth、Remote MCP、Web Fetch 和 Web Search 使用应用内受保护 connector，不继承 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY` 等环境变量。这些 connector 在实际连接前验证本次 DNS 解析的全部地址，避免系统代理把已检查的目标重定向到另一网络边界。
+
+显式配置的 `localhost` 或 loopback endpoint 使用独立 loopback resolver，不会扩大普通公网 endpoint 的访问范围。需要强制使用企业出口代理的环境不能依赖 Shell 代理变量自动生效。Browser 使用自己的进程内受控代理，不使用这些环境变量。
+
 ## 资源限制
 
 - `global_concurrent`: 所有模型调用的全局并发上限，默认值为 8。
-- `daily_token_budget`: 按本地日期统计的全局 token 硬上限，留空表示不限。
+- `daily_token_budget`: 按本地日期统计的已结算 token admission 阈值，留空表示不限。达到阈值后拒绝新请求，但单次请求和并发在途请求可能越过该值，因此它不是账单硬上限。
 - `limits.providers.<id>.concurrent`: Provider 并发上限。
 - `limits.providers.<id>.rpm`: 每个账号的 60 秒请求上限。
 - `input_usd_per_million` 和 `output_usd_per_million`: 用户实际合同或账单的计价口径。
-- `daily_cost_budget_usd`: 按上述显式单价计算的 Provider 每日金额硬上限。
+- `daily_cost_budget_usd`: 按上述显式单价和已结算 usage 计算的 Provider 每日金额 admission 阈值，不是账单硬上限。
 - `circuit_failure_threshold`: 连续失败熔断阈值，默认 3，设置 0 关闭。
 - `circuit_cooldown_seconds`: 熔断冷却时间，默认 60 秒。
 
-多个账号共享 Provider 并发池，RPM 按账号分别记录。Kxen 不内置可能漂移的公开模型价格；没有显式单价时金额保持 `UNKNOWN`，配置金额预算但缺少单价会失败关闭。token 趋势按本地日期持久化 90 天，Settings 展示最近 14 天。
+多个账号共享 Provider 并发池，RPM 按账号分别记录。实际在飞调用、RPM 窗口和路由历史由进程共享；Circuit 按 Workspace、Provider 和自定义 endpoint 隔离。切换 Workspace 不会重置共享并发或 RPM，也不会让一个 Workspace 的端点故障熔断另一个 Workspace。kxen 不内置可能漂移的公开模型价格；没有显式单价时金额保持 `UNKNOWN`，配置金额预算但缺少单价会失败关闭。token 趋势按本地日期持久化 90 天，Settings 展示最近 14 天。
 
 ## 实验能力
 
-- `automatic_knowledge_distillation`: 定期把近期 Session 内容发送给当前 Provider，并且只写个人知识。
+- `automatic_knowledge_distillation`: 定期使用每个 Session 所属 Workspace 的 MRM 和模型路由处理近期内容，并且只写个人知识。
 - `browser_automation`: 允许 Agent 驱动本机 Chrome，页面数据可能进入当前 Provider 上下文。
 - `remote_mcp`: 加载 Streamable HTTP 和 SSE server，工具参数会发送给远端 server。
 
@@ -93,7 +134,9 @@ capabilities = ["text"]
 
 ## Hook
 
-Hook 可以在工具事件上运行命令，并通过 matcher 限定工具名。Hook 仍受 Workspace 信任、Shell Safety 和 Approval 约束。
+Hook 可以在 `pre_tool_use`、`post_tool_use`、`session_start`、`stop`、`notification`、`teammate_idle` 和 `task_completed` 事件上运行命令，并通过 matcher 限定工具名、Session、通知或 Team 对象。用户 Hook 先加载，受信任 Workspace 的项目 Hook 随后追加。
+
+Hook 命令在所属 Workspace 中执行，限时 10 秒，并通过 `KXEN_EVENT`、`KXEN_TOOL` 和 `KXEN_PAYLOAD` 获得事件上下文。命令仍受 Shell Safety 约束；Ask 需要当次 Approval，没有 Approval channel 时失败关闭。`pre_tool_use` 非零退出、Safety 拒绝、超时或未获批准会阻止工具；`post_tool_use` 失败只记录。`task_completed` Hook 成功后 Team task 才提交为 completed，其他 named Hook 按对应生命周期记录失败。
 
 ## 凭证
 

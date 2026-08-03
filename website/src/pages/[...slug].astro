@@ -12,6 +12,7 @@ import {
   getTOC,
 } from "@cloudflare/nimbus-docs";
 import { components } from "../components";
+import { jsonLd } from "../lib/json-ld";
 
 export const prerender = true;
 export const getStaticPaths = getDocsStaticPaths;
@@ -47,6 +48,29 @@ const toc = tocOn && tocConfig !== false ? getTOC(headings, tocConfig) : false;
 const markdownPath = `/${entry.id}/index.md`;
 const markdownUrl = Astro.site ? new URL(markdownPath, Astro.site).href : markdownPath;
 const socialImage = entry.data.socialImage ?? `/og/${entry.id}.png`;
+
+// JSON-LD：文档页 TechArticle + 全站 BreadcrumbList（数据与视觉面包屑同源）。
+const pageUrl = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : undefined;
+const techArticleLd = jsonLd({
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  headline: entry.data.title,
+  ...(entry.data.description ? { description: entry.data.description } : {}),
+  ...(pageUrl ? { url: pageUrl } : {}),
+});
+const breadcrumbLd = jsonLd({
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  itemListElement: breadcrumbs.map((crumb, index) => ({
+    "@type": "ListItem",
+    position: index + 1,
+    name: crumb.label,
+    ...(crumb.href && Astro.site
+      ? { item: new URL(crumb.href, Astro.site).href }
+      : {}),
+  })),
+});
+const head = [...(entry.data.head ?? []), techArticleLd, breadcrumbLd];
 ---
 
 <DocsLayout
@@ -58,7 +82,7 @@ const socialImage = entry.data.socialImage ?? `/og/${entry.id}.png`;
   prevNext={prevNext}
   mode={entry.data.mode}
   banner={entry.data.banner}
-  head={entry.data.head}
+  head={head}
   searchable={entry.data.searchable}
   noindex={entry.data.noindex}
   markdownUrl={markdownUrl}

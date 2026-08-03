@@ -3,21 +3,21 @@ title: Browser
 description: 通过本机 Chrome DevTools Protocol 执行受控浏览器操作。
 status: canonical
 sidebar:
-  order: 3
+  order: 4
 ---
 
 Browser 让 Agent 操作真实网页，用于界面检查、交互验证和需要浏览器上下文的任务。
 
-Browser automation 是默认关闭的个人实验能力。必须先在 Settings 的高级区域显式开启，项目配置不能代替用户开启。关闭时 `browser` 不进入 `tool_search` 目录，直接调用也会被后端拒绝。
+Browser automation 是默认关闭的个人实验能力。必须先在 Settings 的高级区域或个人 `config.toml` 显式开启，项目配置不能代替用户开启。关闭时 `browser` 不进入 `tool_search` 目录，直接调用也会被后端拒绝。
 
 ## 运行方式
 
-kxen 连接本机 Google Chrome 的 Chrome DevTools Protocol。它不下载或捆绑独立 Chromium。
+kxen 按顺序探测并启动本机安装的 Google Chrome、Chromium 或 Microsoft Edge，再通过 Chrome DevTools Protocol 驱动独立的 headless profile。`chromiumoxide` 为它使用单独的临时 `user-data-dir`，不会附着到已经打开的日常浏览器窗口或直接继承日常 profile 的 cookie。kxen 不下载或捆绑浏览器。
 
 使用前需要:
 
-- 本机已安装 Google Chrome。
-- kxen 能够启动或连接调试实例。
+- 本机已安装 Google Chrome、Chromium 或 Microsoft Edge。
+- kxen 能够启动 headless 调试实例。
 - 没有冲突进程占用目标调试状态。
 
 ## 能力
@@ -26,14 +26,18 @@ Browser 可以导航页面、读取可见状态、点击、输入和执行页面
 
 ## 网络边界
 
-初始导航 URL 经过网络地址检查。loopback、link-local 和内部地址不会被当作普通公网目标。
+初始导航 URL 先经过 scheme 和网络地址检查。Chrome 启动后，全部 HTTP 和 HTTPS 流量固定经过 kxen 的本机代理，没有 direct fallback。这个边界同时覆盖 redirect、iframe、图片和脚本等子资源、页面内 `fetch` 以及 WebSocket。
 
-页内导航、iframe 和子资源不构成完整 SSRF 安全边界。Browser 因此仍是实验性工具，不能用来绕开 Web 或 MCP 的网络限制。
+代理只解析一次目标域名，先检查该次解析返回的全部地址，再使用已检查的具体地址建立连接。任一结果属于 loopback、私网、link-local、CGNAT、unspecified 或 multicast 时，整个请求都会在连接前拒绝。HTTPS 使用 CONNECT tunnel，TLS SNI 和 HTTP Host 仍是原始域名，因此不需要为了 pin 地址而降低证书校验强度。DNS rebinding 不能把已检查的请求切换到另一个地址。
+
+请求解析、header、DNS 结果、连接时间、空闲时间和双向流量都有硬上限。request/response body 和 tunnel 的单方向流量上限是 64 MiB；没有 `Content-Length` 的 streaming request body 会失败关闭。超过上限或代理异常时连接失败关闭。每个非 close 操作完成后，kxen 仍复查 top-level URL，发现非 HTTP(S) 或违规目标时关闭整个浏览器实例。
+
+Browser 仍是实验性工具，但原因是网页数据、外部交互和本机浏览器自动化本身需要谨慎授权，不再是 iframe、子资源或 DNS rebinding 未受控。它不能用于绕开 Web 或 MCP 的网络限制。
 
 ## 数据边界
 
-Browser 使用本机 Chrome 状态时，页面可能包含已登录账号和个人数据，页面内容和交互结果也可能进入当前模型 Provider 的上下文。Agent 只能在用户明确授权的任务范围内操作，发送表单和产生外部写入仍需要按风险处理。
+Browser 的独立 profile 可能保留 Browser automation 期间形成的登录状态和个人数据，但不等同于用户日常 Chrome profile。页面内容和交互结果也可能进入当前模型 Provider 的上下文。Agent 只能在用户明确授权的任务范围内操作，发送表单和产生外部写入仍需要按风险处理。
 
 ## 与 Web Search 的区别
 
-Web Search 用于获取搜索结果和页面文本。Browser 用于真实界面和交互。只需要资料时优先使用更小的读取面。
+[Web 与 Search](https://kxen.ai/integrations/web-search) 用于提取已知页面、发现来源和获取搜索摘要。Browser 用于真实界面和交互。只需要资料时优先使用更小的读取面。

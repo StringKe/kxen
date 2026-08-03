@@ -19,19 +19,21 @@ Worktree 为并行 Agent 或任务提供独立工作目录。它解决多个有�
 - 源 Git repository。
 - 独立目录。
 - 分支或 detached 状态。
-- 使用它的 Session、Agent 或 Team member。
+- 工作目录落在其中的 Session，以及该 Session 派发的 Agent 或 Team。
 
 创建后，文件工具、Shell、LSP 和 Git 状态都应使用 Worktree 目录，而不是主 Workspace 目录。
+
+Agent 工具可以为单次 Subagent 派发创建指定 Worktree。Team member 当前不各自绑定不同 Worktree；需要整个 Team 隔离时，先在 Worktree 目录中创建 Session。
 
 ## 使用场景
 
 - 两个 execution Agent 并行实现独立功能。
 - 审查任务需要固定基线。
-- Team member 需要隔离分支。
+- 整个 Team 需要隔离分支。
 - 长任务不能影响用户当前工作树。
 
 ## Git 边界
 
-Worktree 只提供目录隔离，不自动合并提交。任务完成后仍要检查 diff、运行验证，并由用户或主 Agent决定如何提交和合并。
+Worktree 只提供目录隔离，不自动合并提交。任务完成后仍要检查 diff、运行验证，并由用户或主 Agent 决定如何提交和合并。
 
 不要让两个 Worktree 使用同一可写分支。删除 Worktree 前确认没有未提交修改和仍绑定的运行任务。

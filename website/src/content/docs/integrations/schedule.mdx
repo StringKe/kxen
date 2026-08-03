@@ -3,42 +3,47 @@ title: Schedule
 description: 使用 cron 表达式在应用运行期间触发 Session 任务。
 status: canonical
 sidebar:
-  order: 5
+  order: 6
 ---
 
 Schedule 用于把任务绑定到目标 Session，并按 cron 表达式触发。
 
 ## 创建
 
-Schedule 由 Agent 通过 schedule 工具创建。创建时指定:
+可以在 Settings 的定时任务区域直接创建 Schedule，也可以让 Agent 通过 schedule 工具创建。创建时指定:
 
 - cron 表达式。
-- 目标 Session。
+- 目标 Session。Settings 入口绑定当前已创建的 Session。
 - 需要发送的任务。
+- 是否只执行一次。
 
 ## 产品入口
 
-Settings 的定时任务区域显示:
+Settings 的定时任务区域提供创建表单，并显示:
 
 - cron 表达式。
 - 目标 Session。
 - 下次触发时间。
 - 最近执行状态。
 
-用户可以暂停、恢复或删除 Schedule。
+用户可以创建、暂停、恢复或删除 Schedule。
 
 ## 执行边界
 
-Schedule 只在 kxen 应用运行期间触发，不是 macOS 系统级 cron。应用退出后，不会在后台启动自身执行任务。
+Schedule dispatcher 每 15 秒检查一次到期 occurrence，只在 kxen 应用运行期间触发，不是 macOS 系统级 cron。应用退出后，不会在后台启动自身执行任务，因此触发时间具有最多一个 tick 加运行调度延迟。
 
-触发时仍要检查:
+每个 occurrence 先持久化稳定的 `dispatch_id`，再把消息写入目标 Session 的 durable queue。消息 acknowledge 成功后，once Schedule 才删除，recurring Schedule 才推进 `next_fire`。应用在中途退出或派发失败时会使用同一 delivery ID 重放，Session append 通过稳定 message ID 去重，避免静默丢失或重复消息。
+
+`schedule.json` 损坏时保留原文件并阻止后续写入，不把损坏内容解释为空任务列表。修复或恢复该文件后才能继续管理 Schedule。
+
+真正执行 queued message 时仍要检查:
 
 - 目标 Session 是否存在。
 - Session 是否已经有活动 run。
 - MRM 是否有可用模型资源。
 - 工具是否需要 Approval。
 
-Schedule 不能绕过 Session 的并发保护、模型资源限制、Safety 或 Approval。
+这些检查发生在 queued message 真正执行时，不一定发生在 15 秒 tick 的瞬间。Schedule 不能绕过 Session 的并发保护、模型资源限制、Safety 或 Approval。
 
 ## 使用方式
 

@@ -17,7 +17,7 @@ Memory 可以来自:
 - 用户在个人设置中明确开启的后台 consolidation。
 - 用户维护的长期条目。
 
-自动知识沉淀默认关闭，只读取个人配置，并且只写个人 scope。启用后，每 30 分钟把近 24 小时活跃 Session 各自最近 20 条文本和注入上下文发送给 Settings 中显示的默认 Provider。删除 Session 默认直接删除；选择沉淀时，界面会显示本次目标 Provider，Provider 处理失败会保留 Session 并显示错误，不会静默删除。自动沉淀不能把失败输出写成事实，也不能静默覆盖项目 Rules。
+自动知识沉淀默认关闭，只读取个人配置，并且只写个人 scope。启用后，每 30 分钟扫描近 24 小时的活跃 Session，把各自最近 20 条文本和注入上下文发送给该 Session 显式选择的模型，未显式选择时使用其 Workspace 的 `chat` 角色路由。路由、MRM 限额和 Circuit 始终来自 Session 所属 Workspace，不会因前台切换 Workspace 而改变。删除 Session 默认直接删除；选择沉淀时，界面会显示本次目标 Provider，Provider 处理失败会保留 Session 并显示错误，不会静默删除。自动沉淀不能把失败输出写成事实，也不能静默覆盖项目 Rules。
 
 ## 检索
 

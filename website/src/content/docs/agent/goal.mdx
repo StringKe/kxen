@@ -10,7 +10,7 @@ Goal 用于需要跨多轮持续执行的软件工程任务。它把任务目标
 
 ## 创建
 
-使用 `/write-goal` 交互式定义 Goal，或让 Agent 通过 Goal 工具创建。一个有效 Goal 包含:
+可以在右侧 Dock 直接创建草稿，使用 `/write-goal` 交互式定义 Goal，或让 Agent 通过 Goal 工具创建。一个有效 Goal 包含:
 
 - objective。
 - 可观察的 completion criteria。
@@ -21,15 +21,31 @@ Goal 用于需要跨多轮持续执行的软件工程任务。它把任务目标
 ## 生命周期
 
 ```text
-create -> active -> complete
-                 -> blocked
-                 -> paused
-                 -> budget_limited
+draft -> active
+active <-> paused
+active <-> blocked
+active -> budget_limited
+budget_limited --adjust--> active
+active -> complete
+active -> canceled
 ```
 
-Goal 可以激活、暂停、恢复、完成或取消。只有完成条件逐条验证通过后才能进入 complete。
+Goal 可以激活、暂停、恢复、完成或取消。只有完成条件逐条验证通过后才能进入 complete。budget_limited 不能直接恢复，必须通过「提高预算并继续」调整预算后进入 active。
 
-同一阻塞原因连续出现 3 轮后，Goal 才能进入 blocked。预算触顶使用 budget_limited，不应伪装成任务完成。
+完成动作由 per-Goal 单一执行锁保护。kxen 先持久化 operation ID 以及 contract/evidence 的 SHA-256 identity，再在跨过 Provider 边界前写入 `prepared`，并在进入 complete 前依次持久化判定结果和 usage receipt。同一 identity 已有 `scored` 结果时会复用，不会再次付费；不同 identity 在用户明确 adjust 前会被拒绝。
+
+如果应用在已准备的付费判定中断，语义结果标为 `UNKNOWN`，Goal 进入 blocked，后续启动不会自动重发同一判定。用户检查 Provider 侧结果和预算后使用 adjust 确认风险，才能提交新的证据或再次判定。
+
+进入 blocked 有两条路径：terminal 类原因（如上文付费判定中断）立即触发；其他原因在同一阻塞原因连续出现 3 轮后触发。预算触顶使用 budget_limited，不应伪装成任务完成。
+
+## 预算与归属
+
+- wall clock 只累计 active 时间，暂停时间不消耗预算。
+- run 开始时冻结绑定的 Goal ID；运行中切换焦点不会把本轮 usage 记到另一个 Goal。
+- 业务回合增加 turn。Compaction、completion verification 等辅助模型调用只计 token，不增加业务 turn。
+- pause 或 cancel 会停止继续执行，但已经开始的请求在返回后仍结算实际 usage。
+- 有有限 token budget、但 Provider 没有返回可计量 usage 时，Goal fail closed 到 budget_limited，等待用户确认或调整预算。
+- completion verification、compaction、embedding 和其他辅助调用在跨过 Provider 边界前建立 durable usage attempt。已观察到的 usage 精确结算；已发起但无法恢复结果的调用记为 `UNKNOWN`，不会按 0 处理。
 
 ## 产品呈现
 

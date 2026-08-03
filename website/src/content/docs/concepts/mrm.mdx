@@ -6,22 +6,23 @@ sidebar:
   order: 3
 ---
 
-MRM 是 Model Resource Manager。主 Session、Subagent、Workflow Agent 和 Team member 的模型调用都必须经过 MRM。
+MRM 是 Model Resource Manager。主 Session、Subagent、Workflow Agent、Team member、Knowledge embedding、Provider native search 和 cloud audio transcription 的 Provider 调用都必须经过所属 Session Workspace 的 MRM 视图。Provider 连接实测和角色试派发也使用相同 admission 与 durable usage 链路。
 
 <pre class="mermaid">{`
 flowchart LR
   Request["角色申请"] --> Binding["角色绑定"]
   Binding --> Candidates["Provider、模型和账号候选"]
-  Candidates --> Limits["凭证、RPM 和并发检查"]
-  Limits --> Dispatch["分配 Grant 并调用"]
-  Limits -->|"首选不可用"| Fallback["fallback 角色"]
+  Candidates --> Resolve["解析实际路由"]
+  Resolve -->|"首选不可用"| Fallback["fallback 角色"]
   Fallback --> Candidates
+  Resolve --> Limits["调用前预算、Circuit、RPM 和并发 admission"]
+  Limits --> Dispatch["启动调用"]
   Dispatch --> Record["dispatch record"]
 `}</pre>
 
 ## 输入
 
-一次申请包含角色和当前 Auth store。角色绑定提供首选 Provider、模型、可选账号和 fallback 角色。
+一次申请包含角色和当前 Auth store。角色绑定提供首选 Provider、模型、可选账号和 fallback 角色。角色、限制和自定义 Provider 端点来自 Session 所属 Workspace 的有效配置，而不是当前 UI 正在显示的 Workspace。
 
 ## 候选解析
 
@@ -30,19 +31,25 @@ MRM 按以下顺序选择:
 1. 读取角色绑定。
 2. 如果固定账号，只检查该账号。
 3. 否则按默认账号和命名账号构造候选。
-4. 跳过无凭证、RPM 已满或并发已满的候选。
+4. 跳过无凭证或当前不可路由的候选。
 5. 首选角色不可用时进入 fallback 链。
 
 未配置的 Team observer 回落到 execution 角色。
+
+角色解析与模型调用 admission 是两个独立步骤。`resolve` 返回当前实际候选，不占用 slot；真正准备发起网络请求时，`begin_call` 才重新检查预算、Circuit、RPM 和并发限制。这样等待期间发生的预算结算或 Circuit 变化不会被旧解析结果绕过。
 
 ## 资源限制
 
 - 全局并发限制所有模型调用。
 - Provider 并发由同一 Provider 的全部账号共享。
 - RPM 按 Provider 和账号分别计算 60 秒滑动窗口。
-- Grant 使用 RAII，在调用结束或异常退出时释放并发 slot。
+- 全局每日 token 与 Provider cost 配置是已结算 usage 的 admission 阈值，达到后拒绝新调用。单次请求和并发在途请求可能越过阈值，不应把它当作账单硬上限。
+- 连续失败会打开 Workspace 范围的 Provider Circuit；冷却后只允许一个 half-open probe。自定义 Provider 还把协议和 endpoint 纳入 Circuit 身份，端点变更不会继承旧端点的故障状态。
+- `CallPermit` 在网络 I/O 前转为 RAII `Slot`，调用结束或异常退出时释放并发 slot。
 
-选择和占用 slot 是一个原子过程，避免先选中模型再因并发竞争超发。
+配置热更新会保留当前在飞计数、RPM 窗口，以及同一 Workspace、Provider 和 endpoint 的 Circuit 状态。并发降低时不会取消已开始调用，但新调用会等待到实际占用低于新限制。
+
+每个 Workspace 拥有独立的配置视图和 Circuit 状态；进程内的实际在飞计数、Provider/账号 RPM 窗口与路由历史保持共享。每次 admission 使用发起请求的 Workspace 策略检查共享占用，因此后台 Session 不会因前台切换 Workspace 而改变路由。创建另一个 Workspace 不能重置并发或 RPM 占用，但不会让一个 Workspace 的端点故障熔断另一个 Workspace。
 
 ## 账号轮转
 
@@ -50,8 +57,12 @@ MRM 按以下顺序选择:
 
 ## 可观测性
 
-MRM 保留最近 50 条 dispatch record，包含角色、Provider、模型、账号、降级来源和时间。界面可以显示真实解析结果，而不是只显示配置中的首选值。
+MRM 在内存中保留最近 50 条路由解析记录，包含角色、Provider、模型、账号、降级来源和时间。它们用于观察实际解析结果，应用重启后清空，并不等于 Provider 调用次数或账单记录。
 
 ## 当前边界
 
-当前实现具有固定并发、账号 RPM、账号轮转和角色 fallback。动态 AIMD、成本预算和 Provider 熔断仍属于历史设计，不写入当前能力表。
+当前实现使用配置驱动的固定并发限制，不根据实时延迟自动调节。动态 AIMD 尚未实现。
+
+Session 显式选择模型时会跳过角色默认模型选择，但不会跳过所属 Workspace 的凭证解析、预算、Circuit、RPM 和并发 admission。
+
+Voice 的 cloud audio transcription 同样先通过 MRM 的并发、RPM、预算和 Circuit admission，再使用受保护网络 connector，并在上传前写 durable Provider attempt。由于服务通常按音频时长计费而当前 ledger 只表达 token，结果按 `UNKNOWN` 结算。详见 [Voice](https://kxen.ai/integrations/voice) 和 [用量](https://kxen.ai/models/usage)。

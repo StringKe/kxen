@@ -10,28 +10,77 @@ kxen 采用本地优先存储，当前没有 kxen 云同步服务。
 
 ## 目录
 
-| 数据     | macOS 位置                                              |
-| -------- | ------------------------------------------------------- |
-| 用户配置 | `file:///Users/you/.config/kxen/`                       |
-| 应用数据 | `file:///Users/you/Library/Application%20Support/kxen/` |
-| 缓存     | `file:///Users/you/Library/Caches/kxen/`                |
-| 项目配置 | `file:///path/to/workspace/.kxen/`                      |
-| 项目知识 | `file:///path/to/workspace/.agents/`                    |
-| 个人知识 | `file:///Users/you/.agents/`                            |
+| 数据       | macOS 位置                                              |
+| ---------- | ------------------------------------------------------- |
+| 用户配置   | `file:///Users/you/.config/kxen/`                       |
+| 应用数据   | `file:///Users/you/Library/Application%20Support/kxen/` |
+| 保留缓存根 | `file:///Users/you/Library/Caches/kxen/`                |
+| 项目配置   | `file:///path/to/workspace/.kxen/`                      |
+| 项目知识   | `file:///path/to/workspace/.agents/`                    |
+| 个人知识   | `file:///Users/you/.agents/`                            |
+
+当前命名缓存不一定写入缓存根。模型目录和 embedding cache 位于应用数据目录，不能把 `Library/Caches/kxen` 当成清理它们的唯一入口。
+
+## 用户配置
+
+- `config.toml`: 路由、限制、实验开关和一般设置。
+- `mcp.json`: 用户级 MCP server 配置。
+- `custom-provider.transaction.json`: 只在 custom Provider 的配置和凭证跨文件提交尚未完成时存在的恢复 journal。
+
+项目可以提供 `.kxen/config.toml` 和 `.mcp.json`。只有受信任 Workspace 的项目配置和项目 MCP 才会加载。
+
+## 应用数据
+
+- `workspaces.json`: 最近 Workspace。
+- `sessions/`: Session meta、消息、队列、compaction、artifact、删除 tombstone 和 recovery bundle。
+- `goals/`: Goal contract、状态和预算用量。
+- `teams/`: Team 配置、任务、inbox 和 member transcript。
+- `auth.json`: Provider 凭证。
+- `mcp-oauth.json`: MCP OAuth token、refresh token 和 client secret，按 scope + server 名 + canonical resource endpoint 绑定。
+- `trusted.json`: Workspace 信任记录。
+- `credential-consent.json`: 本机凭证来源授权。
+- `notifications.json`: 最近通知。
+- `schedule.json`: Schedule 和 durable dispatch 状态。
+- `usage.json`: Session 和 `system_*` 全局付费操作的已知 token 下界与 `UNKNOWN` 计数。system scope 纳入总量和完整性，但不计入产品显示的 Session 数量。
+- `usage-trend.json`: 最近 90 天按日期和 Provider 的 usage。
+- `usage-attempts/`: 已跨过或准备跨过 Provider 边界的 durable usage attempt。启动恢复先结算或标记 `UNKNOWN`，不会按 0 丢弃。
+- `workflow-journals/`: Dynamic Workflow 恢复 journal。
+- `shadow/`: Checkpoint 的独立 Git repository。
+- `models-catalog.json`: Provider 模型目录缓存。
+- `embedding-cache.json`: Knowledge embedding cache。
+- `consolidate.json`: Knowledge consolidation watermark。
+- `consolidation-attempts/`: Knowledge 蒸馏的 Provider attempt、消息 revision、cursor、候选 Note 和写入进度。每个 attempt 同时保存可解释的 `status` 和 `reason`；`provider_result_unknown` 会阻止自动重试，直到用户显式确认 UNKNOWN。
+- `knowledge-moves/`: 项目与个人 scope 移动的私有 transaction claim；项目内容不能提供或修改该 claim。
+- `instance.lock`: 单实例持有的进程锁。
 
 ## Session
 
-每个 Session 使用一个 JSON meta 文件和一个 JSONL 消息文件。消息追加写入，meta 通过临时文件和 rename 更新。
+每个 Session 使用 `<id>.json` meta 和 `<id>.jsonl` 消息文件，并可以包含 `<id>.compact.json`、`<id>.queue.json` 与 `<id>/` artifact 目录。消息追加写入，meta 和需要重写的状态使用临时文件、fsync 和 rename。meta 中的单调 `message_revision` 在真实 append 或 rewrite 后推进；同 ID、同内容的幂等 append 不会虚增 revision。
 
-Session 可以包含文本、隐藏上下文、工具调用、推理、图片和 Approval 结果。图片以内联数据保存，使 fork、导出、rewind 和删除保持自包含。
+Session 可以包含文本、隐藏上下文、工具调用、推理、图片和 Approval 结果。图片以内联数据保存，使 fork、导出、rewind 和删除保持自包含。Queue delivery 同时持久化稳定 ID 和原始 `created_at`；一旦用户消息写入 JSONL，重放直接复用该消息中的文本、已解析上下文和图片，不重新读取可能变化的文件或 URL。
+
+`sessions/.deleted/` 保存删除 tombstone、本地 recovery bundle 和传输 backup。进入系统废纸篓的 `<id>.kxen-session` bundle 可由 Finder 恢复，再由启动扫描导入。
+
+`sessions/.recovery/` 保存存储一致性修复前的原始 JSONL 字节证据，格式为 `<id>.messages.<uuid>.bak`。目录权限为 `0700`，备份权限为 `0600`。这些文件不是普通缓存；确认不再需要恢复或核对前不要删除。
+
+## 存储恢复契约
+
+当前 Session 的 Composer 上方会自动调用 `recovery.inspect`。健康时面板隐藏；检测到 JSONL 尾部问题、Session PostCommit 写入阻塞或 PendingQueue 阻塞时，面板显示两个 store 的状态。
+
+- `recovery.inspect` 只读检查 Session meta、compaction、messages 和 queue，返回 `healthy`、`repairable_tail`、`corrupt` 以及是否可证明恢复。
+- `recovery.repair` 要求没有 active run，且 Session 和 Queue 都可恢复。如存在可修复的 JSONL 尾部，它会先完整备份原 JSONL；随后修复可证明的最后尾部、meta floor 和精确的 PostCommit 持久化状态，对可见文件和父目录 fsync 后才清除阻塞。
+- `recovery.clear` 只在 JSONL 已经健康时调用同一套精确验证和 fsync 逻辑，用于解除可证明的 PostCommit block。它不是强制忽略损坏的开关。
+- JSONL 中间损坏、身份冲突、Queue 文件解析失败或盘上 Queue 与内存期望快照不同时 fail closed。恢复 API 不会删除原文件或猜测数据。
+
+用户不需要手工调用这些 RPC。面板会在可修复尾部操作前要求二次确认，修复失败时保留原文件、备份和阻塞状态。
 
 ## Goal 和 Team
 
-Goal 保存在应用数据的 goals 子目录。Team 配置、共享任务、inbox 和 member transcript 保存在 teams 子目录。
+Goal 保存在应用数据的 goals 子目录。完成判定的 operation ID、contract/evidence identity、阶段、结果和 usage receipt 直接保存在对应 Goal JSON 中。Team 配置、共享任务、inbox 和 member transcript 保存在 teams 子目录。
 
 ## 凭证
 
-认证数据保存在权限受限的 auth.json。配置文件只保存路由选择，不保存 API key 或 OAuth token。
+Provider 认证数据保存在权限受限的 `auth.json`，MCP OAuth 数据保存在权限受限的 `mcp-oauth.json`。二者都是本地 JSON，不是 macOS Keychain。配置文件只保存路由或连接描述，不保存 API key、OAuth token、refresh token 或 client secret。
 
 认证文件不得提交到 Git。复制或删除认证数据前先退出应用，并确认目标文件权限。
 
@@ -39,6 +88,12 @@ Goal 保存在应用数据的 goals 子目录。Team 配置、共享任务、inb
 
 Checkpoint 使用独立 shadow Git repository，不写入 Workspace 自身的 `.git`。
 
+Workspace 中的 `.kxen/worktrees/` 保存隔离 Worktree，`.kxen/backups/` 保存覆盖前的有限数量恢复副本。项目 `.agents/` 保存共享知识，用户 `file:///Users/you/.agents/` 保存个人知识。跨 scope 移动先在应用私有目录建立 claim，再通过 staging、文件 fsync、rename 和父目录 fsync 提交；跨文件系统时不依赖单次 rename。
+
+Knowledge 的 UNKNOWN 确认先把 usage receipt 写入 `usage.json`，再把可证明的被跳过 cursor 写入 `consolidate.json`，最后删除 `consolidation-attempts/<session_id>.json`。启动时的 receipt compaction 会保留仍被任一 Knowledge attempt 引用的 operation ID，因此在 usage 已提交、attempt acknowledgement 尚未提交的 crash window 中重启也不会重复计量。缺少精确 cursor 的 legacy attempt 不推进 watermark。保留 attempt 是故障恢复依据；不要手工删除它来绕过结算。
+
+删除 Session 时，即使选择「不沉淀」，也会在 recovery manifest 捕获之前把 Knowledge blocked attempt 的 UNKNOWN usage 写入 usage ledger。manifest 因此保留完整的已知下界和 UNKNOWN 计数；claim 只在后续关联清理阶段删除。
+
 ## 删除
 
-生产环境中的文件和 Session 删除进入 macOS 废纸篓。清理整个应用数据目录会同时影响 Session、Goal、Team、认证和恢复状态，不能当作普通缓存清理。
+生产环境中的文件和 Session 删除进入系统废纸篓。清理整个应用数据目录会同时影响 Session、Goal、Team、认证和恢复状态，不能当作普通缓存清理。

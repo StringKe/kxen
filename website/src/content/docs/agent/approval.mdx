@@ -14,7 +14,7 @@ Shell 和 exec 类工具对每条命令强制 Approval，包括 Safety 判定为
 
 这是刻意的 fail-closed 设计: 审批通道超时、中断或不可用时命令不执行。静态规则判定再宽松，也不替代人对当次具体命令的确认。
 
-每执行一条 Shell 命令，用户都会看到一张审批卡，包含具体命令、请求原因和当前 Session，逐条允许或拒绝。
+Session 内执行的操作显示在该 Session 时间线中。Workspace 信任、Provider 凭证导入、项目 stdio MCP 和其他无 Session 归属的操作显示在应用级常驻审批面中，因此切到 Settings 或 Workspaces 时仍可允许或拒绝。
 
 与 Safety 判定结果的关系:
 
@@ -24,7 +24,7 @@ Shell 和 exec 类工具对每条命令强制 Approval，包括 Safety 判定为
 
 ## 触发条件
 
-非 Shell 工具的典型 Ask 操作包括:
+Shell 本身已经强制逐次审批，其中以下命令还会被 Safety 标为典型 Ask 风险；非 Shell 工具中的等价高风险操作也会进入 Approval:
 
 - `git push --force`
 - 裸 `git reset --hard`
@@ -38,12 +38,16 @@ Safety 硬拒绝的操作不会进入 Approval，因为用户确认也不能把 
 
 ## 用户看到什么
 
-Approval 显示具体命令或操作、请求原因和当前 Session。用户可以允许或拒绝，决定会记录到 Session 时间线。
+Approval 显示具体命令或操作和请求原因。Session-scoped 决定会记录到对应 Session 时间线；全局决定没有可归属的 Session，不伪造时间线记录。
+
+前端同时监听实时审批事件并从 `approval.pending` 恢复 broker 快照。全局恢复省略 `session_id`，Session 恢复传入精确 `session_id`，同一审批不会在两个界面重复展示。新 Session 会先把 ID 返回给前端，再在后台运行 `session_start` hook，使前端能够订阅并恢复该 Session 的 Ask 审批。
 
 允许只针对当前具体调用，不创建永久全局放行规则。命令、目标或参数变化后需要重新判定。
 
 ## 取消和超时
 
-Abort 优先于 Approval。正在等待的调用在 Session 取消后按拒绝处理，不会保持悬挂，也不会在后台恢复执行。
+Composer 的「停止」动作优先于 Approval。正在等待的调用在 Session 取消后按拒绝处理，不会保持悬挂，也不会在后台恢复执行。
 
-Approval 超时或连接中断时不执行操作。用户没有看到确认结果时，不能把请求已显示当作命令已执行。
+Approval 最长等待 5 分钟。可能等待全局审批的 RPC 客户端窗口还包含审批后的 Provider 探测或 MCP initialize 收尾时间，不会在后端仍等待或收尾时先按普通 30 秒 RPC 超时报失败。多个 Provider 来源、项目 stdio server 或已缓存 Workspace 的独立审批会先全部发布再并发等待，每项仍可分别允许或拒绝，整体不会串成多个 5 分钟窗口。
+
+连接中断会取消仍在等待决定的 Approval，此时操作不会执行。若 Allow 已经成为 broker 的唯一终态，操作可能已经进入不可逆或事务提交段；该提交段不再随连接中断被强制取消，而是继续完成或由自身事务回滚。重连后必须从 Session、Workspace、worktree、MCP status 等真实状态重新对账，不能根据上一条 RPC 响应是否送达推断操作结果。用户只看到审批请求但没有作出 Allow 时，不能把请求已显示当作命令已执行。

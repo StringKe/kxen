@@ -6,7 +6,7 @@ sidebar:
   order: 5
 ---
 
-用量页面汇总当前应用运行期间记录的模型调用数据。
+用量页面汇总当前进程内加载的 Session 与 system-scoped token ledger、最近趋势和当前进程的路由解析记录，并单独报告 ledger 是否已经确认持久化。
 
 ## 产品入口
 
@@ -15,17 +15,23 @@ sidebar:
 - 输入 tokens。
 - 输出 tokens。
 - Session 数量。
-- 模型派发次数。
-- 按模型统计的派发分布。
+- 最近路由解析记录数。
+- 最近路由解析的按模型分布。
 
 每条 Assistant 消息还会显示 TTFT、总耗时和输出速率，用于观察单次请求表现。
 
 ## 数据含义
 
-token 汇总来自 kxen 记录的调用结果，不是 Provider 账单。Provider 的计费规则、缓存计费、免费额度和订阅配额仍以对应服务为准。
+`usage.json` 保存每个 Session 和 `system_*` 全局付费操作的已知 token 下界或 `UNKNOWN` 计数，成功落盘后可在应用重启后继续累计。`usage-trend.json` 按 Provider 和本地日期保留最近 90 天，Settings 展示最近 14 天。每个准备跨过 Provider 边界的付费调用先在 `usage-attempts/` 建立 operation marker；观察到响应 usage 后记录数值，再以同一 operation ID 幂等结算到 Session、Goal 或 system scope。
 
-统计从当前应用启动开始累计。加载失败会显示错误，不会把缺失数据伪装成全零。
+Provider 连接实测、角色试派发和没有聊天 Session 的 Voice 上传也会建立 system-scoped marker。它们计入总 token 或 `UNKNOWN` 完整性，但 system scope 不计入 Settings 显示的 Session 数量。Provider native search 返回 usage 时精确结算，未返回时保持 `UNKNOWN`。Tavily、Brave、Exa、Jina、Serper、SerpAPI、Google CSE、Firecrawl 和 You.com 这些可能按请求计费的搜索 API 也在网络前建立 marker；它们不返回 token usage，已开始请求按 `UNKNOWN` 结算。云音频通常按时长计费，当前 token ledger 无法表达该单位，因此任何已经发送的云转写都以 `UNKNOWN` 结算。
+
+token 汇总来自 kxen 记录的调用结果，不是 Provider 账单。Provider 的计费规则、缓存计费、免费额度和订阅配额仍以对应服务为准。Provider 未返回完整 usage 时，界面使用 `≥` 表示已知下界，并把完整性标为 `UNKNOWN`，不会把未知 token 当成 0。应用重启会扫描未完成 marker：已记录数值的 attempt 继续精确结算；已经发起但没有可恢复 usage 的 attempt 增加 unknown 计量，不会自动重发付费请求。
+
+只有明确的 HTTP `401`、`403` 或 `429` 拒绝，且当次没有产生任何内容或 usage 观测时，才会以已知 `0/0` 结算。已经收到内容、usage，或只知道 timeout、reset 等模糊传输失败时，不得推断为零用量。零产出 `429` 会执行受限重试：仅限明确限流且未观测到任何内容或 usage 的请求，最多重试 2 次（同一请求共 3 次 attempt），重试可轮换到账号池中的其他账号；`5xx`、timeout、reset 等模糊失败一律不重试。一旦观测到任何 usage，不再自动重试同一请求。
+
+`storage_complete=false` 时，Settings 和状态栏显示「存储 UNKNOWN」。此时数字是当前进程内 ledger 的累计，不代表已经全部写入 `usage.json`，应用重启后可能无法恢复尚未落盘的增量。任一持久化失败都会保持该状态；只有同一 ledger 后续成功落盘才会清除 warning。`usage_complete` 只有在计量完整且存储完整时才为 `true`。
 
 ## 与路由的关系
 
-模型派发分布反映 MRM 最终选择的模型。发生 fallback 时，统计落在实际执行请求的模型上，而不是最初请求的角色绑定。
+最近路由解析分布来自 MRM 当前进程内最多 50 条记录。发生 fallback 时，记录落在最终解析的模型上，而不是最初请求的角色绑定；记录会在应用重启后清空，也不能替代真实 Provider 调用或计费统计。

@@ -1,0 +1,59 @@
+---
+title: Web 与 Search
+description: 提取已知网页，或使用搜索 API、Provider 原生搜索和公开搜索页发现资料。
+status: canonical
+sidebar:
+  order: 3
+---
+
+`webfetch` 和 `websearch` 是 Agent 的常驻只读工具。它们用于读取公开资料，不负责操作网页或绕过目标站点权限。
+
+## Web Fetch
+
+Web Fetch 接收一个明确的 HTTP 或 HTTPS URL，最多等待 20 秒，流式读取并提取最多 50,000 个字符。HTML 中的 script、style 和标签会被移除；它不会执行页面 JavaScript，也不提供浏览器登录状态。
+
+HTTP client 的自动 redirect 被关闭，kxen 最多手动跟随 5 跳，并在每一跳重新检查 scheme、URL 和实际连接地址。缺少或非法 Location、超过跳数、非 HTTP(S) scheme、受限地址、最终非成功状态和传输错误都不会伪装成空页面。
+
+## Web Search
+
+Web Search 接收搜索词，返回实际命中引擎、来源列表，以及原生搜索引擎可选的综合答案。搜索 API、SearXNG 和 DuckDuckGo 每次最多返回 8 条结果；Provider 原生搜索保留响应中的引用。
+
+### 引擎与 fallback
+
+当前引擎链依次包含:
+
+1. 搜索 API: Tavily、Brave、Exa、Jina、Serper、SerpAPI、Google CSE、Firecrawl 和 You.com。
+2. Provider 原生搜索: Perplexity、xAI Grok、OpenAI 和 Anthropic。
+3. 自托管 SearXNG。
+4. 无需凭证的 DuckDuckGo HTML 搜索。
+
+用户配置的 `search.engine` 会移到链首。该引擎没有凭证、没有配置或请求失败时，kxen 会继续尝试其余已配置引擎，最后回落到 DuckDuckGo；未知 engine ID 按默认 `auto` 顺序处理。因此指定首选引擎不是只允许单一服务，其他已经配置的搜索服务仍可能在 fallback 时收到查询。
+
+返回内容会标记实际产出结果的引擎。某个引擎失败不会被写成空成功；全部引擎都不可用时，工具返回逐引擎错误摘要。
+
+### 配置与凭证
+
+Search 只读取个人配置，项目 `.kxen/config.toml` 不能改变搜索引擎或扩大网络访问范围。
+
+```toml
+[search]
+engine = "brave"
+google_cx = ""
+searxng_url = ""
+```
+
+API key 来自本地 Auth store 或对应进程环境，不写入 TOML。Google CSE 还需要 `google_cx` 或 `GOOGLE_SEARCH_CX`；SearXNG 需要 `searxng_url` 或 `SEARXNG_URL`。自托管 SearXNG 可以使用显式 loopback HTTP，其他远程 endpoint 必须使用 HTTPS。
+
+Provider 原生搜索复用对应的 Perplexity、xAI、OpenAI 或 Anthropic 凭证。搜索 API 使用各服务自己的 key，例如 `TAVILY_API_KEY`、`BRAVE_SEARCH_API_KEY`、`EXA_API_KEY`、`JINA_API_KEY`、`SERPER_API_KEY`、`SERPAPI_API_KEY`、`GOOGLE_SEARCH_API_KEY`、`FIRECRAWL_API_KEY` 和 `YOU_API_KEY`。
+
+### 资源与计量
+
+每个引擎请求最多等待 20 秒；绑定 Goal 时还受剩余 wall clock 预算约束。Provider 原生搜索先经过所属 Workspace 的 MRM admission，再在网络前写入 durable usage attempt。响应包含 token usage 时精确结算，未包含时保持 `UNKNOWN`。
+
+九个搜索 API 也会在请求前写入 durable usage attempt。它们可能按请求计费，但不返回 kxen token ledger 能表达的 usage，因此已开始的请求以 `UNKNOWN` 结算。timeout、取消或模糊传输失败不会自动重发同一可能已计费请求。SearXNG 和 DuckDuckGo 不进入付费 attempt 计量。
+
+## 共同网络与数据边界
+
+搜索请求使用受保护 connector，不继承 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`。请求前检查目标和本次 DNS 解析的全部地址，普通公网链拒绝 loopback、私网、link-local、CGNAT 和其他受限地址。响应大小受限，传输错误不会回显包含 query API key 的完整 URL。
+
+Web Fetch 的目标 URL、Search 查询和结果可能进入当前模型上下文；Search 查询还会发送给 fallback 链中实际尝试的第三方服务。需要点击、输入、执行 JavaScript 或验证真实界面时使用 [Browser](https://kxen.ai/integrations/browser)。

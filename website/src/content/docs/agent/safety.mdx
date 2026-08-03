@@ -33,10 +33,14 @@ Safety 拒绝无法安全收窄或后果不可接受的操作，包括:
 
 ## 可恢复删除
 
-文件工具和 Session 删除使用 macOS 废纸篓。Shell 中的 `trash` 被识别为可恢复删除。可恢复不代表可以删除系统目录或 `.git`。
+文件工具和 Session 删除使用系统废纸篓。Shell 中的 `trash` 被识别为可恢复删除。可恢复不代表可以删除系统目录或 `.git`。
+
+Shell 中会造成永久删除的命令直接进入 Deny，包括 `rm`、`rmdir`、`unlink`、`find -delete`，以及通过绝对路径、`command`、`env`、`xargs` 或嵌套 Shell 调用的等价形式。需要删除 Workspace 文件时使用 `delete` tool，将目标移入系统废纸篓。
 
 ## 网络边界
 
-Web 和远端 MCP 的初始 URL 经过地址检查。loopback、link-local 和内部地址不会被当作普通公网目标。Browser 页内导航和子资源不构成完整 SSRF 边界，因此 Browser 仍需要受控使用。
+Web 和远端 MCP 的 URL 经过地址检查。loopback、link-local、CGNAT 和内部地址不会被当作普通公网目标。
+
+Browser 把 Chrome 的全部 HTTP、HTTPS 和 WebSocket 流量强制送入本机受控代理，不配置 direct fallback。代理在实际连接前检查单次 DNS 解析的全部结果，并使用已经检查的 SocketAddr 直连；redirect、iframe、子资源和页面脚本请求都经过相同边界。受限地址、解析歧义、超限、timeout 或代理退出都会失败关闭。动作后的 top-level URL 复查继续作为额外防线。
 
 需要用户决定的高风险操作见 [Approval](https://kxen.ai/agent/approval)。

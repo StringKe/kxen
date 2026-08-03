@@ -32,11 +32,23 @@ Knowledge Library 是 kxen 统一知识系统的管理界面。它使用同一�
 
 - 启用或停用条目。
 - 在项目和个人 scope 之间移动。
-- 删除到 macOS 废纸篓。
+- 删除到系统废纸篓。
 - 手动写入 Note。
 - 查看下一轮 system prompt 的知识注入预览。
 
-启停会立即影响下一次知识渲染。移动 scope 保留条目 kind，不会把 Rule 自动转换成 Note。
+启停会立即影响下一次知识渲染。移动 scope 保留条目 kind，不会把 Rule 自动转换成 Note。移动事务的 claim 保存在应用私有数据目录，不接受项目文件提供的路径或恢复状态；跨文件系统移动使用 staging 和 durable commit，异常退出后按同一 claim 恢复，不会把来源和目标同时当成已提交版本。
+
+## 自动沉淀边界
+
+自动 Knowledge consolidation 按 Session 获取单一 lease，并使用 Session 的单调 `message_revision` 和消息内容 cursor 建立快照。完成后只 checkpoint 已处理快照自身的 revision/cursor；处理期间新增或 rewrite 后形成的不同 cursor 仍会进入下一轮。同一毫秒内的多次写入或历史 rewrite 不会被时间戳误判为已处理。
+
+如果 durable attempt 表明 Provider 请求可能已经开始，但结果没有落盘，后台会把它标记为 `provider_result_unknown` 并停止自动重试。Knowledge Library 会显示「自动沉淀待确认」，包括 Session、稳定 reason，以及 UNKNOWN usage 是否已经 durable 结算。该状态不是空结果，也不会被当成成功。
+
+「确认 UNKNOWN 并跳过快照」是显式的两步操作。后端取得该 Session 的同一 consolidation lease 后，依次 durable 结算 attempt usage、checkpoint 被跳过的消息 cursor、删除 attempt。已有 token 观测按已知值结算，缺失 token 观测则记录为 UNKNOWN，不能按 0 处理。结算或 checkpoint 失败会保留 attempt 并返回错误，恢复操作本身不会再次调用 Provider。成功后同一 cursor 不再付费；Session 产生新的消息 cursor 后可以进入下一轮自动沉淀。
+
+升级前创建、缺少精确 revision/cursor 的 legacy attempt 不能安全 checkpoint。确认这类 UNKNOWN 时只结算 usage 并删除旧 claim，不使用确认时的当前 cursor 代替旧 cursor，因此 blocked 之后新增的消息仍会在下一轮进入沉淀。
+
+删除 Session 会先建立 tombstone，再等待活动 run 和 consolidation lease 收敛。删除窗口不启动新的 Note 写入；已经跨过 Provider 边界的 attempt 只允许完成 usage 与既有结果结算。选择「不沉淀」仍会在 recovery manifest 建立前 durable 结算 blocked attempt 的 UNKNOWN usage，再由清理阶段删除 claim，不会重调 Provider 或把未知用量按 0 丢弃。选择「删除并沉淀」时，蒸馏、结果持久化或 revision 校验失败都会停止删除并保留恢复状态。
 
 ## 信任边界
 

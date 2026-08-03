@@ -19,7 +19,7 @@ stateDiagram-v2
   Queued --> Running: 当前 run 完成
   Running --> Cancelling: interrupt
   Cancelling --> Running: 启动新 run
-  Running --> Cancelled: Abort
+  Running --> Cancelled: 停止
   Cancelled --> [*]
 `}</pre>
 
@@ -27,7 +27,15 @@ stateDiagram-v2
 
 `queue` 是默认行为。新消息进入当前 Session 的等待队列，当前 run 完成后按顺序继续处理。它适合补充后续任务，不会打断正在执行的工具调用。
 
-队列状态持久化为 `queued` 和 `in_flight`。每条 delivery 拥有稳定 ID，后端先 claim 并落盘，再用同一 ID 幂等追加 Session 用户消息，持久化成功后才 acknowledge。应用在 claim 后异常退出时会重放 `in_flight`；如果崩溃发生在 JSONL append 和 acknowledge 之间，重放会识别同一 message ID，不重复追加也不静默丢失。后续模型执行是否完成不改变用户消息已经持久化的事实。
+队列状态持久化为 `queued` 和 `in_flight`。每条 delivery 拥有稳定 ID 和原始创建时间，后端先 claim 并落盘，再用同一 ID 和时间幂等追加 Session 用户消息，持久化成功后才 acknowledge。应用在 claim 后异常退出时会重放 `in_flight`；如果崩溃发生在 JSONL append 和 acknowledge 之间，重放会识别同一 message ID，不重复追加也不静默丢失。
+
+文件、URL、Note 和图片引用只在首次 delivery 时解析。用户消息一旦写入 Session，重放直接使用 JSONL 中已提交的文本、Context 和 Image snapshot，不重新读取当前文件、重新抓取 URL 或生成新时间。稳定 ID 已存在但 role 或内容形态不合法时，该 delivery 进入 blocked 状态，不会用漂移输入继续执行。后续模型执行是否完成不改变用户消息已经持久化的事实。
+
+Assistant 消息与终态先持久化，然后才继续队列。有下一条 delivery 时，后端在同一个 active run 临界区内执行队列 claim 和旧 token -> 新 token 换代，不暴露可被第二个 run 抢占的空窗。因此 terminal 与续跑之间的权威 running 状态保持为真，界面的流式指示和停止入口通过 Session 快照对账，不依赖上一条 terminal 事件推测。
+
+前端对 queue 的本地发送、取消和 live event 都会推进加载 generation。较早发出的 queue snapshot 即使迟到，也不能覆盖这些更新；界面随后从后端重新读取 authoritative queue。时间线加载失败和 queue 加载失败分开呈现，重试其中一个不会清除另一个错误。
+
+队列文件损坏时，kxen 保留原文件并阻止该 Session 的队列操作，不把损坏内容解释为空队列。如果 rename 已可见但父目录 fsync 失败，当前进程会保留精确的期望快照并 fail closed。Composer 上方的存储恢复面板只在盘上状态与该快照完全相等时重新 fsync 并解除阻塞；无法证明一致时保持原文件，要求先导出诊断包并人工核对。
 
 ## Interrupt 模式
 
@@ -35,9 +43,11 @@ stateDiagram-v2
 
 设置入口位于 Settings 的通用区域。修改后对后续发送生效。
 
-## Abort
+## 停止
 
-Abort 直接取消当前 run，优先于 Approval 等待和长命令等待。取消后必须产生明确终态。等待队列不会把已经取消的工具调用恢复到后台继续执行。
+Composer 的「停止」动作会直接取消当前 run，优先于 Approval 等待和长命令等待。取消后必须产生明确终态。等待队列不会把已经取消的工具调用恢复到后台继续执行。
+
+停止或 interrupt 会让当前工具 future 结束。MCP 会移除 pending request 并 best-effort 通知 server 取消，exec 会终止对应进程并执行清理。取消不是外部副作用的事务回滚；工具在收到取消前已经完成的写入仍可能存在。
 
 ## 使用边界
 

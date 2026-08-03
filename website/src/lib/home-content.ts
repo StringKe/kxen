@@ -10,9 +10,11 @@ export const homeBody = `kxen 是一个面向复杂软件工程任务的 macOS �
 - [产品概览](https://kxen.ai/overview/)
 - [开始使用](https://kxen.ai/getting-started/)
 - [Workspace](https://kxen.ai/workspace/workspace/)
+- [模型与 Provider](https://kxen.ai/models/)
 - [Agent 与任务](https://kxen.ai/agent/)
 - [知识与定制](https://kxen.ai/knowledge/)
 - [集成能力](https://kxen.ai/integrations/)
+- [恢复与隔离](https://kxen.ai/recovery/)
 - [参考手册](https://kxen.ai/reference/)
 - [核心概念](https://kxen.ai/concepts/)
 

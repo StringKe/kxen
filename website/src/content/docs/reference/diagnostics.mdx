@@ -20,6 +20,12 @@ sidebar:
 
 界面加载失败时会显示错误，不把无数据渲染成全部正常。
 
+Knowledge Library 的 blocked consolidation 也是明确的 `UNKNOWN` 状态。它表示 Provider 请求可能已经发生、但没有 durable 结果，不能解读为零 token 或零条 Note。用户确认前不会自动重试；usage 结算或 cursor checkpoint 失败时 attempt 仍保留，可修复存储问题后再次确认。
+
+诊断读取 MCP 的当前快照，不会为了展示而启动 server 或触发项目级审批。当前 Workspace 的 MCP runtime 尚未完成首次加载时，界面明确显示 `UNKNOWN`；只有完成加载后的空列表才表示未配置。
+
+Session 时间线下方的存储恢复面板使用只读检查区分健康、可修复尾部、中间损坏和 PendingQueue 阻塞。诊断包中的 `storage recovery` 章节列出可枚举 Session 的异常状态以及 blocked queue；全部健康时明确写入 `PASS`。自动恢复不可证明时，应先导出该诊断包，不要手工清空 JSONL 或 queue 文件。
+
 ## Doctor
 
 在 Composer 使用 `/doctor` 执行环境自检。Doctor 与诊断页面读取同一类后端状态，适合在 Session 中让 Agent 协助解释结果。

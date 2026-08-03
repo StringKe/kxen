@@ -6,7 +6,7 @@ sidebar:
   order: 4
 ---
 
-Agent Teams 用于多个 Agent 需要持续协作的任务。Team 由 lead 和 member 组成，每个成员可以使用不同角色、模型和 Worktree。
+Agent Teams 用于多个 Agent 需要持续协作的任务。Team 由 lead 和 member 组成，每个成员可以使用不同角色和模型。Team 共享所属 Session 的工作目录；如果整个 Session 创建在 Worktree 内，lead 和 member 都在该隔离目录中工作。
 
 ## Team member
 
@@ -17,7 +17,6 @@ Agent Teams 用于多个 Agent 需要持续协作的任务。Team 由 lead 和 m
 - inbox。
 - 当前任务和状态。
 - 可选模型绑定。
-- 可选 Worktree 绑定。
 
 成员可以向 lead 或其他成员发送消息。消息进入目标 inbox，不会拼接到所有成员的上下文中。
 
@@ -25,12 +24,12 @@ Agent Teams 用于多个 Agent 需要持续协作的任务。Team 由 lead 和 m
 
 Team 任务记录:
 
-- pending、in_progress 和 completed 状态。
+- pending、in_progress、completing、blocked、completed、failed 和 canceled 状态。
 - assignee。
 - depends_on。
 - 任务描述和结果。
 
-依赖完成后，后续任务才能进入可执行状态。任务状态是 Team 协作真源，不应只依赖自然语言中的"我完成了"。
+依赖完成后，后续任务才能进入可执行状态。failed 或 canceled 会级联取消仍为 pending 的依赖任务；已经 in_progress 的任务自行结算。completion hook 成功后任务先进入 completing 中间态，由 task_resolve 提交后才结算为 completed。teammate crash 时，其进行中的任务被标记为 blocked。任务状态是 Team 协作真源，不应只依赖自然语言中的"我完成了"。
 
 ## 持久化
 

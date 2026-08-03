@@ -16,13 +16,13 @@ flowchart TB
   State["Rust AppState"]
   Runtime["Session、Agent、MRM、Tools、Knowledge、MCP、LSP"]
   Host["本地文件、进程、Provider 和系统能力"]
-  UI -->|"WebSocket RPC"| State
-  State -->|"Stream 事件"| UI
+  UI -->|"WebSocket（RPC 帧）"| State
+  State -->|"同一 WebSocket（stream 事件帧）"| UI
   State --> Runtime
   Runtime --> Host
 `}</pre>
 
-UI 不直接调用 Provider，也不直接拥有 Agent run。后端通过 RPC 接收操作，通过 Stream 推送 token、工具、审批、活动状态和终态事件。
+UI 不直接调用 Provider，也不直接拥有 Agent run。前端与后端之间只有一条 WebSocket 连接：操作以 JSON-RPC 帧发送，token、工具、审批、活动状态和终态事件则以同一连接上的 stream 事件帧推送，不存在独立的流通道。
 
 ## AppState
 
@@ -30,9 +30,9 @@ AppState 持有跨 Session 的共享运行对象，包括:
 
 - Session 和 active run registry。
 - Auth store 和 Provider catalog。
-- MRM。
+- WorkspaceRuntime registry、每个 Workspace 的 MRM 视图以及进程共享的并发、RPM 和路由历史。
 - Approval broker。
-- Task、Schedule、Team 和 Browser 状态。
+- Task、PendingQueue、Team、Browser 和 usage 运行状态。Goal、Schedule 和 Knowledge 等长期对象由各自的本地持久存储承载。
 - Event bus。
 
 共享状态不会因为前端组件卸载而结束。界面重连后应从后端快照恢复，再使用事件流保持更新。
@@ -47,4 +47,4 @@ Session 是用户工作的持久边界。一次 run 是 Session 中的一次执�
 
 ## 平台边界
 
-当前 Runtime 只支持 macOS 14 及以上版本和 Apple Silicon。Tauri bundle 目标是 DMG。本地 Developer ID 签名、公证、staple 和 Gatekeeper 已经实测通过；GitHub Actions 使用同一发布链生成 updater artifacts。公开 Release 尚未发布，因此不能把流水线就绪等同于公众已经可下载。
+当前 Runtime 只支持 macOS 14 及以上版本和 Apple Silicon。Tauri 生成 App 与 DMG，对外安装介质为 DMG。kxen 仍处于开发预览阶段，尚未开放公开签名安装包和稳定更新通道。源码中的发布配置不代表公众已经可以下载，安装资格以 [可用性](https://kxen.ai/overview/availability) 为准。

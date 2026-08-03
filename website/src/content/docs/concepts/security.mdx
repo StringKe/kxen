@@ -21,15 +21,15 @@ flowchart LR
 
 ## 信任边界
 
-| 边界      | 规则                                   |
-| --------- | -------------------------------------- |
-| Workspace | 统一解析相对、绝对和不存在的目标路径   |
-| 项目配置  | 未信任 Workspace 不加载项目 TOML       |
-| 项目 MCP  | 未信任 Workspace 不启动                |
-| 外部文件  | 需要原生文件选择器授权，授权按路径生效 |
-| 模型调用  | 统一经过 MRM 和 Auth store             |
-| 工具调用  | 统一经过角色权限、Safety 和 Approval   |
-| 网络请求  | 初始 URL 经过地址和重定向检查          |
+| 边界      | 规则                                               |
+| --------- | -------------------------------------------------- |
+| Workspace | 统一解析相对、绝对和不存在的目标路径               |
+| 项目配置  | 未信任 Workspace 不加载项目 TOML                   |
+| 项目 MCP  | 未信任 Workspace 不加载；stdio 还需独立执行审批    |
+| 外部文件  | 需要原生文件选择器授权，授权按路径生效             |
+| 模型调用  | 统一经过 MRM 和 Auth store                         |
+| 工具调用  | 统一经过角色权限、Safety 和 Approval               |
+| 网络请求  | URL 与实际连接地址受检，Browser 全流量经过受控代理 |
 
 ## 凭证
 
@@ -37,13 +37,13 @@ API key 和 OAuth token 保存在本地权限受限文件中。凭证不进入�
 
 Provider 凭证可以来自官方客户端的本地登录状态或用户显式配置。模型只看到调用结果，不获得原始 secret。
 
-原生文件选择器也不能把 credential 目录或常见 secret 文件授权给 Agent，包括 Kxen 数据目录、Keychain、`.ssh`、`.gnupg`、`.aws`、`.kube`、`.docker`、各类 Agent 配置目录，以及 `.p8`、`.p12`、`.pfx` 和 keychain 文件。不存在目标通过最近存在父目录完成 canonicalization，符号链接和 `..` 不能绕过 Workspace 边界。
+原生文件选择器也不能把 credential 目录或常见 secret 文件授权给 Agent，包括 kxen 数据目录、Keychain、`.ssh`、`.gnupg`、`.aws`、`.kube`、`.docker`、各类 Agent 配置目录，以及 `.p8`、`.p12`、`.pfx` 和 keychain 文件。不存在目标通过最近存在父目录完成 canonicalization，符号链接和 `..` 不能绕过 Workspace 边界。
 
 ## 最小权限
 
 研究和规划角色默认只读。写文件、执行命令和删除数据需要 execution 权限。MCP 工具还可以逐项配置 allow、ask 或 deny。
 
-Shell 命令在宿主机执行，不宣称提供进程沙盒。Kxen 不加载用户 Shell rc 或 alias 快照，并且每条命令和 background task start/restart 都需要显示完整 command 与 cwd 的当次 Approval。拒绝或没有可用 Approval channel 时执行失败关闭。
+Shell 命令在宿主机执行，不宣称提供进程沙盒。kxen 不加载用户 Shell rc 或 alias 快照，并且每条命令和 background task start/restart 都需要显示完整 command 与 cwd 的当次 Approval。拒绝或没有可用 Approval channel 时执行失败关闭。
 
 ## 硬保护
 
@@ -51,12 +51,14 @@ Safety 对系统路径、Credential 目录、Git 元数据、磁盘操作和大�
 
 ## 可恢复性
 
-- 文件和 Session 删除进入废纸篓。
+- 文件和 Session 删除进入系统废纸篓。
 - Checkpoint 使用独立 shadow Git repository。
 - Worktree 隔离并行修改。
-- Approval 结果写入 Session。
-- Abort 使未完成审批失效。
+- Session-scoped Approval 结果写入对应 Session；全局审批不伪造 Session 记录。
+- 用户停止 Session 会使未完成审批失效。
 
 ## 已知边界
 
-Browser 页内导航和子资源未形成完整 SSRF 边界。Remote MCP、Browser automation 和自动知识沉淀仍是实验性能力，个人配置中默认全部关闭，项目配置不能替用户开启。启用后也不能用于无监督处理高敏感数据。
+Browser 会在初始导航前检查 URL，并把 Chrome 的 HTTP、HTTPS 和 WebSocket 流量固定到进程内代理，不配置 direct fallback。代理对每个导航、redirect、iframe、子资源和脚本请求分别解析域名，拒绝任一受限地址，并只连接本次检查通过的具体地址。HTTPS 保留原始域名的 TLS SNI。请求解析、连接、空闲和流量超过上限时失败关闭。每个非 close 操作后的 top-level URL 复查是额外防线，不承担网络拦截职责。
+
+Remote MCP、Browser automation 和自动知识沉淀仍是实验性能力，个人配置中默认全部关闭，项目配置不能替用户开启。启用后也不能用于无监督处理高敏感数据。

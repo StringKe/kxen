@@ -32,7 +32,7 @@ Workspace 提供文件边界。Session 提供持久对话边界。run 是一次�
 
 ## Goal
 
-Goal 为跨轮任务保存 objective、completion criteria、constraints、预算和状态。complete 需要验证证据，blocked 需要同一阻塞原因连续出现 3 轮。
+Goal 为跨轮任务保存 objective、completion criteria、constraints、预算和状态。complete 需要验证证据；blocked 由 terminal 类原因立即触发，或因同一阻塞原因连续出现 3 轮触发。
 
 ## Subagent
 
@@ -46,7 +46,7 @@ Workflow 把 JavaScript 运行在 QuickJS 沙箱中。脚本可以调用 Agent�
 
 ## Agent Teams
 
-Team 适合需要长期协作、共享任务依赖和成员消息的工作。每个 member 有独立 transcript 和 inbox，可以绑定角色、模型和 Worktree。
+Team 适合需要长期协作、共享任务依赖和成员消息的工作。每个 member 有独立 transcript 和 inbox，可以绑定角色和模型。Team 共享所属 Session 的工作目录；需要文件隔离时，应让整个 Session 位于 Worktree 中。
 
 ## 统一控制面
 
@@ -54,6 +54,6 @@ Team 适合需要长期协作、共享任务依赖和成员消息的工作。每
 
 - 模型调用必须经过 MRM。
 - 工具调用必须经过角色权限和 Safety。
-- Abort 必须能够中断等待。
+- 用户停止 Session 时必须能够中断等待。
 - 运行状态必须进入事件流。
 - 最终结果必须写入 Session 或对应持久化对象。
