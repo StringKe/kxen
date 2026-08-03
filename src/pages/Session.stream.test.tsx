@@ -277,12 +277,13 @@ describe("Session 流式与对账", () => {
     dispose();
   });
 
-  it("session.update 存亡广播 running=true：未臂时重臂 streaming（续跑恢复进度指示）", async () => {
+  it("session.update 存亡广播 running=true：初始核对即臂上 streaming（续跑恢复进度指示）", async () => {
     h.sessionRunning.mockImplementation(async () => true);
     setActiveSessionId("s1");
     const dispose = render(() => <Session />, document.body);
     await flush();
-    expect(document.body.textContent).not.toContain("composer-streaming");
+    // mountSource 初始核对：冷启动恰逢进行中 run 立即臂上，不等首帧存亡广播
+    expect(document.body.textContent).toContain("composer-streaming");
     h.sessionUpdateHandlers.forEach((cb) => cb({}));
     await flush();
     expect(document.body.textContent).toContain("composer-streaming");

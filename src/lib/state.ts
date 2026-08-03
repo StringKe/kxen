@@ -46,6 +46,25 @@ function intentChanged(revision: number): boolean {
   return revision !== sessionIntentRevision;
 }
 
+/** 草稿首发落库产生的 "" -> id 激活：Session 页据此跳过时间线重载（乐观上屏是唯一权威）。
+ *  其余 "" -> id 路径（冷启动 initSessions、删除活跃会话后的自动替代）必须重载时间线。 */
+let firstSendActivationId = "";
+
+export function markFirstSendActivation(id: string): void {
+  firstSendActivationId = id;
+}
+
+function clearFirstSendActivation(id: string): void {
+  if (firstSendActivationId === id) firstSendActivationId = "";
+}
+
+/** 一次性消费：只有紧邻的 "" -> id 激活能命中，迟到的同 id 转换不误判。 */
+export function consumeFirstSendActivation(id: string): boolean {
+  if (firstSendActivationId !== id) return false;
+  firstSendActivationId = "";
+  return true;
+}
+
 /** 长 RPC 完成前验证用户仍停留在发起动作时的会话意图。 */
 export function captureSessionIntent(): number {
   return sessionIntentRevision;
@@ -185,8 +204,15 @@ export async function ensureActiveSession(): Promise<string> {
     }
     // 先迁移草稿键再激活：激活触发的 composer 恢复要读到迁移后的内容
     migrateNewDraft(created.id);
-    await switchSession(created.id);
+    markFirstSendActivation(created.id);
+    try {
+      await switchSession(created.id);
+    } catch (error) {
+      clearFirstSendActivation(created.id);
+      throw error;
+    }
     if (activeSessionId() !== created.id) {
+      clearFirstSendActivation(created.id);
       throw new SessionAdmissionError("会话已切换，新建会话未自动激活", "");
     }
     if (modelError) throw new SessionAdmissionError(formatError(modelError), created.id);

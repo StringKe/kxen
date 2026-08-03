@@ -138,4 +138,21 @@ describe("mountSource（session.update 存亡广播）", () => {
     await flush();
     expect(c.sid()).toBe("s1");
   });
+
+  it("订阅建立即初始核对：冷启动恰逢进行中 run 立即臂上 streaming（不等首帧事件）", async () => {
+    h.sessionRunning.mockResolvedValue(true);
+    const c = setup();
+    c.mountSource();
+    await flush();
+    expect(h.sessionRunning).toHaveBeenCalledWith("s1");
+    expect(c.sid()).toBe("s1");
+  });
+
+  it("草稿态挂载：初始核对跳过（无活跃会话不打 RPC）", async () => {
+    const c = setup("");
+    c.mountSource();
+    await flush();
+    expect(h.sessionRunning).not.toHaveBeenCalled();
+    expect(c.sid()).toBe("");
+  });
 });

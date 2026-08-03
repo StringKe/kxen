@@ -2,7 +2,7 @@
 // 用户不应手敲绝对路径；选择器取消返回 null，静默无事发生。
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { workspaceAdd, workspaceSwitch } from "./chat";
-import { refreshSessions } from "./state";
+import { activeSessionId, hasConversation, newSession, refreshSessions } from "./state";
 import { flashErr } from "./flash";
 import { formatError } from "./error-text";
 
@@ -23,6 +23,9 @@ export async function openProjectDir(): Promise<boolean> {
   try {
     await workspaceAdd(selected);
     await workspaceSwitch(selected);
+    // 已落库的空会话仍绑旧目录：不切回草稿，下一条消息就会在旧目录运行，
+    // 与「会话在该目录下运行」的承诺相违。有内容的会话与草稿态不动。
+    if (activeSessionId() && !hasConversation()) await newSession();
     await refreshSessions();
     return true;
   } catch (e) {

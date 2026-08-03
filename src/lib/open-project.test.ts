@@ -5,11 +5,18 @@ const h = vi.hoisted(() => ({
   add: vi.fn<(path: string) => Promise<void>>(),
   switch: vi.fn<(path: string) => Promise<void>>(),
   refresh: vi.fn<() => Promise<void>>(),
+  newSession: vi.fn<() => Promise<void>>(),
+  active: { id: "", conversation: false },
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: h.open }));
 vi.mock("./chat", () => ({ workspaceAdd: h.add, workspaceSwitch: h.switch }));
-vi.mock("./state", () => ({ refreshSessions: h.refresh }));
+vi.mock("./state", () => ({
+  refreshSessions: h.refresh,
+  newSession: h.newSession,
+  activeSessionId: () => h.active.id,
+  hasConversation: () => h.active.conversation,
+}));
 
 import { flash } from "./flash";
 import { openProjectDir } from "./open-project";
@@ -23,6 +30,10 @@ beforeEach(() => {
   h.switch.mockResolvedValue(undefined);
   h.refresh.mockReset();
   h.refresh.mockResolvedValue(undefined);
+  h.newSession.mockReset();
+  h.newSession.mockResolvedValue(undefined);
+  h.active.id = "";
+  h.active.conversation = false;
 });
 
 afterEach(() => {
@@ -48,5 +59,22 @@ describe("openProjectDir", () => {
     expect(h.add).toHaveBeenCalledWith("/tmp/project");
     expect(h.switch).toHaveBeenCalledWith("/tmp/project");
     expect(h.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("已落库空会话仍绑旧目录：切目录后回到草稿（首发在新目录落库）", async () => {
+    h.open.mockResolvedValue("/tmp/project");
+    h.active.id = "s-empty";
+    h.active.conversation = false;
+    await expect(openProjectDir()).resolves.toBe(true);
+    expect(h.newSession).toHaveBeenCalledTimes(1);
+    expect(h.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("有内容的会话与草稿态不被切目录打断", async () => {
+    h.open.mockResolvedValue("/tmp/project");
+    h.active.id = "s-full";
+    h.active.conversation = true;
+    await expect(openProjectDir()).resolves.toBe(true);
+    expect(h.newSession).not.toHaveBeenCalled();
   });
 });

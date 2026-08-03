@@ -31,12 +31,18 @@ export function createStreamingReconcile(deps: {
     });
   };
 
-  /** session.update（RunGuard 存亡广播）驱动真源核对：续跑重臂、快速终态丢帧收回。返回注销。 */
-  const mountSource = () =>
-    client.stream("session.update").on(() => {
+  /** session.update（RunGuard 存亡广播）驱动真源核对：续跑重臂、快速终态丢帧收回。返回注销。
+   *  订阅建立后对当前会话补一轮初始核对：冷启动恰逢进行中 run 时
+   *  streaming 否则要等下一帧事件才臂上（停止按钮缺失）。 */
+  const mountSource = () => {
+    const off = client.stream("session.update").on(() => {
       const sid = deps.activeSessionId();
       if (sid) reconcile(sid, "keep");
     });
+    const sid = deps.activeSessionId();
+    if (sid) reconcile(sid, "keep");
+    return off;
+  };
 
   return { reconcile, mountSource };
 }

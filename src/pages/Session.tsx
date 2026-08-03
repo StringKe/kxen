@@ -11,7 +11,12 @@ import { createSessionRewind } from "../lib/rewind";
 import { createStreamingReconcile } from "../lib/streaming-reconcile";
 import PendingQueue from "../components/PendingQueue";
 import RewindConfirm from "../components/RewindConfirm";
-import { activeSessionId, sessions, setHasConversation } from "../lib/state";
+import {
+  activeSessionId,
+  consumeFirstSendActivation,
+  sessions,
+  setHasConversation,
+} from "../lib/state";
 import type { OrbState } from "../lib/orb";
 import Composer from "../components/composer/TextComposer";
 import SessionHeader from "../components/SessionHeader";
@@ -124,7 +129,8 @@ export default function Session() {
   };
 
   // 切换会话：加载存储的时间线；草稿态（""）清空。
-  // 草稿->激活（首发）跳过重载：此时本地上屏是唯一权威（空载会抹掉乐观上屏消息）。
+  // 草稿->激活仅首发落库（consumeFirstSendActivation 命中）跳过重载：
+  // 此时本地上屏是唯一权威（空载会抹掉乐观上屏消息）；其余 "" -> id 一律重载。
   createEffect(() => {
     const id = activeSessionId();
     if (prevSid !== id) {
@@ -149,7 +155,9 @@ export default function Session() {
     }
     const fromDraft = prevSid === "";
     prevSid = id;
-    if (fromDraft) return;
+    // 仅草稿首发落库的 "" -> id 激活跳过重载（乐观上屏是唯一权威）；
+    // 冷启动/删除活跃会话后自动替代的 "" -> id 必须重载，否则历史时间线永不加载且静默。
+    if (fromDraft && consumeFirstSendActivation(id)) return;
     loadTimeline(id);
   });
 

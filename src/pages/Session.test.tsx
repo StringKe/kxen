@@ -1,6 +1,7 @@
 // Session 路由卸载重挂载：prevSid 是组件实例变量，重挂载后重置。
 // null 哨兵首跑强制重载（修：重挂载误判 fromDraft 跳过重载 = 时间线空白）；
-// 草稿->激活首发仍跳过重载（空载会抹掉乐观上屏 = 首行消失）。
+// 草稿->激活仅首发落库（markFirstSendActivation）跳过重载（空载会抹掉乐观上屏 = 首行消失），
+// 冷启动/删除活跃会话后的 "" -> id 自动激活必须重载（否则历史时间线永不加载且静默）。
 import { render } from "solid-js/web";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { StoredMessage } from "../lib/chat";
@@ -45,7 +46,7 @@ vi.mock("../components/StorageRecoveryPanel", () => ({ default: () => null }));
 vi.mock("../components/AssistantItem", () => ({ default: () => null }));
 
 import Session from "./Session";
-import { setActiveSessionId } from "../lib/state";
+import { markFirstSendActivation, setActiveSessionId } from "../lib/state";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -73,10 +74,21 @@ describe("Session 路由卸载重挂载", () => {
     dispose2();
   });
 
+  it("冷启动/自动替代的 草稿->激活 重载时间线（无首发标记不得跳过）", async () => {
+    const dispose = render(() => <Session />, document.body); // 草稿态 ""
+    await flush();
+    setActiveSessionId("s2"); // initSessions/删除活跃会话后的自动激活，非首发落库
+    await flush();
+    expect(h.sessionMessages).toHaveBeenCalledWith("s2");
+    expect(document.body.textContent).toContain("历史消息一");
+    dispose();
+  });
+
   it("草稿->激活首发仍跳过重载（乐观上屏不被空载抹掉）", async () => {
     const dispose = render(() => <Session />, document.body); // 草稿态 ""
     await flush();
-    setActiveSessionId("s2"); // 首发落库后激活
+    markFirstSendActivation("s2"); // ensureActiveSession 首发落库后的激活
+    setActiveSessionId("s2");
     await flush();
     expect(h.sessionMessages).not.toHaveBeenCalled();
     dispose();
