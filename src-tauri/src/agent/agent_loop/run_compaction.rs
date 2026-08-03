@@ -40,6 +40,12 @@ pub(super) async fn compact_if_needed(
     } else {
         None
     };
+    // 蒸馏请求越过 Provider 网络边界前，把计量 claim 落为 Started（durable boundary），
+    // 与 run.rs/websearch/verify 同一不变量；admission 失败/取消仍按 Prepared 丢弃。
+    let start_barrier = metering.as_mut().map(|attempt| {
+        let reporter = ctx.usage_reporter.as_ref().expect("metering claim implies a usage reporter");
+        Box::new(move || reporter.mark_started(attempt)) as Box<dyn FnMut() -> Result<(), String> + Send + '_>
+    });
     let compacted = match crate::agent::compact::compact_messages(
         ctx.mrm.as_deref(),
         &ctx.model,
@@ -48,6 +54,7 @@ pub(super) async fn compact_if_needed(
         6,
         timeout,
         ctx.cancel.as_ref(),
+        start_barrier,
     )
     .await
     {
@@ -108,9 +115,8 @@ fn charge_metering(
     }
     match (&ctx.usage_reporter, attempt.take()) {
         (Some(reporter), Some(mut attempt)) => {
-            // claim 在 compact_messages 之前以 Prepared 落盘；summarize 的 Provider 请求
-            // 不经过此 claim，request_started=true 即证明已越过网络边界，先补 Started 标记
-            // （幂等）再 observe/settle，否则恢复流程会把已发出的请求误当未发出。
+            // start_barrier 已在 Provider 边界前把 claim 落为 Started；这里的幂等补标是
+            // 兜底（barrier 未接线的路径），保证 request_started=true 时相位必然正确。
             reporter.mark_started(&mut attempt)?;
             if let Some(usage) = &usage {
                 reporter.observe(&mut attempt, usage.input, usage.output)?;

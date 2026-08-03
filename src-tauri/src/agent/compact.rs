@@ -61,6 +61,9 @@ pub struct CompactSessionOptions<'a> {
     pub keep_recent: usize,
     pub timeout: std::time::Duration,
     pub cancel: Option<&'a crate::agent::cancel::CancelToken>,
+    /// Provider 网络边界前的 durable Started 标记（session 计量 claim），
+    /// 在 permit.start() 之前 fsync；无计量 claim 的调用方传 None。
+    pub start_barrier: Option<Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
 }
 
 struct SummaryAttempt {
@@ -140,7 +143,9 @@ Output plain markdown, <= 800 words.\n\nCONVERSATION:\n";
 /// 压缩消息序列：保留 system（若有）与最近 keep_recent 条，旧段蒸馏为一条 user 摘要。
 /// 返回（压缩后序列，摘要文本，被摘要的非 system 消息数）；无需压缩时摘要为 None。
 /// LLM 失败降级截断式保留（旧段只留首尾），绝不丢最近上下文。
-pub async fn compact_messages(
+/// start_barrier 在蒸馏请求越过 Provider 网络边界前触发（计量 claim 的 durable Started 标记）。
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_messages<'a>(
     mrm: Option<&crate::llm::mrm::ModelResourceManager>,
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
@@ -148,6 +153,7 @@ pub async fn compact_messages(
     keep_recent: usize,
     timeout: std::time::Duration,
     cancel: Option<&crate::agent::cancel::CancelToken>,
+    start_barrier: Option<Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
 ) -> Result<CompactResult, CompactError> {
     let (system, rest) = match messages.first() {
         Some(m) if m.role == crate::llm::types::Role::System => (vec![m.clone()], &messages[1..]),
@@ -173,7 +179,7 @@ pub async fn compact_messages(
     }
     let (old, recent) = rest.split_at(split);
     let segment: String = old.iter().map(|m| format!("{:?}: {}", m.role, m.content)).collect::<Vec<_>>().join("\n\n");
-    let attempt = summarize(mrm, model, store, &segment, timeout, cancel).await?;
+    let attempt = summarize(mrm, model, store, &segment, timeout, cancel, start_barrier).await?;
     let summary = match attempt.output.as_ref().map(|output| output.text.trim()).filter(|text| !text.is_empty()) {
         Some(summary) => summary.to_string(),
         None => fallback_summary(old),
@@ -212,7 +218,7 @@ pub async fn compact_session(
     store: &crate::auth::credential::AuthStore,
     options: CompactSessionOptions<'_>,
 ) -> Result<Option<CompactionReport>, CompactError> {
-    let CompactSessionOptions { mrm, keep_recent, timeout, cancel } = options;
+    let CompactSessionOptions { mrm, keep_recent, timeout, cancel, start_barrier } = options;
     let raw = crate::core::session::load_messages_checked(dir, id).map_err(history_error)?;
     if raw.len() <= keep_recent {
         return Ok(None);
@@ -225,7 +231,7 @@ pub async fn compact_session(
         .collect::<Vec<_>>();
     let llm_msgs = flattened.iter().map(|(message, _)| message.clone()).collect::<Vec<_>>();
     let before = estimate_tokens(&llm_msgs);
-    let compacted = compact_messages(mrm, model, store, &llm_msgs, keep_recent, timeout, cancel).await?;
+    let compacted = compact_messages(mrm, model, store, &llm_msgs, keep_recent, timeout, cancel, start_barrier).await?;
     let Some(summary) = compacted.summary.clone() else { return Ok(None) };
     let system_offset = usize::from(llm_msgs.first().is_some_and(|message| message.role == crate::llm::types::Role::System));
     let upto = flattened
@@ -263,13 +269,14 @@ pub async fn compact_session(
     }))
 }
 
-async fn summarize(
+async fn summarize<'a>(
     mrm: Option<&crate::llm::mrm::ModelResourceManager>,
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
     segment: &str,
     timeout: std::time::Duration,
     cancel: Option<&crate::agent::cancel::CancelToken>,
+    start_barrier: Option<Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
 ) -> Result<SummaryAttempt, CompactError> {
     let Some(mrm) = mrm else {
         return Ok(SummaryAttempt {
@@ -283,7 +290,19 @@ async fn summarize(
     };
     let tail: String = segment.chars().rev().take(48_000).collect::<Vec<_>>().into_iter().rev().collect();
     let req = vec![Message::user(format!("{COMPACT_PROMPT}{tail}"))];
-    match crate::llm::managed::collect_text_observed(mrm, model, &req, store, timeout, None, cancel).await {
+    match crate::llm::managed::collect_text_observed_with_policy_and_start(
+        mrm,
+        model,
+        &req,
+        store,
+        timeout,
+        None,
+        cancel,
+        crate::llm::managed::CircuitPolicy::Record,
+        start_barrier,
+    )
+    .await
+    {
         Ok(output) => Ok(SummaryAttempt {
             usage: output.usage.clone(),
             request_started: true,

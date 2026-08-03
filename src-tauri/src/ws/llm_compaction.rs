@@ -30,8 +30,14 @@ pub(super) async fn compact_if_needed(input: CompactionInput<'_>) -> Result<(), 
         .expect("compaction cap always produces a timeout");
 
     state.bus.publish(kxen_app::core::event::Event::notify("上下文超阈值，正在自动压缩历史", Some(session_id.to_string())));
-    let options = kxen_app::agent::compact::CompactSessionOptions { mrm: Some(mrm), keep_recent: 6, timeout, cancel: Some(cancel) };
-    let metering = CompactionMeter::begin(state, session_id, goal_id).map_err(|event| (event, None))?;
+    let mut metering = CompactionMeter::begin(state, session_id, goal_id).map_err(|event| (event, None))?;
+    let options = kxen_app::agent::compact::CompactSessionOptions {
+        mrm: Some(mrm),
+        keep_recent: 6,
+        timeout,
+        cancel: Some(cancel),
+        start_barrier: Some(Box::new(metering.start_barrier())),
+    };
     match kxen_app::agent::compact::compact_session(sessions_dir, session_id, model, store, options).await {
         Ok(Some(report)) => {
             let model_used = report.model_used.clone();
@@ -86,6 +92,14 @@ impl CompactionMeter {
         let attempt =
             reporter.begin(goal_id).map_err(|error| AgentEvent::Error { message: format!("compaction usage claim failed: {error}") })?;
         Ok(Self { reporter, attempt, bus: state.bus.clone(), session_id: session_id.to_string() })
+    }
+
+    /// Provider 网络边界前的 durable Started 标记（permit.start() 之前 fsync），
+    /// 与 run.rs/websearch/verify 同一不变量；admission 失败/取消仍按 Prepared 丢弃。
+    pub(crate) fn start_barrier(&mut self) -> impl FnMut() -> Result<(), String> + Send + '_ {
+        let reporter = &self.reporter;
+        let attempt = &mut self.attempt;
+        move || reporter.mark_started(attempt).map_err(|error| format!("compaction Started marker failed: {error}"))
     }
 
     pub(crate) fn settle(

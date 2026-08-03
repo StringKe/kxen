@@ -65,7 +65,7 @@ pub async fn verify_provider(
             };
         }
     };
-    let mut start = || {
+    let start = || {
         usage_reporter
             .mark_started(&mut attempt)
             .map_err(|error| format!("probe was not started because its durable Started marker failed: {error}"))
@@ -79,7 +79,7 @@ pub async fn verify_provider(
         None,
         None,
         crate::llm::managed::CircuitPolicy::Neutral,
-        Some(&mut start),
+        Some(Box::new(start)),
     )
     .await;
     let result = settle_probe(result, usage_reporter, &mut attempt);

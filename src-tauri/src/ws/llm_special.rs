@@ -104,10 +104,16 @@ async fn compact_session(
         Ok(None) => kxen_app::agent::compact::COMPACT_TIMEOUT,
         Err(message) => return (AgentEvent::Error { message }, None),
     };
-    let options = kxen_app::agent::compact::CompactSessionOptions { mrm: Some(&mrm), keep_recent: 4, timeout, cancel: Some(cancel) };
-    let metering = match super::llm_compaction::CompactionMeter::begin(state, session_id, goal_id) {
+    let mut metering = match super::llm_compaction::CompactionMeter::begin(state, session_id, goal_id) {
         Ok(metering) => metering,
         Err(event) => return (event, None),
+    };
+    let options = kxen_app::agent::compact::CompactSessionOptions {
+        mrm: Some(&mrm),
+        keep_recent: 4,
+        timeout,
+        cancel: Some(cancel),
+        start_barrier: Some(Box::new(metering.start_barrier())),
     };
     let (notice, model_used) = match kxen_app::agent::compact::compact_session(sessions_dir, session_id, &model, &store, options).await {
         Ok(Some(report)) => {

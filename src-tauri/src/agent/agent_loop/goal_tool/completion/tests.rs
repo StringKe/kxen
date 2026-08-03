@@ -90,12 +90,12 @@ async fn concurrent_complete_calls_share_one_paid_judge_and_one_result() {
     let calls = AtomicUsize::new(0);
     let accounting = Accounting { auxiliary: &auxiliary, reporter: &metering };
 
-    let first = complete_goal_with(&dir, id, evidence, Some("ses_concurrent"), None, accounting, |_| async {
+    let first = complete_goal_with(&dir, id, evidence, Some("ses_concurrent"), None, accounting, |_, _| async {
         calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         passing_attempt(10, 2)
     });
-    let second = complete_goal_with(&dir, id, evidence, Some("ses_concurrent"), None, accounting, |_| async {
+    let second = complete_goal_with(&dir, id, evidence, Some("ses_concurrent"), None, accounting, |_, _| async {
         calls.fetch_add(1, Ordering::SeqCst);
         passing_attempt(10, 2)
     });
@@ -128,7 +128,7 @@ async fn passing_score_is_reused_after_budget_adjust_without_repaying() {
         Some("ses_budget"),
         None,
         Accounting { auxiliary: &auxiliary, reporter: &metering },
-        |_| async {
+        |_, _| async {
             calls.fetch_add(1, Ordering::SeqCst);
             passing_attempt(4, 2)
         },
@@ -148,7 +148,7 @@ async fn passing_score_is_reused_after_budget_adjust_without_repaying() {
         Some("ses_budget"),
         None,
         Accounting { auxiliary: &auxiliary, reporter: &metering },
-        |_| async {
+        |_, _| async {
             calls.fetch_add(1, Ordering::SeqCst);
             passing_attempt(4, 2)
         },
@@ -179,7 +179,7 @@ async fn paid_failure_is_cached_until_explicit_adjust() {
             Some("ses_failure"),
             None,
             Accounting { auxiliary: &auxiliary, reporter: &metering },
-            |_| async {
+            |_, _| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 rejected_attempt()
             },
@@ -202,7 +202,7 @@ async fn paid_failure_is_cached_until_explicit_adjust() {
         Some("ses_failure"),
         None,
         Accounting { auxiliary: &auxiliary, reporter: &metering },
-        |_| async {
+        |_, _| async {
             calls.fetch_add(1, Ordering::SeqCst);
             passing_attempt(3, 1)
         },

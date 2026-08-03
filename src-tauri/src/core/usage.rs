@@ -131,12 +131,6 @@ impl<'de> serde::Deserialize<'de> for SessionUsage {
     }
 }
 
-pub fn add_run(map: &mut HashMap<String, SessionUsage>, session_id: &str, stats: crate::agent::agent_loop::RunStats) {
-    let entry = map.entry(session_id.to_string()).or_default();
-    entry.add_known(stats.input_tokens, stats.output_tokens);
-    entry.unmetered_calls = entry.unmetered_calls.saturating_add(stats.unmetered_calls);
-}
-
 /// Settle one durable Provider claim into the session receipt and Goal outbox,
 /// then remove the claim. A crash before cleanup simply replays the same
 /// operation id, so both ledgers remain idempotent.

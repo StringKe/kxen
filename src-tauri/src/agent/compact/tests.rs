@@ -35,7 +35,8 @@ fn compact_preserves_system_and_recent() {
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let store = crate::auth::credential::AuthStore::default();
-    let compacted = rt.block_on(compact_messages(None, &model, &store, &msgs, 4, COMPACT_TIMEOUT, None)).expect("fallback compaction");
+    let compacted =
+        rt.block_on(compact_messages(None, &model, &store, &msgs, 4, COMPACT_TIMEOUT, None, None)).expect("fallback compaction");
     let out = compacted.messages;
     assert_eq!(out[0].content, "sys");
     assert_eq!(out[1].role, crate::llm::types::Role::User);
@@ -56,7 +57,8 @@ fn compact_boundary_skips_orphan_tool_results() {
     msgs.push(Message::user("tail".to_string()));
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let store = crate::auth::credential::AuthStore::default();
-    let out = rt.block_on(compact_messages(None, &model, &store, &msgs, 2, COMPACT_TIMEOUT, None)).expect("fallback compaction").messages;
+    let out =
+        rt.block_on(compact_messages(None, &model, &store, &msgs, 2, COMPACT_TIMEOUT, None, None)).expect("fallback compaction").messages;
     let first_recent = &out[out.len() - 2];
     assert_ne!(first_recent.role, crate::llm::types::Role::Tool, "recent 首条不能是孤儿 tool result");
     assert_eq!(out.last().unwrap().content, "tail");
@@ -69,8 +71,16 @@ async fn cancelled_compaction_never_writes_a_fallback_summary() {
     let cancel = crate::agent::cancel::CancelToken::new();
     cancel.cancel();
 
-    let result =
-        compact_messages(Some(&mrm), &ModelRef::new("xai", "grok"), &Default::default(), &messages, 2, COMPACT_TIMEOUT, Some(&cancel))
-            .await;
+    let result = compact_messages(
+        Some(&mrm),
+        &ModelRef::new("xai", "grok"),
+        &Default::default(),
+        &messages,
+        2,
+        COMPACT_TIMEOUT,
+        Some(&cancel),
+        None,
+    )
+    .await;
     assert!(matches!(result, Err(CompactError::Cancelled { unmetered_call: false, .. })));
 }

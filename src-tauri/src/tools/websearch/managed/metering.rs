@@ -76,6 +76,9 @@ pub(super) fn record_metering(
     runtime: &SearchRuntime<'_>,
     attempt: &mut crate::core::usage::ProviderAttempt,
 ) -> Result<Option<String>, String> {
+    // durable settle 先入账：若持久化失败，auxiliary/trend 不得先记——
+    // 否则辅助计量比 Goal durable 账本多计，漏计方向相反且无用户可见错误。
+    let outcome = settle_durable_usage(runtime.usage_reporter, attempt, usage)?;
     match usage {
         Some(usage) => {
             runtime.auxiliary_usage.record(usage.input, usage.output);
@@ -90,7 +93,6 @@ pub(super) fn record_metering(
             }
         }
     }
-    let outcome = settle_durable_usage(runtime.usage_reporter, attempt, usage)?;
     Ok(outcome.stop_message)
 }
 

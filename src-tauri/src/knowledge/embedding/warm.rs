@@ -202,6 +202,13 @@ fn record_metering(
     runtime: &EmbeddingRuntime,
     attempt: &mut ProviderAttempt,
 ) -> Result<(), String> {
+    // durable settle 先入账：若持久化失败，trend 不得先记——
+    // 否则趋势比 Goal durable 账本多计，漏计方向相反且无用户可见错误。
+    let reporter = runtime.usage_reporter.as_ref().ok_or("embedding usage reporter disappeared")?;
+    if let Some(usage) = usage {
+        reporter.observe(attempt, usage.input, usage.output)?;
+    }
+    let outcome = reporter.settle(attempt)?;
     match usage {
         Some(usage) => {
             publish_trend_warning(runtime, crate::core::usage_trend::record(provider, usage.input, usage.output));
@@ -210,11 +217,6 @@ fn record_metering(
             publish_trend_warning(runtime, crate::core::usage_trend::record_unknown(provider));
         }
     }
-    let reporter = runtime.usage_reporter.as_ref().ok_or("embedding usage reporter disappeared")?;
-    if let Some(usage) = usage {
-        reporter.observe(attempt, usage.input, usage.output)?;
-    }
-    let outcome = reporter.settle(attempt)?;
     for warning in outcome.durability_warnings {
         publish(runtime, format!("用量持久化已修复：{warning}"));
     }

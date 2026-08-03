@@ -115,7 +115,7 @@ pub async fn collect_text_observed_with_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn collect_text_observed_with_policy_and_start(
+pub async fn collect_text_observed_with_policy_and_start<'a>(
     mrm: &crate::llm::mrm::ModelResourceManager,
     model: &ModelRef,
     messages: &[Message],
@@ -124,7 +124,7 @@ pub async fn collect_text_observed_with_policy_and_start(
     stream_override: Option<&StreamFn>,
     cancel: Option<&crate::agent::cancel::CancelToken>,
     circuit_policy: CircuitPolicy,
-    mut start_barrier: Option<&mut (dyn FnMut() -> Result<(), String> + Send)>,
+    mut start_barrier: Option<Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
 ) -> Result<ManagedOutput, ManagedError> {
     let mut effective_model = model.clone();
     effective_model.account = crate::auth::credential::effective_account_name(store, &model.provider, model.account.as_deref());

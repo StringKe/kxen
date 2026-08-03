@@ -1,4 +1,8 @@
-use super::{GoalJudge, publish, show_goal};
+use super::GoalJudge;
+
+mod claims;
+
+use claims::{admit, clear_claim, finalize, mark_prepared, recover_unknown, store_outcome};
 
 struct JudgeInput {
     objective: String,
@@ -65,34 +69,44 @@ pub(super) async fn complete_goal(
     judge: &GoalJudge<'_>,
 ) -> Result<String, String> {
     let reporter = judge.usage_reporter.ok_or("completion verification requires a durable session usage reporter")?;
-    complete_goal_with(dir, id, evidence, session_id, bus, Accounting { auxiliary: judge.auxiliary_usage, reporter }, |input| async move {
-        crate::agent::goal_verify::score_completion(crate::agent::goal_verify::CompletionRequest {
-            mrm: judge.mrm,
-            model: &judge.model,
-            store: judge.store,
-            objective: &input.objective,
-            criteria: &input.criteria,
-            evidence: &input.evidence,
-            timeout: input.timeout,
-            cancel: judge.cancel,
-        })
-        .await
-    })
+    complete_goal_with(
+        dir,
+        id,
+        evidence,
+        session_id,
+        bus,
+        Accounting { auxiliary: judge.auxiliary_usage, reporter },
+        |input, start_barrier| async move {
+            crate::agent::goal_verify::score_completion(crate::agent::goal_verify::CompletionRequest {
+                mrm: judge.mrm,
+                model: &judge.model,
+                store: judge.store,
+                objective: &input.objective,
+                criteria: &input.criteria,
+                evidence: &input.evidence,
+                timeout: input.timeout,
+                cancel: judge.cancel,
+                start_barrier: Some(start_barrier),
+            })
+            .await
+        },
+    )
     .await
 }
 
-async fn complete_goal_with<M, F, Fut>(
+async fn complete_goal_with<'a, M, F, Fut>(
     dir: &std::path::Path,
     id: &str,
     evidence: &str,
     session_id: Option<&str>,
     bus: Option<&crate::core::event::EventBus>,
-    accounting: Accounting<'_, M>,
+    accounting: Accounting<'a, M>,
     scorer: F,
 ) -> Result<String, String>
 where
-    M: CompletionMetering,
-    F: FnOnce(JudgeInput) -> Fut,
+    M: CompletionMetering + Sync,
+    M::Claim: Send,
+    F: FnOnce(JudgeInput, Box<dyn FnMut() -> Result<(), String> + Send + 'a>) -> Fut,
     Fut: std::future::Future<Output = crate::agent::goal_verify::CompletionAttempt>,
 {
     let completion_lock = crate::core::goal::completion_lock(id);
@@ -116,7 +130,25 @@ where
         return Err(join_cleanup_errors(error, cleanup, clear));
     }
 
-    let attempt = scorer(input).await;
+    // barrier 在 scorer 的 Provider 请求越界前把 claim 落为 Started（durable boundary）；
+    // claim 经 Arc<Mutex> 共享给 barrier，scorer 返回后独占取回继续结算。
+    let attempt = {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(metering));
+        let barrier: Box<dyn FnMut() -> Result<(), String> + Send + 'a> = Box::new({
+            let reporter = accounting.reporter;
+            let claim = std::sync::Arc::clone(&shared);
+            move || {
+                let mut claim = crate::core::shared::lock(&claim);
+                reporter.mark_started(&mut claim)
+            }
+        });
+        let attempt = scorer(input, barrier).await;
+        metering = match std::sync::Arc::try_unwrap(shared) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Err(_) => return Err("completion start barrier outlived the scorer future".into()),
+        };
+        attempt
+    };
     record_runtime_usage(accounting.auxiliary, &attempt);
     publish_metering_warning(attempt.metering_warning.as_deref(), session_id, bus);
     if !attempt.request_started {
@@ -170,123 +202,6 @@ where
         return Err(message);
     }
     finalize(dir, id, evidence, bus)
-}
-
-fn admit(dir: &std::path::Path, id: &str, evidence: &str) -> Result<(crate::core::goal::CompletionAdmission, Option<JudgeInput>), String> {
-    let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(dir, id)?;
-    let lock = crate::core::goal::write_lock(id);
-    let _guard = crate::core::shared::lock(&lock);
-    let mut goal = crate::core::goal::Goal::load(dir, id).map_err(|error| error.to_string())?;
-    let existing = goal.completion_attempt.is_some();
-    if !existing {
-        match goal.runtime_budget(crate::core::shared::now_ms()) {
-            crate::core::goal::RuntimeBudget::Unbounded | crate::core::goal::RuntimeBudget::WallRemaining(_) => {}
-            crate::core::goal::RuntimeBudget::Stop(status) => {
-                return Err(format!("goal {} cannot run completion verification in status {}", goal.id, status.as_str()));
-            }
-        }
-    }
-    let admission = goal.admit_completion(evidence).map_err(|error| error.to_string())?;
-    match &admission {
-        crate::core::goal::CompletionAdmission::Start { .. } => {
-            let timeout = match goal.runtime_budget(crate::core::shared::now_ms()) {
-                crate::core::goal::RuntimeBudget::Unbounded => crate::agent::goal_verify::JUDGE_TIMEOUT,
-                crate::core::goal::RuntimeBudget::WallRemaining(remaining) => remaining.min(crate::agent::goal_verify::JUDGE_TIMEOUT),
-                crate::core::goal::RuntimeBudget::Stop(status) => {
-                    return Err(format!("goal {} cannot run completion verification in status {}", goal.id, status.as_str()));
-                }
-            };
-            save_repaired(&goal, dir, "completion claim")?;
-            let input = JudgeInput {
-                objective: goal.contract.objective.clone(),
-                criteria: goal.contract.completion_criteria.clone(),
-                evidence: evidence.to_string(),
-                timeout,
-            };
-            Ok((admission, Some(input)))
-        }
-        crate::core::goal::CompletionAdmission::Reuse { .. } => Ok((admission, None)),
-    }
-}
-
-fn mark_prepared(dir: &std::path::Path, id: &str, operation_id: &str) -> Result<(), String> {
-    mutate_claim(dir, id, "prepared completion claim", |goal| goal.mark_completion_prepared(operation_id))
-}
-
-fn store_outcome(
-    dir: &std::path::Path,
-    id: &str,
-    operation_id: &str,
-    outcome: crate::core::goal::CompletionOutcome,
-    usage: crate::core::goal::CompletionUsage,
-) -> Result<(), String> {
-    mutate_claim(dir, id, "completion outcome", |goal| goal.record_completion_outcome(operation_id, outcome, usage))
-}
-
-fn clear_claim(dir: &std::path::Path, id: &str, operation_id: &str) -> Result<(), String> {
-    let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(dir, id)?;
-    let lock = crate::core::goal::write_lock(id);
-    let _guard = crate::core::shared::lock(&lock);
-    let mut goal = crate::core::goal::Goal::load(dir, id).map_err(|error| error.to_string())?;
-    if goal.clear_completion_claim(operation_id) {
-        save_repaired(&goal, dir, "completion claim cleanup")?;
-    }
-    Ok(())
-}
-
-fn recover_unknown(dir: &std::path::Path, id: &str, operation_id: &str, bus: Option<&crate::core::event::EventBus>) -> Result<(), String> {
-    let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(dir, id)?;
-    let lock = crate::core::goal::write_lock(id);
-    let _guard = crate::core::shared::lock(&lock);
-    let mut goal = crate::core::goal::Goal::load(dir, id).map_err(|error| error.to_string())?;
-    let matches_prepared = goal
-        .completion_attempt
-        .as_ref()
-        .is_some_and(|attempt| attempt.operation_id == operation_id && attempt.phase == crate::core::goal::CompletionPhase::Prepared);
-    if matches_prepared && goal.recover_interrupted_completion().map_err(|error| error.to_string())? {
-        save_repaired(&goal, dir, "UNKNOWN completion recovery")?;
-        publish(bus, &goal);
-    }
-    Ok(())
-}
-
-fn finalize(dir: &std::path::Path, id: &str, evidence: &str, bus: Option<&crate::core::event::EventBus>) -> Result<String, String> {
-    let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(dir, id)?;
-    let lock = crate::core::goal::write_lock(id);
-    let _guard = crate::core::shared::lock(&lock);
-    let mut goal = crate::core::goal::Goal::load(dir, id).map_err(|error| error.to_string())?;
-    let already_complete = goal.status == crate::core::goal::GoalStatus::Complete;
-    goal.finalize_completion(evidence).map_err(|error| error.to_string())?;
-    if !already_complete {
-        save_repaired(&goal, dir, "completed goal")?;
-        publish(bus, &goal);
-    }
-    Ok(show_goal(&goal))
-}
-
-fn mutate_claim(
-    dir: &std::path::Path,
-    id: &str,
-    context: &str,
-    mutate: impl FnOnce(&mut crate::core::goal::Goal) -> Result<(), crate::core::goal::GoalError>,
-) -> Result<(), String> {
-    let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(dir, id)?;
-    let lock = crate::core::goal::write_lock(id);
-    let _guard = crate::core::shared::lock(&lock);
-    let mut goal = crate::core::goal::Goal::load(dir, id).map_err(|error| error.to_string())?;
-    mutate(&mut goal).map_err(|error| error.to_string())?;
-    save_repaired(&goal, dir, context)
-}
-
-fn save_repaired(goal: &crate::core::goal::Goal, dir: &std::path::Path, context: &str) -> Result<(), String> {
-    match goal.save_committed(dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.committed() => {
-            let visible = error.to_string();
-            goal.save_committed(dir).map_err(|repair| format!("{context} was visible but durability repair failed: {visible}; {repair}"))
-        }
-        Err(error) => Err(format!("{context} was not committed: {error}")),
-    }
 }
 
 fn record_runtime_usage(auxiliary: &super::super::usage::AuxiliaryUsage, attempt: &crate::agent::goal_verify::CompletionAttempt) {

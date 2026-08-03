@@ -32,6 +32,9 @@ pub struct CompletionRequest<'a> {
     pub evidence: &'a str,
     pub timeout: std::time::Duration,
     pub cancel: Option<&'a crate::agent::cancel::CancelToken>,
+    /// Provider 网络边界前的 durable Started 标记（completion 计量 claim），
+    /// 在 permit.start() 之前 fsync；admission 失败/取消仍按 Prepared 丢弃。
+    pub start_barrier: Option<Box<dyn FnMut() -> Result<(), String> + Send + 'a>>,
 }
 
 /// 判据文本拆条：非空行剥列表前缀（- / * / 1. / 1) / - [ ]）。
@@ -86,7 +89,7 @@ pub fn parse_scores(text: &str, criteria: &[String]) -> Option<Vec<CriterionScor
 
 /// 逐条评审：每条判据一个 pass/reason，条数必须与判据数一致（漏条 = 评审不可信，按失败重试）。
 pub async fn score_completion(request: CompletionRequest<'_>) -> CompletionAttempt {
-    let CompletionRequest { mrm, model, store, objective, criteria, evidence, timeout, cancel } = request;
+    let CompletionRequest { mrm, model, store, objective, criteria, evidence, timeout, cancel, start_barrier } = request;
     let items = split_criteria(criteria);
     if items.is_empty() {
         return CompletionAttempt {
@@ -112,7 +115,19 @@ pub async fn score_completion(request: CompletionRequest<'_>) -> CompletionAttem
         ),
         Message::user(format!("Objective: {objective}\n\nCompletion criteria:\n{numbered}\n\nEvidence:\n{evidence_capped}")),
     ];
-    match crate::llm::managed::collect_text_observed(mrm, model, &messages, store, timeout, None, cancel).await {
+    match crate::llm::managed::collect_text_observed_with_policy_and_start(
+        mrm,
+        model,
+        &messages,
+        store,
+        timeout,
+        None,
+        cancel,
+        crate::llm::managed::CircuitPolicy::Record,
+        start_barrier,
+    )
+    .await
+    {
         Ok(output) => {
             let result = parse_scores(&output.text, &items)
                 .ok_or_else(|| "completion verification returned unparseable scores".to_string())
@@ -187,6 +202,7 @@ mod tests {
             evidence: "evidence",
             timeout: JUDGE_TIMEOUT,
             cancel: None,
+            start_barrier: None,
         })
         .await;
         assert!(!attempt.request_started);
