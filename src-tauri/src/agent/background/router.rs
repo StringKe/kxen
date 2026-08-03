@@ -73,6 +73,15 @@ impl NotifyRouter {
         }
         self.persist_to_sink(&mut notice);
         crate::core::shared::lock(&self.queue).push_back(notice);
+        // 与 close 竞态：push 前 late 还是 None、push 后 close 的首轮 flush 已结束，
+        // 此项会永远卡队列（kick 丢失）。push 后复查，close 已注册则就地补 flush。
+        // 必须先 drop 首个 guard：std Mutex 不可重入，持锁复查会自死锁。
+        drop(late);
+        let late = crate::core::shared::lock(&self.late).clone();
+        if let Some(callback) = late {
+            self.flush_late(&callback)?;
+            return Ok(NotifyPath::Late);
+        }
         Ok(NotifyPath::ActiveRun)
     }
 

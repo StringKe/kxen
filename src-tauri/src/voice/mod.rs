@@ -96,7 +96,12 @@ fn start_one(
             let session = apple::start_mic(locale, capture_cloud)?;
             let token = std::sync::Arc::new(());
             let token_pump = token.clone();
-            crate::core::shared::lock(&ACTIVE).insert(session_id.to_string(), Active::Apple { session: SendWrap(session), token });
+            // 并发 start_one 同槽：insert 顶掉的旧 Active 必须 cancel（drop 会泄漏麦克风引擎）
+            let displaced =
+                crate::core::shared::lock(&ACTIVE).insert(session_id.to_string(), Active::Apple { session: SendWrap(session), token });
+            if let Some(displaced) = displaced {
+                displaced.cancel();
+            }
             let bus = bus.clone();
             let key = session_id.to_string();
             std::thread::spawn(move || {
@@ -123,7 +128,10 @@ fn start_one(
             // 测试引擎：避开麦克风硬件验证槽位语义，序号用于区分替换前后的槽
             static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::core::shared::lock(&ACTIVE).insert(session_id.to_string(), Active::Dummy(n));
+            let displaced = crate::core::shared::lock(&ACTIVE).insert(session_id.to_string(), Active::Dummy(n));
+            if let Some(displaced) = displaced {
+                displaced.cancel();
+            }
             Ok("dummy".into())
         }
         other => {
@@ -131,8 +139,11 @@ fn start_one(
                 return Err(format!("{other} 未配置 API key"));
             }
             let session = provider::start_recording()?;
-            crate::core::shared::lock(&ACTIVE)
+            let displaced = crate::core::shared::lock(&ACTIVE)
                 .insert(session_id.to_string(), Active::Record { session: SendWrap(session), provider: other.to_string() });
+            if let Some(displaced) = displaced {
+                displaced.cancel();
+            }
             Ok(other.to_string())
         }
     }
@@ -284,6 +295,28 @@ mod tests {
         assert!(dummy_slot("voice-delete").is_some());
         drop_session("voice-delete");
         assert!(dummy_slot("voice-delete").is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_same_session_leaves_single_slot() {
+        let _test = TEST_LOCK.lock().await;
+        // 并发 start_one 同槽：insert 顶掉的旧 Active 必须 cancel 而非直接 drop
+        // （apple/provider 引擎 drop 会泄漏麦克风；dummy 下断言收敛为单槽且不 panic）
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| {
+                let store = crate::auth::credential::AuthStore::new();
+                for _ in 0..50 {
+                    start(&dummy_config(), &store, "zh-CN", crate::core::event::EventBus::default(), "voice-race").unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(dummy_slot("voice-race").is_some());
+        assert_eq!(crate::core::shared::lock(&ACTIVE).len(), 1, "同槽并发 start 后不得残留多个槽");
+        crate::core::shared::lock(&ACTIVE).clear();
     }
 
     #[tokio::test]

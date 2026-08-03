@@ -30,6 +30,39 @@ fn postcommit_session_append_is_not_delivered_to_the_active_run() {
 }
 
 #[test]
+fn notify_racing_close_is_still_flushed_late() {
+    // notify 读到 late=None 后、push 前 close 完成首轮 flush：不修则该项永卡队列（kick 丢失）。
+    // 修复后每条 notify 恰好投递一次，结束后队列不得有残留。
+    let router = Arc::new(NotifyRouter::new());
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = delivered.clone();
+    let router_close = router.clone();
+    let closer = std::thread::spawn(move || {
+        router_close
+            .close(Arc::new(move |notice| {
+                crate::core::shared::lock(&sink).push(notice.text);
+                Ok(())
+            }))
+            .unwrap();
+    });
+    let mut senders = Vec::new();
+    for t in 0..4 {
+        let router = router.clone();
+        senders.push(std::thread::spawn(move || {
+            for i in 0..50 {
+                router.notify(format!("n-{t}-{i}")).unwrap();
+            }
+        }));
+    }
+    closer.join().unwrap();
+    for sender in senders {
+        sender.join().unwrap();
+    }
+    assert_eq!(crate::core::shared::lock(&delivered).len(), 200, "close 后每条 notify 都必须经 late 回调恰好投递一次");
+    assert!(router.drain().is_empty(), "与 close 竞态的 notify 不得卡死在队列");
+}
+
+#[test]
 fn indeterminate_session_fallback_is_reported_as_failure() {
     let dir = temporary_sessions("late-indeterminate");
     let session = crate::core::session::create(&dir, "/tmp").unwrap();
