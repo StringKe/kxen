@@ -1,153 +1,166 @@
-# kxen 仓库完整评估报告
+# kxen 当前应用完整评估报告
 
-- 评估日期: 2026-08-01
-- 评估方式: 7 路并行只读审查（后端核心、后端工具集成、前端页面组件、前后端接线、端到端流程、官网、质量门禁实测）
-- 代码规模: 前端 `src` 22,715 行（TS/TSX），后端 `src-tauri/src` 30,944 行（Rust），官网 62 页 MDX 文档
+- 评估日期: 2026-08-03
+- 评估对象: 当前工作树的桌面前端、Rust Runtime、本地持久化、工具与集成、UI 完整度与流程顺畅度、产品文档、website SEO/GEO、CI/发布配置
+- 评估口径: `PASS` 表示当前有代码或验证证据，`FAIL` 表示已证明不满足要求，`UNKNOWN` 表示需要真实凭证、硬件、外部服务或现场操作才能确认
+- 评估方法: 三路并行只读静态审查（前端 UI、Rust 后端、文档与发布链）+ 62 个 MDX 逐字文档-代码同步审计 + website SEO/GEO 实现审计 + 线上 `https://kxen.ai/` 实证 + 本地全量门禁实际执行。本报告同时记录评估发现与同轮修复收口（audit trail），第 10 节验证证据为当前工作树的最终状态
 
-## 一、总体结论
+## 1. 结论
 
-**整体完成度：高，达到「开发预览」并超出其宣称的水平。** 主功能域（多 Provider 模型与 MRM 路由、Goal、Subagent、Dynamic Workflow、Agent Teams、本地工具、安全审批、Checkpoint/Rewind/Worktree、Knowledge/Rules/Skills/Memory、语音、更新、官网文档）均为真实实现且前后端接线闭环。前端发起的约 94 个 RPC 调用与后端 handler 一一对应，无一落空。生产代码零 TODO/FIXME/占位/mock 标记。
+kxen 是一个可运行的 macOS 本地 Coding Agent Harness，主链为
 
-**UI 完整度：极高。** 遍历全部页面与组件的 onClick/onChange，未发现空 handler、占位按钮或无数据源区块；空/加载/错误三态纪律严明；危险操作（删除会话、rewind、worktree 删分支）均有确认摩擦；乐观更新全部带失败回滚。
+`Workspace -> Session -> Composer -> MRM -> Provider -> Agent/Tools -> durable terminal -> UI reconciliation`
 
-**九条关键用户流程主干全部闭环**（首次启动、发送与审批、Checkpoint/Rewind、Worktree、Goal、Subagent/Team、Command Palette、通知、更新检查）。
+本轮评估在工作树中发现了真实阻断问题并全部修复，当前状态：
 
-**发现 1 个 P0（打包版首次启动目录边界）、9 类 P1、若干 P2。** 详见下文。
+- 后端编译与门禁 `PASS`：评估时发现 8 处编译错误（lib 14 错、lib test 15 错）和 4 个超行门禁文件，已全部修复（第 4 节）；`cargo check/clippy/fmt/test --all-targets` 当前全绿。
+- 前端测试 `PASS`：评估时发现 `Session.stream.test.tsx` 挂起 WebKit（无限响应式重载环，3/3 复现）及 3 个潜伏测试失败，已全部修复（第 5 节）；`pnpm test` 当前 100 文件 / 674 测试全绿。
+- UI 完整度与流程顺畅度 `PASS`：三个页面无 dead-end、无未接线入口、无 TODO 占位，十一条关键用户流程闭环（第 6 节）。
+- 文档与代码一致性 `PASS`：62 个 MDX 逐字审计发现 3 处 major + 4 处 minor 失准，已全部修正（第 7 节）。
+- website SEO/GEO `PASS`：基础设施完整；评估发现的 JSON-LD 深度缺口已补（SoftwareApplication/TechArticle/BreadcrumbList），剩余 minor 见第 9 节。
+- 仍为 `FAIL`/`UNKNOWN` 的项与代码无关：GitHub 外部发布治理（沿用上轮 FAIL 证据）、真实签名发布与现场硬件/外部服务验证（UNKNOWN）、website 线上部署滞后（`integrations/web-search` 页已就绪待部署）。
 
-## 二、质量门禁实测（全部真实运行）
+## 2. 产品意图、范围与必要需求
 
-| 门禁                    | 结果 | 关键输出                                               |
-| ----------------------- | ---- | ------------------------------------------------------ |
-| `pnpm check`            | PASS | 359 文件格式正确，297 文件 0 lint 错误                 |
-| `pnpm test`             | PASS | vitest 真实 webkit 浏览器模式，79 文件 441 用例全过    |
-| `pnpm build`            | PASS | vite 构建 11.92s                                       |
-| `cargo check`           | PASS | 33.19s 无错误                                          |
-| `cargo test`            | PASS | 582 passed / 0 failed（含 29 个集成测试文件）          |
-| `website && pnpm check` | PASS | 62 文档 lint 干净，astro check 0 errors，64 页构建成功 |
+必要需求十条（项目边界、持久对话、单 Session 单 run、可控模型资源、风险可见、长任务、故障不静默、未知不伪装成功、可恢复、本地优先）的设计和代码入口在本轮抽查中未发现回退，故障语义与安全边界的代码级证据见第 8 节，运行期证据见第 10 节测试矩阵。
 
-前端测试覆盖率（istanbul statement）：总体 85.4%（lib 90.4% / components 85.1% / pages 74.0% / 根 88.5%）。Rust 侧覆盖率 UNKNOWN（脚本存在未运行）。
+## 3. 当前库存与规模
 
-## 三、模块完成度矩阵
+| 对象                    |          当前数量 | 统计口径                                                                          |
+| ----------------------- | ----------------: | --------------------------------------------------------------------------------- |
+| 桌面前端源文件          | 255 个，33,289 行 | `src` 下全部 `.ts`/`.tsx` 物理文件，包含测试与 2 个 `.d.ts`                       |
+| Rust Runtime 源文件     | 349 个，62,993 行 | `src-tauri/src` 下全部 `.rs`，包含内联和模块测试                                  |
+| Rust integration 源文件 |   35 个，6,935 行 | `src-tauri/tests` 下全部 `.rs`，包含 `common` 辅助模块                            |
+| 桌面路由                |              3 个 | Session Home、Settings、Workspaces                                                |
+| Settings 一级区域       |              9 个 | 通用、Provider、Voice、Routing、Usage、Knowledge、Schedule、Diagnostics、Advanced |
+| 业务 RPC                |            100 个 | `rpc_contract` 集成测试强制前端字面量、handler、request_schema 三方对称，当前通过 |
+| 产品文档                |         62 个 MDX | `website/src/content/docs` 下实际文件                                             |
 
-| 模块                                    | 结论                                                                                                                     |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| run 生命周期与终态                      | 完整。任何退出路径都有 terminal 事件 + 持久化，末尾还有兜底（`run.rs:63-347`、`run_finalize.rs:94-101`，顺序有专项测试） |
-| Goal                                    | 完整。状态机含 BudgetLimited，complete 三段校验 fail-closed，预算语义含 Paused 扣减（`core/goal.rs`、`goal_verify.rs`）  |
-| Subagent / Workflow / Agent Teams       | 完整。MRM 占槽 RAII、QuickJS 沙箱 + journal 断点续跑、team 分权与崩溃恢复均真实实现                                      |
-| 多 Provider / MRM                       | 完整。26 个内置 provider + OAuth 专线 + custom 端点；并发池、RPM 滑窗、熔断、降级链、预算准入均真实                      |
-| 文件/Shell/Browser/MCP/LSP 工具         | 完整。safety 规则 -> 审批 -> path 边界 -> SSRF 四层纵深，各有测试                                                        |
-| 审批与可恢复删除                        | 闭环。六消费域共用同一 broker；删除走系统 trash + 恢复包                                                                 |
-| auth 凭证                               | 完整。0600 原子写、预防/反应式双刷新、并发统一入口                                                                       |
-| ws 通道                                 | 完整。token 握手 + Origin 白名单 + 会话 ACL + resync 对账，前后端逐字段吻合                                              |
-| Knowledge/Rules/Skills/Memory           | 完整。检索 + embedding + 蒸馏 + consolidation 均实接                                                                     |
-| 语音                                    | 真实现（Apple Speech.framework + 云转写降级），一处 UI 接线缺口（见 P1-2）                                               |
-| 前端页面（Session/Settings/Workspaces） | 完整。Settings 九个分区全部真实生效                                                                                      |
-| 官网 website                            | 完整。62 页文档零死链，搜索/OG/llms.txt/重定向表健全                                                                     |
-| capabilities 权限                       | 最小化，仅 `ws_port` 一个命令，无暴露                                                                                    |
+`src` 与 `src-tauri/src` 全部源文件当前均不超过 350 原始行（cargo `file_size_gate`）与 350 有效行（`scripts/test.mjs`）。
 
-## 四、问题清单
+## 4. 后端：评估发现与修复明细（已全部收口）
 
-### P0（功能缺失/断裂，1 项）
+### 4.1 编译错误（评估时 lib 14 错 + lib test 15 错，8 处，全部修复）
 
-**P0-1 打包版首次启动 workspace 落在进程 cwd（Finder 启动恒为 `/`），无首跑目录门。**
-`src-tauri/src/app_state.rs:69-70` 用 `current_dir()` 初始化 workdir 并直接作为 `active_workspace` 初值（`:115`）；macOS 从 Finder 启动 .app 时 cwd 为 `/`。后果：`path_policy.rs:41` 边界判定 `starts_with(workspace)` 在 workspace 为 `/` 时全盘路径都在边界内，agent 文件工具默认获得全盘读写面；checkpoint 屏障对 `/` 跑 `git add -A` 必然大面积失败导致 rewind 全部不可用；UI 显示 `/` 为工作区。老用户会被 `session.activate` 抢救，纯新用户无此路径。
-修复方向：cwd 为 `/` 或不可写时回退 home 目录，或首跑强制目录选择。
+| 位置                                                          | 根因                                                                             | 修法                                                        |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `llm/models.rs:86,96`、`knowledge/embedding/warm.rs:160`      | `Option::as_deref()` 配合 `from_ref` 被推导成 `&[str]`，期望 `&[&str]`           | 改为 `as_deref().as_slice()`（三处同模式）                  |
+| `llm/client.rs:275`                                           | 重构给 `format_http_error` 加了第 4 个 `secrets` 参数，测试漏改                  | 补 `&[]`                                                    |
+| `llm/anthropic.rs:262`、`llm/openai.rs:179`、`llm/xai.rs:143` | `error_bearer: Arc<str>` 在 `FnMut` 闭包的 `async move` 中被 move                | 分支内先 clone 再进 coroutine，与同函数 Ok 分支既有写法一致 |
+| `agent/background.rs:93`、`agent/team/spawn.rs:102`           | 根因在 `llm/managed.rs:138`：callback 参数 trait object 不含 Send，跨 await 持有 | 参数类型加 `+ Send`，唯一调用方闭包本身 Send 无需改         |
 
-### P1（半成品/接线缺失）
+### 4.2 文件行门禁（4 个超标文件，全部拆分，接口与行为不变）
 
-1. **主会话模型路由整条断裂，且对用户静默假成功。** ModelPicker「设为主会话模型」（`src/components/composer/ModelPicker.tsx:19`）和设置页主会话角色卡（`RoutingSection.tsx:20`）写 `roles.chat` 并提示「已保存并热生效」，但后端主会话从不 `mrm.resolve("chat")`——真正生效的是 `app_state.rs:99` 硬编码的 `xai/grok-build-0.1`。后果：用户改主会话模型无效；「当前全局」显示永远错误；只导入 Claude/ChatGPT 凭证的新用户首发消息必失败（错误不吞，会走 Error 终态 + doctor 引导）。修复方向：全局默认走 `mrm.resolve("chat")` 或前端改调 `set_model`。
-2. **Composer 语音 PTT 忽略设置页主引擎配置。** `TextComposer.tsx:50` 硬编码 `createSignal("apple")` 且从不读后端配置，`voice.ts:66-69` 把它当 override 发送，后端 `ops.rs:244-250` 直接替换 config。VoiceSection「设为主引擎」对 composer PTT 不生效。
-3. **OS 桌面通知对 subagent/teammate 的 done 帧误触发。** `main.rs:91-103` 通知分支不过滤 `agent` 字段，而子代理终态帧带 `agent` 发布到同一 bus（`subagent.rs:236-241`）。后台会话里每个 subagent 完成都会弹「会话完成」通知。前端 `delta.ts:90` 已过滤，Rust 通知侧漏了同一过滤。
-4. **无启动时自动更新检查。** 更新链路本身闭环（签名、latest.json、UI 齐备），但唯一入口是 Settings 手动点检查；用户不进设置页永远不知道有新版本。
-5. **exec 对所有命令（含 safety 判 Allow 的）强制逐次审批。** `tools/exec.rs:121-124`，无 auto-approve 配置，每条 `ls` 都弹审批卡。属刻意 fail-closed 设计，但需产品确认这是预期可见行为。
-6. **Anthropic 工具名重映射存在陈旧死映射臂。** `anthropic.rs:21-24,36-41` 的 `"subagent" => "Agent"`、`"skill_manage" => "Skill"` 映射的工具名在仓库中不存在；模型若按 Claude 习惯回 `Agent`/`Skill`，逆映射会撞 `unknown tool`。
-7. **死接口集中（双端闲置，建议删除或接线）：** 全局 `set_model`（`rpc.rs:47` + `chat.ts:52`）；`team.list`（`rpc.rs:209` + `team.ts:21`）；`voice.transcribe_file`（`ops.rs:194`，注释自称「E2E 共用」与事实不符）；`goal.get`/`goal.complete`/`goal.record_turn` RPC 入口（内部已直接调 Rust 方法）；`client.runStream`（`client.ts:256`）。
-8. **发布链路未闭环。** release CI、签名、公证、updater artifacts 全部就位，但 `plan.md` 中 v0.1.0 preview 发布、官网下载入口、GitHub Releases 实际发布动作仍未执行。README 已如实标注「尚未发布」。
-9. **SessionRow 右键菜单两项删除入口行为完全一致。** `SessionRow.tsx:93-98`「删除会话」与「删除并沉淀知识」映射同一函数，真正选择在行内确认条里再做。功能不断，菜单承诺与实际行为不符。
+- `tools/websearch/managed.rs`（369 有效行）-> `managed.rs`（206）+ `managed/metering.rs`（111）+ `managed/tests.rs`（57）。
+- `llm/mrm.rs`（361 原始行）-> `mrm.rs`（253）+ `mrm/rpm.rs`（127，账号 RPM 滑窗族）。
+- `core/session.rs`（355）-> `session.rs`（278）+ `session/append.rs`（86，消息追加族，`pub use` 再导出保持路径）。
+- `agent/agent_loop/run.rs`（368）-> `run.rs`（275）+ `run_stream.rs`（157，单次 LLM 流消费内循环）。
 
-### P2（质量隐患，择要）
+### 4.3 安全口径修复
 
-- **锁中毒即整进程崩溃。** release `panic = "abort"` 与全库 251 处 `Mutex.expect()` 并存；已有 `core::shared::lock` 收口工具但未统一使用。
-- **热路径反复读盘。** custom provider 每次 LLM 请求 `Config::load`（`client.rs:50-51`）；`coding_rules_enabled()` 每轮 prompt 构建读盘；goal wall 检查点每 500ms 全目录扫描 + JSON 解析（`run.rs:179-185`）。
-- **run 主循环无 mock 注入缝，最值钱的重试/终态/预算分支零直接单测。**
-- **write 覆盖外部已变更文件时备份 `.kxen-bak` 落在用户工作区**（`fs_tool.rs:251-255`），无清理、未 gitignore，会污染用户仓库。
-- **MRM 热换整实例替换**：改配置瞬间在飞槽位不受新信号量约束，熔断计数清零（`ws/settings.rs:90`）。
-- **browser SSRF 守卫只钉初始 URL**，页内跳转不经守卫（已注释声明 v1 范围外）。
-- **workspaces 看板首载失败与真空同态**（`Workspaces.tsx:28-31`），无首载 loading/错误态，与同仓库其他分区不一致。
-- **前端小死代码**：`Popup.tsx` 全仓库无引用；`App.tsx:127-137` 用已废弃 `document.execCommand`。
-- **`pages` 覆盖率 74.0% 为最低**，主会话页 `Session.tsx`（302 行）仅 2 个测试。
-- **运行时可达 panic**：`voice/objc.rs:16`（ObjC 类缺失）、`config.rs:286-287`、`catalog.rs:238` 的 fail-fast panic，坏配置直接 crash 而非用户可读错误。
-- **后端错误码粗化**：unknown method 也回 `-32603`，已定义的 `-32601` 从未使用（`protocol.rs:95`）。
-- **官网**：`release-smoke.mdx` 与 `troubleshooting.mdx` sidebar.order 同为 5；站内链接全用 `https://kxen.ai` 绝对 URL，本地/预览环境点击跳生产站；界面 chrome 英文与 `zh-CN` locale 不一致；8 个 MDX 全局组件注册后零使用；Header GitHub 图标与「Edit this page」配置为 null 永不渲染（疑似刻意）。
+`ws/rpc.rs` 的 `task.restart` 原不过 safety 审批，与"background task start/restart 每次强制审批"口径不一致。已按 agent 侧 `task_tool.rs` 同模式补门禁：取回原任务 command/workdir，在真实执行目录上过 `exec::safety_gate`（Deny 拒绝、Ask 走审批通道、无通道 fail closed），通过后才 restart。
 
-## 五、UI 流程顺畅度专项
+### 4.4 重构遗留测试修复（评估复跑门禁时暴露）
 
-九条流程逐条静态走查（UI 入口 -> Rust 实现），结论：
+- `voice/provider/tests.rs`：采样率常量提到 192kHz 后断言口径更新（96k 线性、192k 钳上限）。
+- `ws/session_delete/tests.rs`：补 `mark_started` 使 usage claim 进入 Started，恢复删除屏障语义。
+- `tests/goal.rs`（3 败）、`tests/run_loop.rs`（6 败）：重构新增的 `session_lifecycle` admission 要求绑定真实存在的 Session，测试改用真实 session id；另修一处测试目录整删的并行竞态。
 
-- **首次启动 -> Workspace -> 新会话**：主干闭环，但存在 P0-1 边界。原生目录选择器、workspace.add/switch、session_start hook 均真实。
-- **发送 -> run -> 工具 -> 审批 -> 流式 -> 终态**：完全闭环。乐观上屏 + 失败重发、审批 300s 超时 + 重载恢复 + 迟到应答置失效、「任何路径不许无声结束」兜底 + 终态先落盘后发布。
-- **Checkpoint/Rewind**：闭环且设计精良。shadow bare repo 不污染项目，原子写锁，四类结构化拒绝码（dirty/active_run/not_in_session/checkpoint_missing）前后端一一对应。
-- **Worktree**：闭环。建/切/删全真实，dirty/删分支走审批。
-- **Goal**：闭环。budget_limited 只给「提高预算并继续」唯一自助出口，杜绝无效 resume。
-- **Subagent/Team/AgentFocusView**：闭环。加载/失败重试/真空三态齐备，teammate 对话走 `team.message`。
-- **Command Palette/快捷键**：闭环。三路搜索全有 apply 动作。
-- **通知**：闭环，有 P1-3 误触发问题；通知中心靠 5s 轮询而非订阅 `notification` topic（后端 topic 存在但前端未订阅，设计妥协）。
-- **更新**：链路闭环，缺启动自动检查（P1-4）。
+## 5. 前端：评估发现与修复明细（已全部收口）
 
-## 六、亮点（值得保持的工程实践）
+### 5.1 `Session.stream.test.tsx` 挂起（blocker，根因已修复）
 
-- **终态纪律是一等公民**：大量注释直接引用历史事故编号，每个设计可追溯到具体根因。
-- **对账文化贯穿全栈**：bus lag -> `sys.resync` -> 各面板按真源重拉；运行真源兜底；断线重连订阅恢复。每条分支有根因注释和对应测试。
-- **审批链路教科书级闭环**：注册/应答/超时/中断四出口语义一致，决定落盘可回放。
-- **RPC 对齐度极高**：94 个手写 JSON-RPC 方法前后端参数命名全程一致。
-- **安全纵深真实叠加**：safety 规则（含嵌套命令展开）-> 逐次审批 -> path canonicalize 边界 -> SSRF 逐跳守卫，四层独立且各有测试。
-- **测试严肃**：441 前端用例跑真实 webkit 而非 jsdom；582 Rust 测试含 MCP OAuth、workflow、team 集成测试；350 行单文件上限是硬门禁。
-- **错误结构化传输**：rewind 拒绝序列化 `{code, message, ...}`，前端按 code 归类，文案漂移免疫。
-- **官网文档可信**：能力描述与真实模块一一对应，明确不把研究中的实现写成产品承诺。
+根因是无限响应式重载环：`createSessionLoader` 新增的 `items` 参数在 `session-loader.ts` 的 `loadTimeline` 开头同步读取 `deps.items()`，使 `Session.tsx` 切会话 `createEffect` 被意外订阅到 `items` 信号；`loadTimeline` 的 `.then` 每次写入新数组引用又回触发该 effect，形成永久占满事件循环的微任务环（插桩实测 60 秒循环 29 万次），页面零输出冻结直到浏览器连接断开。受害面不止 stream 一个文件，所有 Session 挂载类测试同根。修法：基线读取改 `untrack(deps.items)`，effect 只跟踪 `activeSessionId`，语义不变。修复后该文件 17/17 通过（6.65s），全量 100 文件 / 674 测试通过。
 
-## 七、修复状态回写（2026-08-01)
+### 5.2 其余测试修复（3 个）
 
-全部问题已按「按报告建议方案实现决策项、排除发布动作」的既定决策修复完毕。六条门禁在合并后状态下全部 PASS:`pnpm check`、`pnpm test`(83 文件 466 用例）、`pnpm build`、`cargo check`、`cargo test`(0 failed)、`website pnpm check`。
+- `Settings.test.tsx` 实验能力用例：等待锚点改为等 3 个 toggle 全部解禁再点击（组件"配置未读回禁止提交"行为正确，修测试）。
+- `KnowledgeSection.test.tsx` blocked attempt 用例：组件失败提示补回"attempt 已保留"语义；测试第二次点击前等按钮解禁。
+- `shortcuts.test.ts`：`./drafts` 手写部分 mock 缺 `clearComposerRestore` 传递依赖，改 `importOriginal` 铺开。
 
-### P0
+### 5.3 UI 改进（评估发现的 2 项 minor 已修）
 
-- P0-1 首跑目录边界：**已修复**。`app_state.rs` 新增 `initial_workdir(cwd, home)` 纯函数，cwd 为 `/` 或不可写时回退 home,home 不可得时保留 cwd 不劣化；含三种路径单测。
+- `Settings.tsx`：config/doctor/readiness 抽取 `reloadOverview()`，接 `client.onResync` 断线重拉，卸载退订，并新增对应测试。
+- `Workspaces.tsx`：`goal.update`/`task.update` 事件刷新加 250ms 去抖，与会话列表刷新同模式。
 
-### P1
+## 6. UI 完整度与流程顺畅度（评估结论）
 
-1. 主会话模型路由断裂：**已修复**。`seed_default_roles` 增加 `chat` 角色种子；`effective_session_model` 解析序改为 session 覆盖 > MRM `peek("chat")` > 硬编码兜底；MRM 新增 `peek()`(不污染派发历史）;`AppState` 删除硬编码 `model` 字段；全局 `set_model` RPC 双端删除。
-2. Composer PTT 忽略主引擎：**已修复**。PTT 未显式点选时不发 engine override，后端使用 `config.voice.engine`;MicMenu 点选仍作 override。
-3. OS 通知 subagent done 误触发：**已修复**。新增 `should_notify_done` 纯判定，与前端 `delta.ts:90` 同口径过滤 agent 帧，含测试。
-4. 启动自动更新检查：**已修复**。`updater.ts` 新增共享状态与 `autoCheckOnStartup()`（失败静默、并发去重）,App 启动挂载，UpdateSection 回填共享状态不重复请求。
-5. exec 逐次审批粒度：**已修复（决策落地）**。维持 fail-closed 逐次审批设计，行为写入官网 `website/src/content/docs/agent/approval.mdx`。
-6. Anthropic 重映射死臂：**已修复**。映射臂改为真实工具名 `agent`/`skill`，全表正逆往返测试。
-7. 死接口：**已修复**。双端删除 `set_model`、`team.list`、`voice.transcribe_file`（连带 `voice/mod.rs::transcribe_file`、`apple.rs::recognize_file`、`objc.rs::url_request`)、`goal.get`/`goal.complete`/`goal.record_turn` RPC 入口、`client.runStream`、前端 `setModel()`/`teamList`。
-8. 发布链路：**UNKNOWN（按决策排除）**。实际发布属对外动作，未纳入本次范围；release CI 代码侧已就绪，待用户授权后执行。
-9. SessionRow 删除菜单：**已修复**。右键菜单只保留「删除会话...」单一入口，直删/沉淀选择留在行内确认条。
+对 `src/` 全部页面、组件、状态层逐文件静态审查，并与 `src-tauri/src/ws/` 高风险链路抽查对账：
 
-### P2
+- 页面完整度 `PASS`：Session（时间线/Composer/PendingQueue/审批双通道/Dock 四区/Rewind/StorageRecoveryPanel）、Settings 九区域、Workspaces 看板全部接线，无 dead-end；全仓无 TODO/FIXME/待实现标记；无空 onClick、无残留 console.log/alert。
+- 十一条关键流程 `PASS`：首次启动 -> Workspace -> Session、发送（乐观气泡 + failed/unknown 分态）、流式渲染（delta 绑定 sid+model 防串写）、工具审批（双通道去重 + 全局常驻面 + 迟到应答置 expired）、中断/排队、断线重连（resync 真源重拉）、删除/恢复（废纸篓 + fail closed 修复面板）、Checkpoint/Rewind（结构化 code 门禁 + dirty 二次确认）、模型切换（乐观 + 回滚 + 失败阻断发送）、Voice PTT（完整状态机 + 权限指引）、命令与快捷键。
+- 状态一致性 `PASS`：loading/empty/error/stale/UNKNOWN 五态分源表达；乐观更新与权威快照按 messageId/approval occurrence 锚点合并；generation guard 覆盖全部异步回写。
+- 契约抽查 `PASS`：前端 `client.rpc` 字面量全部在 Rust handler 注册；订阅 topic 与后端白名单、发布侧吻合；高风险 payload（send_message、approval.respond、approval.global）前后端一致；`rpc_contract` 测试当前通过。
+- 遗留 minor（已接受，不阻断）：`items.ts` context_sources 异常顺序的空气泡兜底（正常写入顺序不触发，已有测试覆盖）；VoiceSection locale 下拉硬编码 5 种语言（产品取舍）。
 
-- 锁收口：**已修复**。`core::shared` 新增 `read`/`write` 助手，生产代码 134 处/36 文件全部收口，残留 `.expect` 仅在 `#[cfg(test)]`。
-- 热路径读盘：**已修复**。新增 `core/config_cache.rs`(mtime 失效，MRM 热换天然触发）;custom provider 与 `coding_rules_enabled` 走缓存；goal wall 检查点改 `GoalWallCache`(run 粒度、目录 mtime 失效），预算语义不劣化。
-- run 主循环注入缝：**已修复**。`LlmClient::stream_dispatch` + `AgentContext::stream_override` 注入缝，新增 `tests/run_loop.rs` 三个直接单测（终态/重试/预算）。
-- `.kxen-bak` 污染：**已修复**。备份改落 `.kxen/backups/` 镜像相对路径，`ensure_gitignore` 写 `.kxen/`，恢复能力保留。
-- MRM 热换状态清零：**已修复**。可变运行状态（信号量/RPM 滑窗/熔断/历史）抽为 `mrm/state.rs::Shared`,`reconfigured()` 跨重建共享；在飞槽位、熔断、滑窗跨重建保留，三条回归测试。
-- browser SSRF 页内跳转：**已修复**。动作后复检落地 URL，命中拒绝段即断开报错（CDP 无法事前拦截，取舍已注释），含测试。
-- Workspaces 首载三态：**已修复**。新增 loading/错误+重试态，与真空区分。
-- 前端小死代码：**已修复**。`Popup.tsx` 删除；右键编辑菜单 input/textarea 改 clipboard + Selection API(contenteditable 保留 execCommand 并注释 WKWebView 限制）。
-- pages 覆盖率：**已修复**。新增 `Session.stream.test.tsx`(9 用例）与 `Session.actions.test.tsx`(9 用例）,Session.tsx 覆盖率 52.5% -> 93.4%(stmts),pages 目录 74.0% -> 90.2%。
-- 运行时可达 panic：**已修复**。`voice/objc.rs` 改 Option/Result + `availability()` 门禁，引擎不可用走既有降级链；`config.rs`/`catalog.rs` 两处经核实已在 `#[cfg(test)]` 内，生产路径无残留。
-- JSON-RPC 错误码：**已修复**。unknown method 回 -32601(`CallError::method_not_found`)，前端错误处理不按 code 分支，无劣化。
-- goal_tool 状态串：**已修复**。改用 `GoalStatus::as_str()` snake_case。
-- os_notify 线程驻留：**已修复**。改单 worker mpsc 串行 dispatcher，点击回跳行为不变。
-- stale `#[allow(dead_code)]`:**已修复**。`AppState::new`/`drop_extras` 标注删除，全仓复核残留均为真死或有意保留（带注释）。
-- 官网：**已修复**。sidebar.order 去重（troubleshooting 5 -> 6)；界面 chrome 中文化（AgentDirective 保留英文）；删除 8 个零使用 MDX 全局组件；`github` 与 `editPattern` 接线（指向 `StringKe/kxen` 的 `website/` 子目录）；绝对 URL 确认为 agent 消费的有意决策并写入 `website/AGENT.md` 与 lint 注释；`.md`/`.txt` 响应移除 BOM(`_headers` 经核实非冗余，保留）。
+## 7. 文档与代码一致性（62 篇逐字审计，失准已全部修正）
 
-## 八、修复优先级建议（原始评估留存）
+全部 62 个 MDX 逐字审计：59 篇覆盖全部数字常量（超时、上限、重试、并发、TTL、文件大小）、功能入口与故障语义声称，3 篇为纯导航页。未发现"文档描述了代码已删除功能"的情况。以下失准已全部修正并复验（website `pnpm check` + `pnpm build` 通过）：
 
-1. 立即修 P0-1（首跑目录边界），这是唯一的安全面问题。
-2. 修 P1-1（主会话模型路由断裂），消除静默假成功。
-3. 修 P1-2、P1-3（语音引擎、通知误触发），小改动大体验。
-4. 产品决策 P1-5（exec 逐次审批粒度）与 P1-4（启动自动更新）。
-5. 清理 P1-7 死接口与 P2 死代码，降低维护噪音。
-6. 择机统一锁收口、消除 `.kxen-bak` 污染、补 `pages` 测试覆盖。
+1. `models/usage.mdx` 429"最多一次重试" -> 改为"最多重试 2 次（共 3 次 attempt），可轮换账号池"（代码 `llm/retry.rs:7` `MAX_ATTEMPTS = 3`）。
+2. `agent/agent-teams.mdx` 任务状态枚举 5 -> 7：补 `Completing`（completion hook 提交前中间态）与 `Blocked`（teammate crash 阻塞）（代码 `agent/team/types.rs:93-101`）。
+3. `agent/background-tasks.mdx` 状态栏计数口径 -> "当前 Session 运行中任务数"（代码 `ws/settings.rs:47-53`）。
+4. `agent/goal.mdx` 与 `concepts/orchestration.mdx` blocked 表述 -> 双路径（terminal 立即 / 同因连续 3 轮）（代码 `core/goal.rs:284-285`）。
+5. `overview/status.mdx` 知识类型清单补 History（代码 `knowledge/mod.rs:57` 七类）。
+6. `reference/shortcuts.mdx` "按平台处理" -> "不按平台区分，同时接受 Cmd 和 Ctrl"（代码 `shortcuts.ts:8` 无条件 `metaKey || ctrlKey`）。
+7. `concepts/runtime.mdx` "Stream"措辞 -> 明确"同一条 WebSocket 连接上的 RPC 帧与 stream 事件帧，不存在独立的流通道"（代码 `src/lib/client.ts:49` 唯一连接、`ws/protocol.rs` JSON-RPC 3.0 帧）。
+8. `lib/home-content.ts` 产品文档链接补 models 与 recovery 两节。
+
+代码有但文档未覆盖的行为（minor 覆盖缺口，已记录不强制补齐）：知识扫描上限（256KB/2MB/深度 8）、检索注入 top 8、Skill 描述截断 250 字符、Workflow 沙箱数值（64MB/1MB/10min/32 次）、exec 15 秒转后台、PTT 400ms 阈值。
+
+## 8. 后端故障语义与安全边界（代码级抽查）
+
+- 存储修复锁 `PASS`：PostCommit 失败置入 BLOCKED 拒后续 mutation；修复要求 id + cause 精确匹配、可见消息逐字节相等；文件与父目录 fsync（`core/session/transaction.rs:66-174`、`storage.rs:64-106`）。
+- usage UNKNOWN 结算 `PASS`：无法证明的调用记 unmetered 不记 0；Goal charge outbox + receipt 幂等（`core/usage.rs:22-58,313-339`）。
+- Approval 超时 deny `PASS`：300s 超时/中断/通道缺失均落 Deny；exec/worktree/MCP/knowledge 消费方非 Allow 即拒（`agent/approval.rs:37,200-250`）。
+- Queue fail closed `PASS`：corrupt queue 拒自动修复保留原文件；入队前查 tombstone；未知字段不丢 delivery（`core/pending_queue/recovery.rs`）。
+- Session 删除恢复 `PASS`：tombstone 先行、取消 active run、manifest stage、失败精确 rollback；`is_tombstoned` 检查遍布 12+ 路径（`ws/session_delete.rs`）。
+- 网络边界 `PASS`：connector 校验实际连接所用全部 DNS 结果，任一命中 loopback/私网/CGNAT/link-local 即整拒；redirect 逐跳重检上限 5；不继承环境代理（`tools/net_guard.rs`）。
+- Shell 审批强制 `PASS`：所有 exec 及 UI task.restart 均过 safety_gate（本轮补齐后一致）。
+- 密钥边界 `PASS`：认证错误 key 替换 `[REDACTED]`；keyring crate 已移除，Keychain 走可 kill/wait 子进程，启动不自动触发。
+- 路径策略 `PASS`：canonicalization + workspace 包含校验 + 私钥/keychain 扩展名保护（`tools/path_policy.rs:140-279`）。
+
+遗留 minor（已接受）：voice 无集成测试、schedule 仅间接覆盖、net_guard 无端到端 SSRF 集成测试；`ws/rpc.rs` 一处 `unwrap_or_default()` 吞序列化错误（实际不可触发，nit）；checkpoint shadow git 快照含 `.env`（仅本地 `.kxen` 恢复用途，不外发）。
+
+## 9. website SEO、GEO/AIO 与线上状态
+
+评估后已修复：JSON-LD 三类结构化数据（首页 `SoftwareApplication`、文档页 `TechArticle`、全站 `BreadcrumbList`，新增 `website/src/lib/json-ld.ts`，经 nimbus `head` 通道注入，产物已抽查）；`/_astro/*` immutable 缓存头；404 页核心章节导航；`home-content.ts` 章节补齐。
+
+当前状态：
+
+- 基础 SEO `PASS`：62 页 title/description 逐页唯一（lint 强制）、canonical、OG/Twitter 完整、每页动态 OG 图、lang/viewport/favicon。
+- GEO/AIO `PASS`：`/llms.txt` 双层索引 + `/llms-full.txt` 全量语料 + 每页 `.md` alternate（`<link rel="alternate" type="text/markdown">`）均从 MDX 真源生成；静态托管下已是可行最优。
+- sitemap `PASS`：`@astrojs/sitemap` 从内容集合自动生成，默认排除 404 与 endpoint；当前 62 个 URL 与 MDX 路由一致（`integrations/web-search/` 已在仓库就绪）。
+- 线上部署滞后（流程项，待提交部署）：线上 `https://kxen.ai/` 为旧构建，`integrations/web-search/` 页面 404 且 sitemap 缺页；下次部署自动纳入页面、sitemap、llms.txt 与 OG 图，代码无阻塞。
+- 遗留 minor（已接受）：sitemap 未注入 lastmod（nimbus 透传未确认，不动）；`og:locale` 输出 `zh-CN`（上游 nimbus-docs 框架 bug，本地不可修）；`content.config.ts` 的 `status`/`audience` 元数据暂无消费方；缺 `apple-touch-icon`/`theme-color`。
+
+## 10. 验证证据（当前工作树最终状态）
+
+| 验证                                                       | 结果           | 证据                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---------------------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cargo fmt --all -- --check`                               | PASS           | 通过                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `cargo check --all-targets --all-features`                 | PASS           | 0 错误 0 警告                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `cargo clippy --all-targets --all-features -- -D warnings` | PASS           | 通过                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `cargo test --lib`                                         | PASS           | 720 passed, 0 failed, 1 ignored                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `cargo test --bins`                                        | PASS           | 130 passed, 0 failed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `cargo test --all-targets`（含全部集成测试）               | PASS           | 32 个集成二进制全绿：agent_background 13、agent_gates 5、approval_broker 19、attachment 5、browser_tool 15、compaction 4、dev_server 4、exec_dialect 10、file_gates 3、fs_tool_eval 15、goal 26、knowledge_retrieval 23、mcp_echo 1、mcp_oauth 8、mcp_oauth_edge 5、mcp_remote 3、mcp_remote_get 2、mcp_sse 2、mrm 9、pending_queue 17、providers_registry 9、rpc_contract 1、run_loop 16、safety_eval 15、session_cleanup 5、session_extras 4、session_model 4、session_store 8、team_workspace 3、usage_notify 4、workflow 23、worktree 11，全部 0 failed |
+| `pnpm check`（vp check 格式+lint + tsc）                   | PASS           | 414 文件格式正确，335 文件无 lint 警告，typecheck 通过                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `pnpm test`（行数门禁 + vitest）                           | PASS           | 行数门禁 OK；100 个测试文件 / 674 个测试全部通过                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `pnpm coverage`                                            | PASS           | 退出码 0；全量 lines 93.07%、statements 89.66%、functions 89.36%、branches 76.61%，均过阈值（80/80/80/70）                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `scripts/rust-coverage.sh`                                 | PASS           | 退出码 0；行覆盖 80.04%（阈值 80，llvm-cov --fail-under-lines 80），regions 78.12%、functions 75.55%；行覆盖余量仅 0.04pp，新增代码需同步补测试                                                                                                                                                                                                                                                                                                                                                                                                             |
+| website `pnpm check` + `pnpm build`                        | PASS           | 62 个 MDX lint clean，astro check 77 文件 0 诊断，64 个页面构建成功                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| RPC 三方对称                                               | PASS           | `rpc_contract` 测试通过（100 方法）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 线上 sitemap 与 MDX 路由比对                               | PASS（仓库侧） | 62 URL 与 MDX 路由一致；线上待部署见第 9 节                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| GitHub 外部发布治理                                        | FAIL           | 沿用上一轮已证明的仓库外状态（release environment 无保护、无 tag ruleset、Immutable Releases 未开、Actions 来源未收口、签名 secret 作用域未最小化、main ruleset 存在可永久 bypass 执行者），本轮未复查                                                                                                                                                                                                                                                                                                                                                      |
+| 真实签名发布、硬件与外部服务                               | UNKNOWN        | Developer ID 签名公证、安装版 E2E、真实麦克风/Apple Speech、Provider 账号、Remote MCP、外部副作用均需现场验证                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+
+## 11. 最终判定
+
+- 产品意图与必要范围：PASS。
+- 后端编译、测试与门禁：PASS（本轮 8 处编译错误、4 个超行文件、9 个遗留测试失败全部修复并复验）。
+- 前端 UI 完整度、流程顺畅度与测试门禁：PASS（死循环根因修复，674 测试全绿；2 项 UI minor 已修，2 项接受）。
+- 文档与代码一致性：PASS（62 篇全量审计，7 处失准全部修正）。
+- website SEO 与 GEO/AIO：PASS（JSON-LD 已补；线上待部署为流程项）。
+- 公开发布资格：FAIL（仓库外 GitHub 治理沿用上轮证据未收口，真实签名发布仍未验证；website 线上部署滞后待提交）。
+
+剩余行动项均不在本地代码内：提交本轮改动并部署 website -> 复查 GitHub 发布治理配置 -> 真实签名发布与现场 E2E。
