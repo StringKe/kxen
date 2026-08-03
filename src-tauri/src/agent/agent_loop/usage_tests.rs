@@ -107,15 +107,19 @@ fn wall_cache_reloads_on_goal_file_change() {
     let mut cache = GoalWallCache::default();
     assert!(cache.goal(Some("wall-sess"), None, false).is_none());
     active_goal("wall-1", 60_000).save(&dir).expect("save");
+    // 检查间隔内复用快照：新保存的 goal 暂不可见
+    assert!(cache.goal(Some("wall-sess"), None, false).is_none());
+    // 缓存按 MIN_CHECK_INTERVAL 节流，跨过间隔后的变更必须被观察到
+    std::thread::sleep(std::time::Duration::from_millis(600));
     let goal = cache.goal(Some("wall-sess"), None, false).expect("focus");
     assert_eq!(goal.id, "wall-1");
     assert!(!goal.wall_exceeded());
 
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(600));
     active_goal("wall-1", 0).save(&dir).expect("save tight");
     assert!(cache.goal(Some("wall-sess"), None, false).expect("focus").wall_exceeded());
 
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::thread::sleep(std::time::Duration::from_millis(600));
     let mut paused = Goal::load(&dir, "wall-1").expect("load");
     paused.pause().expect("pause");
     paused.save(&dir).expect("save paused");

@@ -86,6 +86,13 @@ pub(super) async fn run_api<'a>(
         let cleanup = runtime.usage_reporter.discard_unstarted(&attempt);
         return Some(Err(append_metering_error("request cancelled".into(), cleanup)));
     }
+    // 引擎 future 内部会再查一次凭证；本侧先复查。凭证在 admission 等待窗口内消失时
+    // claim 仍是 Prepared，可安全丢弃，不会留下 Started 崩溃窗口被恢复流程误结算 UNKNOWN。
+    if !api_configured(engine, store, config) {
+        drop(permit);
+        let cleanup = runtime.usage_reporter.discard_unstarted(&attempt);
+        return Some(Err(append_metering_error(format!("{engine} became unconfigured before request start"), cleanup)));
+    }
     if let Err(error) = runtime.usage_reporter.mark_started(&mut attempt) {
         drop(permit);
         return Some(Err(format!("{engine} request was not started because its durable Started marker failed: {error}")));
@@ -170,6 +177,13 @@ pub(super) async fn run_native<'a>(
         drop(permit);
         let cleanup = runtime.usage_reporter.discard_unstarted(&usage_attempt);
         return Some(Err(append_metering_error("request cancelled".into(), cleanup)));
+    }
+    // 引擎 future 内部会再查一次凭证；本侧先复查。凭证在 admission 等待窗口内消失时
+    // claim 仍是 Prepared，可安全丢弃，不会留下 Started 崩溃窗口被恢复流程误结算 UNKNOWN。
+    if !configured(engine, store) {
+        drop(permit);
+        let cleanup = runtime.usage_reporter.discard_unstarted(&usage_attempt);
+        return Some(Err(append_metering_error(format!("{engine} became unconfigured before request start"), cleanup)));
     }
     if let Err(error) = runtime.usage_reporter.mark_started(&mut usage_attempt) {
         drop(permit);

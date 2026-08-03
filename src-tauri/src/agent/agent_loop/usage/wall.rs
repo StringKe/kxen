@@ -9,7 +9,13 @@ pub(crate) struct GoalWallCache {
     goal: Option<crate::core::goal::Goal>,
     load_failed: bool,
     initialized: bool,
+    last_check: Option<std::time::Instant>,
 }
+
+/// 流式 delta 每次都会查 goal；目录 stat 是最小失效粒度，间隔内的重复查询直接复用缓存。
+/// 外部变更（pause/resume/预算编辑）最长延迟一个间隔才被观察到，wall deadline 本身由
+/// 缓存快照按当前时间计算，不受节流影响。
+const MIN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl GoalWallCache {
     pub(crate) fn goal(
@@ -18,6 +24,10 @@ impl GoalWallCache {
         bound_goal_id: Option<&str>,
         binding_frozen: bool,
     ) -> Option<crate::core::goal::Goal> {
+        if self.last_check.is_some_and(|instant| instant.elapsed() < MIN_CHECK_INTERVAL) {
+            return self.goal.clone();
+        }
+        self.last_check = Some(std::time::Instant::now());
         let dir = crate::core::paths::goals_dir();
         let mtime = match goal_store_mtime(&dir) {
             Ok(mtime) => mtime,
