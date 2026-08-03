@@ -12,9 +12,11 @@ const softwareApplicationLd = jsonLd({
   applicationCategory: "DeveloperApplication",
   description: homeDescription,
 });
+// 首页的 markdown 交替页（/index.md）：Agent 指令与 PageActions 需要显式传入。
+const markdownUrl = Astro.site ? new URL("/index.md", Astro.site).href : "/index.md";
 ---
 
-<BaseLayout title={homeTitle} description={homeDescription} head={[softwareApplicationLd]}>
+<BaseLayout title={homeTitle} description={homeDescription} markdownUrl={markdownUrl} head={[softwareApplicationLd]}>
   <div class="flex flex-col min-h-screen">
     <Header />
     <main class="flex-1 mx-auto max-w-5xl w-full px-6 py-16 sm:py-24">

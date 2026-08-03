@@ -42,7 +42,7 @@ AGENTS.md 和 Rules 保存需要持续生效的约束。References 只在任务�
 
 ## 历史压缩
 
-模型上下文使用 catalog 中的 context window，找不到时回落到 200000 token。估算用字符数除以 4，超过窗口的 80％ 时触发 compaction。
+模型上下文使用 catalog 中的 context window，找不到时回落到 200000 token。估算用字符数除以 4，每张图片按固定估值 1000 token 计入（base64 长度与实际 token 无稳定换算，宁高估勿漏估），超过窗口的 80％ 时触发 compaction。
 
 Compaction:
 

@@ -43,8 +43,9 @@ export async function GET({ props }: { props: SlugProps }) {
   const { entry, title, description, version } = item;
   const data = (entry.data ?? {}) as Record<string, unknown>;
   const rawImage = data.socialImage;
+  // 与 [...slug].astro 的 og 约定一致：无显式 socialImage 时用每页生成的 og 卡片。
   const socialImage =
-    typeof rawImage === "string" && rawImage.length > 0 ? rawImage : config.socialImage;
+    typeof rawImage === "string" && rawImage.length > 0 ? rawImage : `/og/${entry.id}.png`;
 
   const body = [
     "---",
