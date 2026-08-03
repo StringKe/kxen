@@ -60,7 +60,7 @@ cap-std = "4.0.2"
 # fetcher 特性不启用：只驱动本机已装 Chrome，不下载 Chromium
 chromiumoxide = { version = "0.9", default-features = false }
 uuid = { version = "1", features = ["v4"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tauri-plugin-dialog = "2.7.2"
 notify-rust = "4"
 tauri-plugin-updater = "2"
