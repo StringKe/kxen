@@ -105,7 +105,10 @@ export default function Settings() {
 
   onMount(() => {
     void reloadOverview();
-    const offResync = client.onResync(() => void reloadOverview());
+    // 保存 RPC 在飞时跳过 resync 对账，避免旧快照覆盖乐观显示值（同 KnowledgeBlockedPanel 的 busy 守卫）
+    const offResync = client.onResync(() => {
+      if (!policySaving() && experimentalSaving().size === 0) void reloadOverview();
+    });
     onCleanup(offResync);
   });
 
