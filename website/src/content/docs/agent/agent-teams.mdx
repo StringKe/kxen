@@ -29,7 +29,7 @@ Team 任务记录:
 - depends_on。
 - 任务描述和结果。
 
-依赖完成后，后续任务才能进入可执行状态。failed 或 canceled 会级联取消仍为 pending 的依赖任务；已经 in_progress 的任务自行结算。completion hook 成功后任务先进入 completing 中间态，由 task_resolve 提交后才结算为 completed。teammate crash 时，其进行中的任务被标记为 blocked。任务状态是 Team 协作真源，不应只依赖自然语言中的"我完成了"。
+依赖完成后，后续任务才能进入可执行状态。failed 或 canceled 会级联取消仍为 pending 的依赖任务；已经 in_progress 的任务自行结算。completion hook 成功后任务先进入 completing 中间态，由 task_resolve 提交后才结算为 completed。teammate crash 时，处于 completing 中间态的任务被标记为 blocked，in_progress 任务保持原状态由 lead 显式处理。任务状态是 Team 协作真源，不应只依赖自然语言中的"我完成了"。
 
 ## 持久化
 
