@@ -32,11 +32,15 @@ pub fn callback_id(server_url: &str) -> String {
 }
 
 /// /dev/urandom 随机字节 -> base64url（零新依赖，与 ws token 同源）。
-fn rand_urlsafe(bytes: usize) -> String {
-    use std::io::Read;
+fn rand_urlsafe(bytes: usize) -> Result<String, String> {
+    let file = std::fs::File::open("/dev/urandom").map_err(|error| format!("OAuth secure randomness unavailable: {error}"))?;
+    rand_urlsafe_from(file, bytes)
+}
+
+fn rand_urlsafe_from(mut source: impl std::io::Read, bytes: usize) -> Result<String, String> {
     let mut buf = vec![0u8; bytes];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).expect("read /dev/urandom for oauth");
-    URL_SAFE_NO_PAD.encode(&buf)
+    source.read_exact(&mut buf).map_err(|error| format!("OAuth secure randomness unavailable: {error}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(&buf))
 }
 
 pub struct Pkce {
@@ -45,15 +49,25 @@ pub struct Pkce {
 }
 
 /// PKCE S256：verifier 32 字节随机（43 字符），challenge = base64url(sha256(verifier))。
-pub fn pkce() -> Pkce {
-    let verifier = rand_urlsafe(32);
+pub fn pkce() -> Result<Pkce, String> {
+    let verifier = rand_urlsafe(32)?;
     let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    Pkce { verifier, challenge }
+    Ok(Pkce { verifier, challenge })
 }
 
 /// state：16 字节随机（22 字符），回调比对防 CSRF。
-pub fn random_state() -> String {
+pub fn random_state() -> Result<String, String> {
     rand_urlsafe(16)
+}
+
+#[cfg(test)]
+mod random_tests {
+    #[test]
+    fn secure_random_read_failure_is_returned_instead_of_panicking() {
+        let source = std::io::Cursor::new(vec![0_u8; 3]);
+        let error = super::rand_urlsafe_from(source, 16).expect_err("short entropy source must fail closed");
+        assert!(error.contains("secure randomness unavailable"));
+    }
 }
 
 /// RFC 8414 AS 元数据（本流只用这三个字段）。
@@ -73,6 +87,8 @@ pub fn authorize_url(
     challenge: &str,
     scopes: Option<&str>,
 ) -> Result<String, String> {
+    super::config::validate_secure_endpoint(&meta.authorization_endpoint, true)
+        .map_err(|error| format!("invalid authorization_endpoint: {error}"))?;
     let mut url = reqwest::Url::parse(&meta.authorization_endpoint).map_err(|e| format!("invalid authorization_endpoint: {e}"))?;
     {
         let mut q = url.query_pairs_mut();
@@ -91,15 +107,24 @@ pub fn authorize_url(
 
 fn parse_meta(v: &Value, source: &str) -> Result<AuthServerMeta, String> {
     let get = |k: &str| v.get(k).and_then(|s| s.as_str()).map(String::from);
-    Ok(AuthServerMeta {
-        authorization_endpoint: get("authorization_endpoint").ok_or_else(|| format!("{source}: missing authorization_endpoint"))?,
-        token_endpoint: get("token_endpoint").ok_or_else(|| format!("{source}: missing token_endpoint"))?,
-        registration_endpoint: get("registration_endpoint"),
-    })
+    let authorization_endpoint = get("authorization_endpoint").ok_or_else(|| format!("{source}: missing authorization_endpoint"))?;
+    let token_endpoint = get("token_endpoint").ok_or_else(|| format!("{source}: missing token_endpoint"))?;
+    let registration_endpoint = get("registration_endpoint");
+    for (name, endpoint) in [
+        ("authorization_endpoint", Some(authorization_endpoint.as_str())),
+        ("token_endpoint", Some(token_endpoint.as_str())),
+        ("registration_endpoint", registration_endpoint.as_deref()),
+    ] {
+        if let Some(endpoint) = endpoint {
+            super::config::validate_secure_endpoint(endpoint, true).map_err(|error| format!("{source}: {name} {error}"))?;
+        }
+    }
+    Ok(AuthServerMeta { authorization_endpoint, token_endpoint, registration_endpoint })
 }
 
 /// discovery GET：2xx 给 body；其余（404/5xx/网络错）一律 None 让候选链继续。
 async fn get_json(http: &reqwest::Client, url: &str, guard: Guard) -> Result<Option<Value>, String> {
+    super::config::validate_secure_endpoint(url, true).map_err(|error| format!("OAuth metadata endpoint {error}"))?;
     if guard == Guard::Enforced {
         crate::tools::net_guard::check_url(url).await?;
     }
@@ -110,7 +135,9 @@ async fn get_json(http: &reqwest::Client, url: &str, guard: Guard) -> Result<Opt
     if !resp.status().is_success() {
         return Ok(None);
     }
-    let v = resp.json::<Value>().await.map_err(|e| format!("{url}: bad json: {e}"))?;
+    let v = crate::net_response::json::<Value>(resp, crate::net_response::JSON_BODY_LIMIT, "OAuth metadata")
+        .await
+        .map_err(|error| format!("{url}: bad json: {error}"))?;
     Ok(Some(v))
 }
 
@@ -194,6 +221,7 @@ pub async fn register(
     guard: Guard,
 ) -> Result<(String, Option<String>), String> {
     let endpoint = meta.registration_endpoint.as_deref().ok_or("authorization server 不支持动态注册，请在 oauth.clientId 显式配置")?;
+    super::config::validate_secure_endpoint(endpoint, true).map_err(|error| format!("OAuth registration endpoint {error}"))?;
     if guard == Guard::Enforced {
         crate::tools::net_guard::check_url(endpoint).await?;
     }
@@ -207,10 +235,41 @@ pub async fn register(
     let resp = http.post(endpoint).json(&body).send().await.map_err(|e| format!("oauth register {endpoint}: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let text: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+        let text = crate::net_response::text_lossy(resp, crate::net_response::ERROR_BODY_LIMIT, "OAuth registration error")
+            .await
+            .unwrap_or_else(|error| error);
+        let text: String = text.chars().take(200).collect();
         return Err(format!("oauth register http {status}: {text}"));
     }
-    let v = resp.json::<Value>().await.map_err(|e| format!("oauth register bad json: {e}"))?;
+    let v = crate::net_response::json::<Value>(resp, crate::net_response::JSON_BODY_LIMIT, "OAuth registration response")
+        .await
+        .map_err(|error| format!("oauth register bad json: {error}"))?;
     let client_id = v.get("client_id").and_then(|s| s.as_str()).ok_or("oauth register response missing client_id")?;
     Ok((client_id.to_string(), v.get("client_secret").and_then(|s| s.as_str()).map(String::from)))
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_rejects_cleartext_public_oauth_endpoints() {
+        let metadata = json!({
+            "authorization_endpoint": "https://auth.example.test/authorize",
+            "token_endpoint": "http://auth.example.test/token",
+        });
+        let error = parse_meta(&metadata, "fixture").unwrap_err();
+        assert!(error.contains("token_endpoint") && error.contains("secure HTTPS URL"), "{error}");
+    }
+
+    #[test]
+    fn metadata_allows_loopback_http_for_local_protocol_tests() {
+        let metadata = json!({
+            "authorization_endpoint": "http://127.0.0.1:3000/authorize",
+            "token_endpoint": "http://[::1]:3000/token",
+            "registration_endpoint": "https://auth.example.test/register",
+        });
+        let parsed = parse_meta(&metadata, "fixture").expect("loopback OAuth endpoints");
+        assert_eq!(parsed.token_endpoint, "http://[::1]:3000/token");
+    }
 }

@@ -1,5 +1,5 @@
 mod app_state;
-mod cron_dispatch;
+mod background_jobs;
 mod doctor;
 mod goal_rpc;
 mod os_notify;
@@ -132,63 +132,17 @@ pub fn run() {
                                 .unwrap_or(0);
                             let state = handle.state::<Arc<AppState>>();
                             let mut buf = kxen_app::core::shared::lock(&state.notifications);
+                            let previous = buf.clone();
                             kxen_app::core::notifications::push(&mut buf, now, text, session_id);
-                            kxen_app::core::notifications::persist(&buf);
-                        }
-                    }
-                });
-                // cron tick：15s 一轮，到期任务注入会话起 run（进程内调度，随 app 存活）
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut ticks = 0u32;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                        ticks += 1;
-                        // 后台记忆 consolidation：120 tick（30min）一轮，best-effort
-                        if ticks.is_multiple_of(120) && kxen_app::core::config::experimental_config().automatic_knowledge_distillation {
-                            let state = handle.state::<Arc<AppState>>();
-                            let model = ws::session_ops::chat_default_model(&state).await;
-                            let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
-                            let written = kxen_app::knowledge::consolidate::run_once(&model, &store).await;
-                            if written > 0 {
-                                tracing::info!(written, "memory consolidation distilled");
-                            }
-                        }
-                        let now =
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                        // 同批已派发的 session：首个 spawn 后 token 尚未注册进 active_runs，靠本集合判重
-                        let mut dispatched: std::collections::HashSet<String> = std::collections::HashSet::new();
-                        for job in kxen_app::core::schedule::drain_due(now) {
-                            let state = handle.state::<Arc<AppState>>();
-                            let has_active = kxen_app::core::shared::lock(&state.active_runs).contains_key(&job.session_id);
-                            let has_queued = state.pending_messages.has_queued(&job.session_id);
-                            let text = format!("[cron {}] {}", job.id, job.prompt);
-                            match cron_dispatch::cron_dispatch(has_active, has_queued, dispatched.contains(&job.session_id)) {
-                                cron_dispatch::CronDispatch::Spawn => {
-                                    dispatched.insert(job.session_id.clone());
-                                    let stream_id = ws::protocol::stream_id("run");
-                                    tokio::spawn(ws::llm_task::run_llm(
-                                        stream_id,
-                                        job.session_id,
-                                        text,
-                                        vec![],
-                                        vec![],
-                                        None,
-                                        handle.clone(),
-                                    ));
-                                }
-                                // 并发 run 会交叉写 JSONL 历史：投入队列由 run 结束续跑消化
-                                cron_dispatch::CronDispatch::Enqueue => {
-                                    let note = match state.pending_messages.enqueue(&job.session_id, text, vec![], vec![]) {
-                                        Ok(n) => format!("cron 触发时会话运行中，已排队（第 {n} 条）"),
-                                        Err(error) => format!("cron 消息入队失败：{error}"),
-                                    };
-                                    state.bus.publish(kxen_app::core::event::Event::notify(note, Some(job.session_id.clone())));
-                                }
+                            if let Err(error) = kxen_app::core::notifications::persist_checked(&buf) {
+                                *buf = previous;
+                                tracing::error!(%error, "notification persistence failed");
                             }
                         }
                     }
                 });
+                // cron 与 Knowledge consolidation 使用独立时钟和任务。Provider 慢请求不得阻塞定时消息。
+                background_jobs::spawn(app.handle().clone());
                 // MCP servers：信任门 + 双 scope 加载后台启动（server 冷启动可至 60s，绝不阻塞启动路径）
                 {
                     let handle = app.handle().clone();
@@ -206,7 +160,7 @@ pub fn run() {
                     let Some(state) = handle.try_state::<Arc<AppState>>() else {
                         return;
                     };
-                    let baseline = state.auth_store.lock().map(|store| store.clone()).unwrap_or_default();
+                    let baseline = kxen_app::core::shared::lock(&state.auth_store).clone();
                     let probed = tokio::task::spawn_blocking(move || {
                         let mut store = baseline.clone();
                         let outcomes = kxen_app::auth::probe_all(&mut store, false);
@@ -219,9 +173,12 @@ pub fn run() {
                         }
                         if let Some(state) = handle.try_state::<Arc<AppState>>() {
                             let mut current = kxen_app::core::shared::lock(&state.auth_store);
-                            kxen_app::auth::probe::merge_probe_delta(&baseline, &store, &mut current);
-                            if let Err(e) = kxen_app::auth::credential::write_auth_file(&kxen_app::core::paths::auth_file(), &current) {
-                                tracing::error!(error = %e, "credential probe persistence failed");
+                            match kxen_app::auth::credential::update_auth_file(&kxen_app::core::paths::auth_file(), |disk| {
+                                kxen_app::auth::probe::merge_probe_delta(&baseline, &store, disk);
+                                Ok(())
+                            }) {
+                                Ok(persisted) => *current = persisted,
+                                Err(error) => tracing::error!(%error, "credential probe persistence failed"),
                             }
                         }
                     }
@@ -252,30 +209,25 @@ fn notification_workdir(
     }
 }
 
+#[cfg(test)]
+fn should_dispatch_schedule(sessions_dir: &std::path::Path, session_id: &str) -> Result<bool, String> {
+    kxen_app::core::session_recovery::is_tombstoned(sessions_dir, session_id).map(|tombstoned| !tombstoned)
+}
+
 /// 前端拿 ws 端口 + 握手 token（替代 window.eval 注入：页面重载后注入丢失的竞态根治）。
 #[tauri::command]
-fn ws_port(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
+fn ws_port(state: tauri::State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let port = *kxen_app::core::shared::lock(&state.ws_port);
-    serde_json::json!({ "port": port, "token": state.ws_token })
+    ws_endpoint(port, &state.ws_token)
+}
+
+fn ws_endpoint(port: u16, token: &str) -> Result<serde_json::Value, String> {
+    if port == 0 {
+        return Err("websocket server is not ready".into());
+    }
+    Ok(serde_json::json!({ "port": port, "token": token }))
 }
 
 #[cfg(test)]
-mod workspace_tests {
-    use super::notification_workdir;
-
-    #[test]
-    fn notification_session_never_falls_back_to_active_workspace() {
-        let base = std::env::temp_dir().join(format!("kxen-notification-workdir-{}", std::process::id()));
-        let sessions = base.join("sessions");
-        let active = base.join("active");
-        let owned = base.join("owned");
-        std::fs::create_dir_all(&active).unwrap();
-        std::fs::create_dir_all(&owned).unwrap();
-        let session = kxen_app::core::session::create(&sessions, owned.to_str().unwrap()).unwrap();
-
-        assert_eq!(notification_workdir(&sessions, &active, None).unwrap(), active);
-        assert_eq!(notification_workdir(&sessions, &active, Some(&session.id)).unwrap(), owned);
-        assert!(notification_workdir(&sessions, &active, Some("ses_missing")).is_err());
-        std::fs::remove_dir_all(base).ok();
-    }
-}
+#[path = "main_tests.rs"]
+mod workspace_tests;

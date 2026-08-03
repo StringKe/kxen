@@ -1,24 +1,37 @@
 //! 内嵌 WebSocket 单端点（前端 <-> Rust）：JSON-RPC 3.0 单连接多路复用。
-//! - 请求-响应：{jsonrpc:"3.0", id, method, params} -> {id, resId, result|error}
-//! - 服务端流：stream:{id, seq, mode:"server", complete?}（订阅流）
+//! - 请求-响应：{jsonrpc:"3.0", id, method, params, options?} -> {id, resId, result|error}
+//! - 服务端流：stream:{id, seq, mode:"server"}（订阅流）
 //! - 系统方法：rpc.subscribe / rpc.unsubscribe / rpc.heartbeat
+//!   3.0 的 rpc.subscribe 必须声明 options.stream=true；2.0 与缺版本请求保持兼容。
 //!   （run 取消不走流控制，走 session.abort）
 //!
 //! 端口启动时随机分配，前端经 ws_port command 获取。
 
 mod active_context;
+mod connection;
+pub(crate) mod llm_compaction;
+mod llm_context;
+mod llm_input;
+mod llm_oauth;
 mod llm_special;
 pub mod llm_task;
 mod ops;
 mod ops_agents;
 mod ops_attach;
+mod ops_config;
 mod ops_diagnostics;
+mod ops_knowledge;
 mod ops_mcp;
 mod ops_provider;
+mod ops_recovery;
+pub(crate) use ops_provider::recover_custom_provider_transaction;
 mod ops_workspace;
 pub mod pending;
 pub mod protocol;
 mod queue_delivery;
+mod queue_retry;
+mod request;
+mod request_schema;
 mod rpc;
 mod run_finalize;
 mod run_slot;
@@ -29,26 +42,20 @@ mod settings;
 mod stream;
 mod worktree_rpc;
 
-use futures::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tauri::{AppHandle, Manager};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tauri::AppHandle;
+use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::server::{Callback, ErrorResponse, Request as WsRequest, Response as WsResponse};
 use tokio_tungstenite::tungstenite::http;
 
-use crate::AppState;
-use protocol::{Request, Response};
-
 /// WS 握手 token：/dev/urandom 32 字节 hex（零新依赖）。每次启动重生成，前端经 ws_port command 获取。
 /// 本机随机端口不能裸奔：同机恶意进程可连端口发 RPC，token 是唯一防线。
-pub(crate) fn gen_ws_token() -> String {
+pub(crate) fn gen_ws_token() -> std::io::Result<String> {
     use std::io::Read;
     let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).expect("read /dev/urandom for ws token");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Origin 白名单：无 Origin（非浏览器客户端）与 Tauri webview / 本地 dev 前端放行。
@@ -119,103 +126,10 @@ pub async fn serve(app: AppHandle) -> std::io::Result<u16> {
     let port = listener.local_addr()?.port();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(handle_mux(stream, app.clone()));
+            tokio::spawn(connection::handle(stream, app.clone()));
         }
     });
     Ok(port)
-}
-
-/// 单连接多路复用（JSON-RPC 3.0）。
-async fn handle_mux(stream: TcpStream, app: AppHandle) {
-    // 握手门：Origin 白名单 + ?token= 与 AppState.ws_token 相等，任一不过拒连
-    let expected = app.state::<Arc<AppState>>().ws_token.clone();
-    let Ok(ws) = tokio_tungstenite::accept_hdr_async(stream, HandshakeGuard { expected }).await else {
-        return;
-    };
-    let (mut tx, mut rx) = ws.split();
-    let mut subs: Vec<SubBinding> = Vec::new();
-    let mut sequences = StreamSequences::default();
-    let mut bus_rx = app.state::<Arc<AppState>>().bus.subscribe();
-
-    loop {
-        tokio::select! {
-            msg = rx.next() => {
-                match msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        let Some(resp) = handle_client_frame(&text, &mut subs, &mut sequences, &app).await else { continue };
-                        if tx.send(WsMessage::Text(resp.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WsMessage::Close(_))) | None => break,
-                    _ => {}
-                }
-            }
-            event = bus_rx.recv() => {
-                use tokio::sync::broadcast::error::RecvError;
-                match event {
-                    Ok(event) => {
-                        for chunk in stream::event_to_chunks(event, &subs, &mut sequences) {
-                            let Ok(text) = serde_json::to_string(&chunk) else { continue };
-                            if tx.send(WsMessage::Text(text.into())).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    // bus 溢出：连接不断，发 resync 控制帧让前端全量重拉（丢增量不可自愈）
-                    Err(RecvError::Lagged(n)) => {
-                        let chunk = resync_chunk(n, &mut sequences);
-                        let Ok(text) = serde_json::to_string(&chunk) else { continue };
-                        if tx.send(WsMessage::Text(text.into())).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-}
-
-/// 处理一条客户端帧：3.0 请求 -> 响应文本（heartbeat/无响应型返回 None 由调用方跳过）。
-async fn handle_client_frame(text: &str, subs: &mut Vec<SubBinding>, sequences: &mut StreamSequences, app: &AppHandle) -> Option<String> {
-    let Ok(req) = serde_json::from_str::<Request>(text) else {
-        let resp = Response::err(Value::Null, protocol::PARSE_ERROR, "invalid json-rpc frame");
-        return serde_json::to_string(&resp).ok();
-    };
-    match req.method.as_str() {
-        protocol::M_HEARTBEAT => {
-            let resp = Response::ok(req.id, json!({ "alive": true }));
-            return serde_json::to_string(&resp).ok();
-        }
-        protocol::M_SUBSCRIBE => {
-            let topics: HashSet<String> = req
-                .params
-                .get("topics")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            let stream_id = protocol::stream_id("sub");
-            subs.push(SubBinding { stream_id: stream_id.clone(), topics });
-            let resp = Response::ok(req.id, json!({ "stream_id": stream_id }));
-            return serde_json::to_string(&resp).ok();
-        }
-        protocol::M_UNSUBSCRIBE => {
-            let stream_id = req.params.get("stream_id").and_then(Value::as_str).unwrap_or("");
-            subs.retain(|b| b.stream_id != stream_id);
-            sequences.remove(stream_id);
-            let resp = Response::ok(req.id, json!(true));
-            return serde_json::to_string(&resp).ok();
-        }
-        _ => {}
-    }
-
-    let result = rpc::rpc_call(&req.method, req.params, app).await;
-    let resp = match result {
-        Ok(value) => Response::ok(req.id, value),
-        Err(e) => Response::err(req.id, e.code, e.message),
-    };
-    serde_json::to_string(&resp).ok()
 }
 
 /// resync 控制帧的固定 stream id：前端按此识别「丢增量，需全量重拉」。
@@ -256,8 +170,8 @@ mod tests {
 
     #[test]
     fn ws_token_is_random_hex() {
-        let a = gen_ws_token();
-        let b = gen_ws_token();
+        let a = gen_ws_token().unwrap();
+        let b = gen_ws_token().unwrap();
         assert_eq!(a.len(), 64, "32 字节 hex = 64 字符");
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "必须全 hex");
         assert_ne!(a, b, "两次生成不得相同");

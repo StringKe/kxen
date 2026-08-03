@@ -19,9 +19,25 @@ impl TeamManager {
                 }
             };
             let directory = entry.path();
-            if directory.is_dir()
-                && let Err(error) = self.restore_dir(directory.clone())
-            {
+            if !directory.is_dir() {
+                continue;
+            }
+            let Some(session_id) = directory.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            match crate::core::session_recovery::is_tombstoned(&self.sessions_dir, session_id) {
+                Ok(true) => {
+                    lock(&self.restore_paused).insert(session_id.to_string());
+                    tracing::info!(session = session_id, "team restore paused for tombstoned session");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(session = session_id, %error, "team tombstone check failed");
+                    continue;
+                }
+            }
+            if let Err(error) = self.restore_dir(directory.clone()) {
                 tracing::error!(path = %directory.display(), %error, "team restore failed");
             }
         }
@@ -31,7 +47,23 @@ impl TeamManager {
         crate::core::ids::validate_id(session_id)?;
         let _registry = lock(&self.registry_lock);
         self.detach_session(session_id);
-        self.restore_dir_locked(self.root.join(session_id)).map(|_| ())
+        self.restore_dir_locked(self.root.join(session_id)).map(|_| {
+            lock(&self.restore_paused).remove(session_id);
+        })
+    }
+
+    /// deletion recovery barrier 完成后恢复启动期暂停的 Team。仍有 tombstone 的项保持 paused。
+    pub fn resume_paused(self: &Arc<Self>) -> Result<Vec<String>, String> {
+        let ids: Vec<String> = lock(&self.restore_paused).iter().cloned().collect();
+        let mut restored = Vec::new();
+        for id in ids {
+            if crate::core::session_recovery::is_tombstoned(&self.sessions_dir, &id)? {
+                continue;
+            }
+            self.restore_session(&id)?;
+            restored.push(id);
+        }
+        Ok(restored)
     }
 
     fn restore_dir(self: &Arc<Self>, directory: PathBuf) -> Result<bool, String> {
@@ -77,33 +109,53 @@ impl TeamManager {
             }
             None => Vec::new(),
         };
-        let restart: Vec<super::super::types::Member> = members
-            .iter()
-            .filter(|member| {
-                !member.prompt.is_empty()
-                    && !matches!(member.status, super::super::types::MemberStatus::Shutdown | super::super::types::MemberStatus::Failed)
-            })
-            .cloned()
-            .collect();
-        for member in &mut members {
-            if member.status != super::super::types::MemberStatus::Shutdown && member.status != super::super::types::MemberStatus::Failed {
-                member.status = if restart.iter().any(|entry| entry.name == member.name) {
-                    super::super::types::MemberStatus::Idle
-                } else {
-                    super::super::types::MemberStatus::Shutdown
-                };
-            }
-        }
+        super::super::types::validate_members(&members).map_err(|error| format!("validate {}: {error}", config_path.display()))?;
         let tasks_path = directory.join("tasks.json");
-        let tasks: Vec<super::super::types::TeamTask> = match std::fs::read_to_string(&tasks_path) {
+        let mut tasks: Vec<super::super::types::TeamTask> = match std::fs::read_to_string(&tasks_path) {
             Ok(text) => serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", tasks_path.display()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(format!("read {}: {error}", tasks_path.display())),
         };
         super::super::tasks::validate_task_graph(&tasks).map_err(|error| format!("validate {}: {error}", tasks_path.display()))?;
-        let next_id = tasks.iter().map(|task| task.id).max().unwrap_or(0) + 1;
         std::fs::create_dir_all(directory.join("inboxes")).map_err(|error| format!("create team inboxes: {error}"))?;
         let workdir = self.session_workdir(session_id)?;
+
+        // pending verdict 是 config + inbox 的 durable intent。先按稳定 ID 补投，再 finalize config；
+        // 任一阶段崩溃后重复 restore 都不会生成第二条 verdict。
+        for member in &mut members {
+            if let Some(verdict) = member.pending_verdict.clone() {
+                let text = if verdict.approved {
+                    format!("{} Plan approved. Proceed with implementation.", super::super::member_wake::PLAN_VERDICT_APPROVED)
+                } else {
+                    format!(
+                        "{} Plan rejected. Revise and resubmit. Feedback: {}",
+                        super::super::member_wake::PLAN_VERDICT_REJECTED,
+                        verdict.feedback
+                    )
+                };
+                super::super::inbox::append_inbox_with_id(&directory, &member.name, "lead", &text, &verdict.delivery_id)?;
+                member.approved = verdict.approved;
+                member.applied_verdict_id = Some(verdict.delivery_id);
+                member.pending_verdict = None;
+            }
+            if matches!(
+                member.status,
+                super::super::types::MemberStatus::Working
+                    | super::super::types::MemberStatus::Idle
+                    | super::super::types::MemberStatus::AwaitingPlanApproval
+            ) {
+                member.status = super::super::types::MemberStatus::Blocked;
+            }
+        }
+        for task in &mut tasks {
+            if matches!(task.status, super::super::types::TeamTaskStatus::InProgress | super::super::types::TeamTaskStatus::Completing) {
+                task.status = super::super::types::TeamTaskStatus::Blocked;
+            }
+        }
+        let config = serde_json::json!({ "session_id": session_id, "members": &members });
+        super::super::storage::write_json_atomic(&config_path, &config).map_err(|error| error.into_message())?;
+        super::super::storage::write_json_atomic(&tasks_path, &tasks).map_err(|error| error.into_message())?;
+        let next_id = tasks.iter().map(|task| task.id).max().unwrap_or(0).saturating_add(1);
         let state = Arc::new(TeamState {
             session_id: session_id.to_string(),
             dir: directory,
@@ -118,111 +170,15 @@ impl TeamManager {
             loops_idle: tokio::sync::Notify::new(),
             tasks: std::sync::Mutex::new(tasks),
             next_task_id: std::sync::atomic::AtomicU64::new(next_id),
+            blocked: std::sync::Mutex::new(None),
             deps: self.deps.clone(),
             bus: self.bus.clone(),
         });
-        for member in restart {
-            Self::start_member_loop(&state, member.name, member.role, member.prompt, member.model, member.approved);
-        }
         lock(&self.sessions).insert(state.session_id.clone(), state);
         Ok(true)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn manager(root: &std::path::Path) -> Arc<TeamManager> {
-        TeamManager::new(
-            root.to_path_buf(),
-            crate::agent::team::types::test_deps(),
-            crate::core::event::EventBus::default(),
-            root.join("sessions"),
-            None,
-        )
-    }
-
-    #[test]
-    fn restore_session_surfaces_corrupt_team_state() {
-        let root = std::env::temp_dir().join(format!("kxen-team-restore-corrupt-{}", uuid::Uuid::new_v4()));
-        let directory = root.join("ses_one");
-        crate::agent::team::types::seed_test_session(&root.join("sessions"), "ses_one", std::path::Path::new("/tmp"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("config.json"), "{broken").unwrap();
-        let manager = manager(&root);
-
-        assert!(manager.state_for("ses_one").err().expect("blocked restore").contains("recovery blocked"));
-        let error = manager.restore_session("ses_one").unwrap_err();
-        assert!(error.contains("parse"));
-        assert_eq!(std::fs::read_to_string(directory.join("config.json")).unwrap(), "{broken");
-        std::fs::write(directory.join("config.json"), r#"{"members":[]}"#).unwrap();
-        manager.restore_session("ses_one").unwrap();
-        assert!(manager.state_for("ses_one").is_ok(), "显式修复并恢复后才解除 blocked");
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn corrupt_tasks_block_empty_state_creation() {
-        let root = std::env::temp_dir().join(format!("kxen-team-restore-tasks-corrupt-{}", uuid::Uuid::new_v4()));
-        let directory = root.join("ses_one");
-        crate::agent::team::types::seed_test_session(&root.join("sessions"), "ses_one", std::path::Path::new("/tmp"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("config.json"), r#"{"members":[]}"#).unwrap();
-        std::fs::write(directory.join("tasks.json"), "[broken").unwrap();
-        let manager = manager(&root);
-
-        assert!(manager.state_for("ses_one").err().expect("blocked restore").contains("recovery blocked"));
-        assert_eq!(std::fs::read_to_string(directory.join("tasks.json")).unwrap(), "[broken");
-        assert!(!lock(&manager.sessions).contains_key("ses_one"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn cyclic_task_graph_blocks_restore_without_mutation() {
-        let root = std::env::temp_dir().join(format!("kxen-team-restore-cycle-{}", uuid::Uuid::new_v4()));
-        let directory = root.join("ses_one");
-        crate::agent::team::types::seed_test_session(&root.join("sessions"), "ses_one", std::path::Path::new("/tmp"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("config.json"), r#"{"members":[]}"#).unwrap();
-        let cyclic =
-            r#"[{"id":1,"title":"a","status":"pending","depends_on":[2]},{"id":2,"title":"b","status":"pending","depends_on":[1]}]"#;
-        std::fs::write(directory.join("tasks.json"), cyclic).unwrap();
-        let manager = manager(&root);
-
-        let error = manager.restore_session("ses_one").unwrap_err();
-        assert!(error.contains("cycle"));
-        assert_eq!(std::fs::read_to_string(directory.join("tasks.json")).unwrap(), cyclic);
-        assert!(!lock(&manager.sessions).contains_key("ses_one"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn missing_session_metadata_blocks_team_restart() {
-        let root = std::env::temp_dir().join(format!("kxen-team-restore-meta-missing-{}", uuid::Uuid::new_v4()));
-        let directory = root.join("ses_one");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("config.json"), r#"{"members":[]}"#).unwrap();
-        let manager = manager(&root);
-
-        assert!(manager.session_workdir("ses_one").unwrap_err().contains("load session"));
-        assert!(manager.state_for("ses_one").err().expect("blocked restore").contains("recovery blocked"));
-        assert!(!lock(&manager.sessions).contains_key("ses_one"));
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn tasks_only_team_directory_is_restored() {
-        let root = std::env::temp_dir().join(format!("kxen-team-restore-tasks-{}", uuid::Uuid::new_v4()));
-        let directory = root.join("ses_one");
-        crate::agent::team::types::seed_test_session(&root.join("sessions"), "ses_one", std::path::Path::new("/tmp"));
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(directory.join("tasks.json"), r#"[{"id":1,"title":"kept","status":"pending","assignee":null,"depends_on":[]}]"#)
-            .unwrap();
-        let manager = manager(&root);
-
-        let state = lock(&manager.sessions).get("ses_one").cloned().expect("tasks-only directory must restore");
-        assert_eq!(lock(&state.tasks).len(), 1);
-        std::fs::remove_dir_all(root).ok();
-    }
-}
+#[path = "restore/tests.rs"]
+mod tests;

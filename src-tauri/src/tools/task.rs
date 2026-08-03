@@ -3,9 +3,10 @@
 use crate::core::shared::{SharedStr, lock, now_ms};
 use crate::tools::shell::ShellKind;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::process::Child;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -26,8 +27,29 @@ pub struct RestartMeta {
     pub timeout_ms: Option<u64>,
 }
 
+/// 后台任务所有权。session 与规范化 Workspace 必须同时一致，防止全局注册表
+/// 把另一会话或同会话另一 worktree 的命令、输出和进程控制权暴露给当前调用方。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOwner {
+    session_id: SharedStr,
+    workspace: PathBuf,
+}
+
+impl TaskOwner {
+    pub fn new(session_id: &str, workspace: impl AsRef<Path>) -> Result<Self, String> {
+        if session_id.is_empty() {
+            return Err("task operation requires a session_id".into());
+        }
+        let workspace = crate::tools::path_policy::canonicalize_lenient(workspace.as_ref())?;
+        Ok(Self { session_id: SharedStr::from(session_id), workspace })
+    }
+}
+
 pub struct TaskHandle {
     pub id: String,
+    pub owner: TaskOwner,
+    /// 注册表内每次成功启动都会分配更大的 generation；异步 watcher 必须携带它做 CAS。
+    pub generation: u64,
     pub command: SharedStr,
     pub workdir: SharedStr,
     pub output: Arc<Mutex<String>>,
@@ -57,9 +79,25 @@ pub struct TaskInfo {
     pub tail: String,
 }
 
-#[derive(Default)]
 pub struct TaskRegistry {
     tasks: Mutex<HashMap<String, Arc<TaskHandle>>>,
+    /// Session 删除先关闭 admission，再终止并摘除全部 owned process。
+    /// 标记保留到进程结束；删除回滚或 recovery import 会显式 reopen。
+    closed_sessions: Mutex<HashSet<String>>,
+    next_generation: AtomicU64,
+    /// restart/kill/watchdog 按 task id 串行。Weak 避免已淘汰 id 在锁表永久驻留。
+    operation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self {
+            tasks: Mutex::new(HashMap::new()),
+            closed_sessions: Mutex::new(HashSet::new()),
+            next_generation: AtomicU64::new(0),
+            operation_locks: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// 注册表容量上限：任务终结后不淘汰会只增不删（输出缓冲一起常驻）。
@@ -85,10 +123,15 @@ impl TaskRegistry {
         Self::default()
     }
 
-    pub fn register(&self, handle: Arc<TaskHandle>) {
-        let mut tasks = lock(&self.tasks);
-        // restart 原位替换（同 id）不占新额度，先豁免再淘汰
-        if tasks.len() >= MAX_TASKS && !tasks.contains_key(&handle.id) {
+    pub(crate) fn allocate_generation(&self) -> Result<u64, String> {
+        self.next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .map(|previous| previous + 1)
+            .map_err(|_| "task generation exhausted".to_string())
+    }
+
+    fn evict_finished_for_new_task(tasks: &mut HashMap<String, Arc<TaskHandle>>) {
+        if tasks.len() >= MAX_TASKS {
             let mut finished: Vec<(u64, String)> =
                 tasks.values().filter(|t| lock(&t.exit_code).is_some()).map(|t| (t.started_at, t.id.clone())).collect();
             finished.sort_unstable();
@@ -96,17 +139,47 @@ impl TaskRegistry {
                 tasks.remove(&id);
             }
         }
+    }
+
+    /// 新 id 注册。相同 id 已存在时拒绝，避免意外覆盖仍由 watcher 管理的进程。
+    pub(crate) fn register_new(&self, handle: Arc<TaskHandle>) -> bool {
+        let closed = lock(&self.closed_sessions);
+        if closed.contains(handle.owner.session_id.as_ref()) {
+            return false;
+        }
+        let mut tasks = lock(&self.tasks);
+        if tasks.contains_key(&handle.id) {
+            return false;
+        }
+        Self::evict_finished_for_new_task(&mut tasks);
         tasks.insert(handle.id.clone(), handle);
+        true
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<TaskHandle>> {
-        lock(&self.tasks).get(id).cloned()
+    /// restart 的原位 CAS：只有旧 generation 仍是当前值时才能发布新 handle。
+    pub(crate) fn replace_current(&self, expected_generation: u64, handle: Arc<TaskHandle>) -> bool {
+        let closed = lock(&self.closed_sessions);
+        if closed.contains(handle.owner.session_id.as_ref()) {
+            return false;
+        }
+        let mut tasks = lock(&self.tasks);
+        let Some(current) = tasks.get(&handle.id) else { return false };
+        if current.generation != expected_generation || current.owner != handle.owner {
+            return false;
+        }
+        tasks.insert(handle.id.clone(), handle);
+        true
     }
 
-    pub fn list(&self) -> Vec<TaskInfo> {
+    pub fn get(&self, owner: &TaskOwner, id: &str) -> Option<Arc<TaskHandle>> {
+        lock(&self.tasks).get(id).filter(|task| task.owner == *owner).cloned()
+    }
+
+    pub fn list(&self, owner: &TaskOwner) -> Vec<TaskInfo> {
         let now = now_ms();
         lock(&self.tasks)
             .values()
+            .filter(|task| task.owner == *owner)
             .map(|t| TaskInfo {
                 id: t.id.clone(),
                 command: t.command.clone(),
@@ -118,16 +191,67 @@ impl TaskRegistry {
             .collect()
     }
 
-    pub fn output(&self, id: &str) -> Option<(String, bool, TaskStatus)> {
-        let task = self.get(id)?;
+    pub fn output(&self, owner: &TaskOwner, id: &str) -> Option<(String, bool, TaskStatus)> {
+        let task = self.get(owner, id)?;
         let output = lock(&task.output).clone();
         let truncated = *lock(&task.truncated);
         Some((output, truncated, task.status()))
     }
 
-    /// 进程组终止：SIGTERM -> 800ms 宽限 -> SIGKILL 升级（spawn 时 process_group(0) 组长，组覆盖孙进程）。
-    pub async fn kill(&self, id: &str) -> bool {
-        let Some(task) = self.get(id) else { return false };
+    pub(crate) fn operation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = lock(&self.operation_locks);
+        if let Some(existing) = locks.get(id).and_then(Weak::upgrade) {
+            return existing;
+        }
+        locks.retain(|_, entry| entry.strong_count() > 0);
+        let created = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(id.to_string(), Arc::downgrade(&created));
+        created
+    }
+
+    /// 调用方所有权校验与进程终止共用 per-id 串行锁。越权与不存在同形返回 false。
+    pub async fn kill(&self, owner: &TaskOwner, id: &str) -> bool {
+        let serial = self.operation_lock(id);
+        let _guard = serial.lock().await;
+        let Some(task) = self.get(owner, id) else { return false };
+        Self::terminate(task).await;
+        true
+    }
+
+    /// 关闭 Session 的 task admission，原子摘除全部 owned handle，再并发终止 OS process。
+    /// 摘除发生在 await 前，list/restart 不会在删除过程中重新获得控制权。
+    pub async fn terminate_session(&self, session_id: &str) -> usize {
+        let owned = {
+            let mut closed = lock(&self.closed_sessions);
+            closed.insert(session_id.to_string());
+            let mut tasks = lock(&self.tasks);
+            let ids: Vec<String> =
+                tasks.iter().filter(|(_, task)| task.owner.session_id.as_ref() == session_id).map(|(id, _)| id.clone()).collect();
+            ids.into_iter().filter_map(|id| tasks.remove(&id)).collect::<Vec<_>>()
+        };
+        let count = owned.len();
+        futures::future::join_all(owned.into_iter().map(Self::terminate)).await;
+        count
+    }
+
+    /// 仅供删除回滚或 recovery import：进程不会复活，但允许恢复后的 Session 创建新任务。
+    pub fn allow_session(&self, session_id: &str) {
+        lock(&self.closed_sessions).remove(session_id);
+    }
+
+    /// watcher 的 generation CAS。旧 timeout/health watcher 永远不能解析 id 后误杀 replacement。
+    pub(crate) async fn kill_if_current(&self, id: &str, generation: u64) -> bool {
+        let task = {
+            let tasks = lock(&self.tasks);
+            tasks.get(id).filter(|task| task.generation == generation).cloned()
+        };
+        let Some(task) = task else { return false };
+        Self::terminate(task).await;
+        true
+    }
+
+    /// 已完成鉴权/CAS 的具体 handle 终止。只操作捕获的 pid，不再按 id 二次解析。
+    pub(crate) async fn terminate(task: Arc<TaskHandle>) {
         // 只给仍在运行的任务终止：已自行退出的保持 Exited/Failed 原判定，也不发任何信号。
         // stderr 一律丢弃：信号即发即弃没人读 stderr，而 waiter 回收与发信号天然有竞态窗口，
         // 窗口内 kill 必打 "No such process"——检查缩窗、丢弃收尾，两类噪音一起灭
@@ -154,7 +278,6 @@ impl TaskRegistry {
         if let Some(mut child) = taken {
             let _ = child.kill().await;
         }
-        true
     }
 }
 
@@ -166,13 +289,13 @@ pub fn tail_of(output: &str, max: usize) -> String {
 }
 
 pub fn append_capped(output: &Arc<Mutex<String>>, truncated: &Arc<Mutex<bool>>, chunk: &str, cap: usize) {
-    let mut out = lock(&output);
+    let mut out = lock(output);
     out.push_str(chunk);
     if out.len() > cap {
         let cut = out.floor_char_boundary(out.len() - cap / 2);
         // drain 原地截头：每个输出块都过这里，to_string 重分配是白拷一份
         out.drain(..cut);
-        *lock(&truncated) = true;
+        *lock(truncated) = true;
     }
 }
 
@@ -185,137 +308,5 @@ pub fn task_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tail_crops() {
-        assert_eq!(tail_of("abcdef", 3), "def");
-        assert_eq!(tail_of("abc", 10), "abc");
-    }
-
-    #[test]
-    fn health_failed_marks_failed_not_killed() {
-        // 健康检查失连后补 kill：killed 与 health_failed 同置，status 必须报 Failed 而非 Killed
-        let handle = TaskHandle {
-            id: "t".into(),
-            command: SharedStr::from("x"),
-            workdir: SharedStr::from("/tmp"),
-            output: Arc::new(Mutex::new(String::new())),
-            truncated: Arc::new(Mutex::new(false)),
-            started_at: 0,
-            pid: None,
-            exit_code: Arc::new(Mutex::new(Some(143))),
-            child: Arc::new(Mutex::new(None)),
-            port: Arc::new(Mutex::new(None)),
-            killed: AtomicBool::new(true),
-            health_failed: AtomicBool::new(true),
-            restart: Mutex::new(None),
-        };
-        assert_eq!(handle.status(), TaskStatus::Failed);
-    }
-
-    #[test]
-    fn append_caps() {
-        let out = Arc::new(Mutex::new(String::new()));
-        let trunc = Arc::new(Mutex::new(false));
-        append_capped(&out, &trunc, &"x".repeat(100), 60);
-        assert!(lock(&out).len() <= 60);
-        assert!(*lock(&trunc));
-    }
-
-    #[tokio::test]
-    async fn killed_task_reports_killed_not_failed() {
-        let registry = Arc::new(TaskRegistry::new());
-        let id = task_id();
-        crate::tools::exec::spawn_task(&id, vec!["sleep".into(), "30".into()], "sleep 30", "/tmp", &registry, None).await.expect("spawn");
-        assert!(registry.kill(&id).await);
-        let task = registry.get(&id).expect("task");
-        for _ in 0..100 {
-            if task.status() != TaskStatus::Running {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(task.status(), TaskStatus::Killed, "被 kill 的任务不得误报 Failed");
-    }
-
-    #[tokio::test]
-    async fn self_exit_failure_stays_failed() {
-        let registry = Arc::new(TaskRegistry::new());
-        let id = task_id();
-        crate::tools::exec::spawn_task(&id, vec!["false".into()], "false", "/tmp", &registry, None).await.expect("spawn");
-        let task = registry.get(&id).expect("task");
-        for _ in 0..100 {
-            if task.status() != TaskStatus::Running {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(task.status(), TaskStatus::Failed, "自行非零退出保持 Failed，不得误报 Killed");
-    }
-
-    #[tokio::test]
-    async fn kill_on_exited_task_keeps_status_and_skips_signals() {
-        let registry = Arc::new(TaskRegistry::new());
-        let id = task_id();
-        crate::tools::exec::spawn_task(&id, vec!["true".into()], "true", "/tmp", &registry, None).await.expect("spawn");
-        let task = registry.get(&id).expect("task");
-        for _ in 0..100 {
-            if task.status() != TaskStatus::Running {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(task.status(), TaskStatus::Exited);
-        // 已退出的任务再 kill：killed 标记不打、信号不发（对死进程 kill 只打 No such process 噪音），原判定不动
-        assert!(registry.kill(&id).await);
-        assert_eq!(task.status(), TaskStatus::Exited, "已退出任务 kill 后不得变 Killed");
-        assert!(!task.killed.load(Ordering::Relaxed));
-    }
-
-    fn finished_handle(id: &str, started_at: u64) -> Arc<TaskHandle> {
-        handle_with_exit(id, started_at, Some(0))
-    }
-
-    fn handle_with_exit(id: &str, started_at: u64, exit: Option<i32>) -> Arc<TaskHandle> {
-        Arc::new(TaskHandle {
-            id: id.into(),
-            command: SharedStr::from("x"),
-            workdir: SharedStr::from("/tmp"),
-            output: Arc::new(Mutex::new("output".repeat(100))),
-            truncated: Arc::new(Mutex::new(false)),
-            started_at,
-            pid: None,
-            exit_code: Arc::new(Mutex::new(exit)),
-            child: Arc::new(Mutex::new(None)),
-            port: Arc::new(Mutex::new(None)),
-            killed: AtomicBool::new(false),
-            health_failed: AtomicBool::new(false),
-            restart: Mutex::new(None),
-        })
-    }
-
-    #[test]
-    fn registry_evicts_oldest_finished_beyond_cap() {
-        // 任务终结后不淘汰会只增不删：超限必须淘汰最旧的已终结任务（输出缓冲随条目回收）
-        let registry = TaskRegistry::new();
-        for i in 0..MAX_TASKS {
-            registry.register(finished_handle(&format!("t{i}"), i as u64));
-        }
-        registry.register(finished_handle("new", 9999));
-        assert!(registry.get("t0").is_none(), "最旧的已终结任务被淘汰");
-        assert!(registry.get("new").is_some());
-        assert!(registry.list().len() <= MAX_TASKS);
-    }
-
-    #[test]
-    fn running_tasks_are_never_evicted() {
-        // 全部运行中时允许超额：运行中任务绝不因容量被淘汰
-        let registry = TaskRegistry::new();
-        for i in 0..MAX_TASKS + 1 {
-            registry.register(handle_with_exit(&format!("r{i}"), i as u64, None));
-        }
-        assert!(registry.get("r0").is_some());
-    }
-}
+#[path = "task/tests.rs"]
+mod tests;

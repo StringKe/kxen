@@ -5,7 +5,7 @@ mod common;
 use common::oauth_mock::{ENV_LOCK, RefreshOutcome, http_client, start_mock};
 use kxen_app::mcp::Guard;
 use kxen_app::mcp::McpManager;
-use kxen_app::mcp::config::{OAuthConfig, RemoteConfig, RemoteKind, ServerConfig};
+use kxen_app::mcp::config::{ConfigScope, OAuthConfig, RemoteConfig, RemoteKind, ServerConfig};
 use kxen_app::mcp::oauth::{self, AuthServerMeta};
 use kxen_app::mcp::oauth_flow::{self, TokenGrant};
 use kxen_app::mcp::oauth_store::{StoredToken, TokenStore};
@@ -37,6 +37,7 @@ async fn dcr_skipped_when_client_id_configured() {
         transport: RemoteKind::Http,
         headers: HashMap::new(),
         oauth: Some(OAuthConfig { client_id: Some("cfg-client".into()), ..Default::default() }),
+        scope: ConfigScope::Personal,
     };
     let session = oauth_flow::prepare_login(&with_id, Guard::Bypassed).await.unwrap();
     assert!(session.authorize_url.contains("client_id=cfg-client"), "配置 clientId 直接用: {}", session.authorize_url);
@@ -57,11 +58,11 @@ async fn dcr_skipped_when_client_id_configured() {
 fn pkce_s256_state_and_callback_id() {
     use base64::Engine;
     use sha2::Digest;
-    let pkce = oauth::pkce();
+    let pkce = oauth::pkce().unwrap();
     assert_eq!(pkce.verifier.len(), 43, "32 字节 base64url 必为 43 字符");
     let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(pkce.verifier.as_bytes()));
     assert_eq!(pkce.challenge, expect, "challenge 必须是 verifier 的 S256");
-    assert_eq!(oauth::random_state().len(), 22, "16 字节 base64url 必为 22 字符");
+    assert_eq!(oauth::random_state().unwrap().len(), 22, "16 字节 base64url 必为 22 字符");
     assert_eq!(oauth::callback_id("https://x.example/mcp").len(), 12, "9 字节 base64url 必为 12 字符");
     let meta = AuthServerMeta {
         authorization_endpoint: "https://as.example/authorize".into(),
@@ -75,9 +76,9 @@ fn pkce_s256_state_and_callback_id() {
     assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcallback%2Fab"), "redirect_uri 必须编码: {url}");
 }
 
-#[test]
-fn token_store_roundtrip_0600() {
-    let dir = std::env::temp_dir().join(format!("kxen-oauth-store-{}", std::process::id()));
+#[tokio::test]
+async fn token_store_roundtrip_0600() {
+    let dir = std::env::temp_dir().join(format!("kxen-oauth-store-{}", uuid::Uuid::new_v4()));
     let path = dir.join("mcp-oauth.json");
     let store = TokenStore::new(path.clone());
     let token = StoredToken {
@@ -88,8 +89,8 @@ fn token_store_roundtrip_0600() {
         client_secret: None,
         token_endpoint: "https://as.example/token".into(),
     };
-    store.save_token("web", &token).unwrap();
-    let loaded = store.load("web").expect("落盘必须能读回");
+    store.save_token("web", &ConfigScope::Personal, "https://api.example/mcp", &token).await.unwrap();
+    let loaded = store.load("web", &ConfigScope::Personal, "https://api.example/mcp").unwrap().expect("落盘必须能读回");
     assert_eq!(loaded.access_token, "at");
     assert_eq!(loaded.refresh_token.as_deref(), Some("rt"));
     assert_eq!(loaded.expires_at, Some(1_900_000_000));
@@ -102,6 +103,54 @@ fn token_store_roundtrip_0600() {
         assert_eq!(mode, 0o600, "token 库必须 0600: {mode:o}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn token_store_distinguishes_missing_from_corrupt_and_preserves_corrupt_file() {
+    let dir = std::env::temp_dir().join(format!("kxen-oauth-corrupt-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("mcp-oauth.json");
+    let store = TokenStore::new(path.clone());
+    assert_eq!(store.load("web", &ConfigScope::Personal, "https://api.example/mcp").unwrap(), None, "缺失 store 表示尚未授权");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&path, b"{not-json").unwrap();
+    let original = std::fs::read(&path).unwrap();
+    let err = store.load("web", &ConfigScope::Personal, "https://api.example/mcp").unwrap_err();
+    assert!(err.contains("解析 OAuth token store"), "损坏必须显式报错: {err}");
+    let err = store.save_token("web", &ConfigScope::Personal, "https://api.example/mcp", &stored_token("new")).await.unwrap_err();
+    assert!(err.contains("解析 OAuth token store"), "损坏时禁止按空表覆盖: {err}");
+    assert_eq!(std::fs::read(&path).unwrap(), original, "损坏原件必须原样保留");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn concurrent_token_updates_on_same_path_do_not_lose_servers() {
+    let dir = std::env::temp_dir().join(format!("kxen-oauth-concurrent-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("mcp-oauth.json");
+    let first = TokenStore::new(path.clone());
+    let second = TokenStore::new(path.clone());
+    let alpha = stored_token("a");
+    let beta = stored_token("b");
+    let (a, b) = tokio::join!(
+        first.save_token("alpha", &ConfigScope::Personal, "https://api.example/mcp", &alpha),
+        second.save_token("beta", &ConfigScope::Personal, "https://api.example/mcp", &beta)
+    );
+    a.unwrap();
+    b.unwrap();
+    let store = TokenStore::new(path.clone());
+    assert_eq!(store.load("alpha", &ConfigScope::Personal, "https://api.example/mcp").unwrap().unwrap().access_token, "a");
+    assert_eq!(store.load("beta", &ConfigScope::Personal, "https://api.example/mcp").unwrap().unwrap().access_token, "b");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn stored_token(access_token: &str) -> StoredToken {
+    StoredToken {
+        access_token: access_token.into(),
+        refresh_token: Some(format!("{access_token}-rt")),
+        expires_at: Some(1_900_000_000),
+        client_id: "cid".into(),
+        client_secret: None,
+        token_endpoint: "https://as.example/token".into(),
+    }
 }
 
 #[tokio::test]
@@ -147,10 +196,13 @@ async fn http_401_refresh_retry_then_needs_auth() {
     unsafe { std::env::set_var("KXEN_MCP_OAUTH_STORE", &store_path) };
     let mock = start_mock(true);
     let endpoint = format!("{}/token-8414", mock.origin);
+    let resource_url = format!("{}/mcp", mock.origin);
     let store = TokenStore::new(store_path.clone());
     store
         .save_token(
             "web",
+            &ConfigScope::Personal,
+            &resource_url,
             &StoredToken {
                 access_token: "stale-1".into(),
                 refresh_token: Some("rt1".into()),
@@ -160,6 +212,7 @@ async fn http_401_refresh_retry_then_needs_auth() {
                 token_endpoint: endpoint,
             },
         )
+        .await
         .unwrap();
     {
         let mut s = mock.state.lock().unwrap();
@@ -168,16 +221,17 @@ async fn http_401_refresh_retry_then_needs_auth() {
     }
     let cfg = ServerConfig::Remote(RemoteConfig {
         name: "web".into(),
-        url: format!("{}/mcp", mock.origin),
+        url: resource_url.clone(),
         transport: RemoteKind::Http,
         headers: HashMap::new(),
         oauth: None,
+        scope: ConfigScope::Personal,
     });
     let mgr = McpManager::new();
     mgr.start_bypassing_guard_for_test(vec![cfg]).await;
     let status = mgr.status();
     assert_eq!(status[0].status, "running", "refresh 成功后重试必须建连: {status:?}");
-    let saved = store.load("web").unwrap();
+    let saved = store.load("web", &ConfigScope::Personal, &resource_url).unwrap().unwrap();
     assert_eq!(saved.access_token, "good-2", "refresh 结果必须落盘");
     assert_eq!(saved.refresh_token.as_deref(), Some("rt2"), "新 refresh_token 必须替换旧的");
     assert_eq!(mock.state.lock().unwrap().token_forms.len(), 1, "只 refresh 一次");

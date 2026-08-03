@@ -12,13 +12,13 @@ pub(super) async fn handle(method: &str, params: &Value, app: &AppHandle) -> Res
     match method {
         "mcp.status" => {
             let state = app.state::<Arc<AppState>>();
-            let runtime = state.active_runtime()?;
+            let runtime = state.ready_active_runtime().await?;
             Ok(serde_json::to_value(runtime.mcp().status()).map_err(|e| e.to_string())?)
         }
         "mcp.restart" => {
             let name = params.get("name").and_then(Value::as_str).ok_or("missing name")?;
             let state = app.state::<Arc<AppState>>();
-            state.active_runtime()?.mcp().restart(name).await?;
+            state.ready_active_runtime().await?.mcp().restart(name).await?;
             Ok(json!({ "restarted": true }))
         }
         "mcp.auth" => mcp_auth(params, app).await,
@@ -31,7 +31,7 @@ pub(super) async fn handle(method: &str, params: &Value, app: &AppHandle) -> Res
 async fn mcp_auth(params: &Value, app: &AppHandle) -> Result<Value, String> {
     let name = params.get("name").and_then(Value::as_str).ok_or("missing name")?;
     let state = app.state::<Arc<AppState>>();
-    let mcp = state.active_runtime()?.mcp();
+    let mcp = state.ready_active_runtime().await?.mcp();
     let session = mcp.begin_auth(name).await?;
     mcp.set_auth_error(name, None); // 新一次发起：清掉上一轮的失败原因
     let url = session.authorize_url.clone();

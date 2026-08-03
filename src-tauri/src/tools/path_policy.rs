@@ -58,33 +58,43 @@ impl ResolvedPath {
         self.authority.read_dir(&self.relative)
     }
 
-    pub fn read_to_string(&self) -> std::io::Result<String> {
-        let mut file = self.authority.open(&self.relative)?;
-        let mut text = String::new();
-        file.read_to_string(&mut text)?;
-        Ok(text)
-    }
-
-    pub fn read_optional(&self) -> std::io::Result<Option<String>> {
-        match self.read_to_string() {
-            Ok(text) => Ok(Some(text)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+    pub fn read_optional_capped(&self, max_bytes: usize) -> std::io::Result<Option<String>> {
+        let mut file = match self.authority.open(&self.relative) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let size = file.metadata()?.len();
+        if size > max_bytes as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("file exceeds {max_bytes} byte snapshot cap")));
         }
+        let mut bytes = Vec::with_capacity(size as usize);
+        std::io::Read::by_ref(&mut file).take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("file exceeds {max_bytes} byte snapshot cap")));
+        }
+        String::from_utf8(bytes).map(Some).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     /// 同一 capability 内写临时文件再 rename，目录句柄把所有路径解析限制在已授权 root。
     pub fn write_atomic(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let parent = self.relative.parent().unwrap_or_else(|| Path::new(""));
+        let parent = self.relative.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         self.authority.create_dir_all(parent)?;
         let parent_dir = self.authority.open_dir(parent)?;
         let file_name =
             self.relative.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no file name"))?;
+        let existing_permissions = parent_dir.metadata(file_name).ok().map(|metadata| metadata.permissions());
         let temporary = format!(".kxen-write-{}.tmp", uuid::Uuid::new_v4());
         let mut options = cap_std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         let mut file = parent_dir.open_with(&temporary, &options)?;
         if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            parent_dir.remove_file(&temporary).ok();
+            return Err(error);
+        }
+        if let Some(permissions) = existing_permissions
+            && let Err(error) = file.set_permissions(permissions)
+        {
             parent_dir.remove_file(&temporary).ok();
             return Err(error);
         }

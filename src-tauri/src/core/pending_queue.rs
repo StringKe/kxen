@@ -6,32 +6,79 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
+#[path = "pending_queue/enqueue.rs"]
+mod enqueue;
+#[path = "pending_queue/recovery.rs"]
+mod recovery;
+#[path = "pending_queue/restore.rs"]
+mod restore;
+#[path = "pending_queue/storage.rs"]
+mod storage;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueuedMessage {
     #[serde(default = "new_delivery_id")]
     pub id: String,
+    /// Queue delivery 变成 Session user message 时沿用该时间，保证 append 后、ack 前崩溃重放
+    /// 仍与已提交 JSONL 完全一致，不因重建时间变化形成永久 ID collision。
+    #[serde(default = "new_delivery_created_at")]
+    pub created_at: u64,
     pub text: String,
     #[serde(default)]
     pub context: Vec<crate::agent::context::ContextItem>,
     #[serde(default)]
     pub images: Vec<crate::llm::types::ImagePart>,
+    /// 仅内部 schedule dispatcher 写入；不能从用户文本推断来源。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_job_id: Option<String>,
 }
 
 fn new_delivery_id() -> String {
     crate::core::ids::new_id("queue")
 }
 
+fn new_delivery_created_at() -> u64 {
+    crate::core::shared::now_ms()
+}
+
 pub struct PendingQueues {
     dir: PathBuf,
     map: std::sync::Mutex<HashMap<String, SessionQueue>>,
+    blocked: std::sync::Mutex<HashMap<String, BlockedQueue>>,
+    load_error: std::sync::Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionQueue {
     #[serde(default)]
     queued: VecDeque<QueuedMessage>,
     #[serde(default)]
     in_flight: Option<QueuedMessage>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockedQueue {
+    message: String,
+    expected: Option<SessionQueue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum QueueIntegrity {
+    Missing,
+    Healthy { deliveries: usize },
+    Corrupt { error: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueRecoveryReport {
+    pub session_id: String,
+    pub blocked: Option<String>,
+    pub integrity: QueueIntegrity,
+    pub repairable: bool,
+    pub cleared: bool,
 }
 
 #[derive(Deserialize)]
@@ -48,77 +95,57 @@ pub fn file_path(dir: &Path, id: &str) -> PathBuf {
 
 impl PendingQueues {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, map: std::sync::Mutex::new(HashMap::new()) }
+        Self {
+            dir,
+            map: std::sync::Mutex::new(HashMap::new()),
+            blocked: std::sync::Mutex::new(HashMap::new()),
+            load_error: std::sync::Mutex::new(None),
+        }
     }
 
-    /// 调用方持 map 锁时把同一状态整写到盘，保证并发修改的磁盘顺序与内存顺序一致。
-    /// 空队列删文件；所有错误返回调用方，不能把未落盘的消息报告成已排队。
-    fn persist_state(&self, id: &str, snapshot: &SessionQueue) -> Result<(), String> {
-        let path = file_path(&self.dir, id);
-        if snapshot.queued.is_empty() && snapshot.in_flight.is_none() {
-            return match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!("remove pending queue {}: {error}", path.display())),
-            };
+    fn ensure_available(&self, id: &str) -> Result<(), String> {
+        if let Some(error) = crate::core::shared::lock(&self.load_error).clone() {
+            return Err(format!("pending queue store unavailable: {error}"));
         }
-        let tmp = path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(snapshot).map_err(|error| error.to_string())?;
-        std::fs::create_dir_all(&self.dir).map_err(|error| format!("create pending queue directory: {error}"))?;
-        std::fs::write(&tmp, text).map_err(|error| format!("write pending queue {}: {error}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|error| format!("commit pending queue {}: {error}", path.display()))
+        if let Some(error) = crate::core::shared::lock(&self.blocked).get(id).cloned() {
+            return Err(format!("pending queue {id} is blocked: {}", error.message));
+        }
+        Ok(())
     }
 
-    /// 入队并落盘，返回该 session 排队总数（通知文案用）。id 不合法直接拒（防路径穿越）。
-    pub fn enqueue(
-        &self,
-        id: &str,
-        text: String,
-        context: Vec<crate::agent::context::ContextItem>,
-        images: Vec<crate::llm::types::ImagePart>,
-    ) -> Result<usize, String> {
-        self.enqueue_existing(id, QueuedMessage { id: new_delivery_id(), text, context, images })
-    }
-
-    /// Session recovery 保留原 delivery ID，避免已写入用户消息的 in-flight 项恢复后换 ID 并重复追加。
-    pub fn enqueue_existing(&self, id: &str, item: QueuedMessage) -> Result<usize, String> {
-        crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
-        if item.id.trim().is_empty() {
-            return Err("pending queue delivery id cannot be empty".into());
-        }
-        let mut map = crate::core::shared::lock(&self.map);
-        let queue = map.entry(id.to_string()).or_default();
-        if queue.in_flight.as_ref().is_some_and(|existing| existing.id == item.id)
-            || queue.queued.iter().any(|existing| existing.id == item.id)
-        {
-            return Err(format!("duplicate pending queue delivery id: {}", item.id));
-        }
-        queue.queued.push_back(item);
-        let count = queue.queued.len();
-        if let Err(error) = self.persist_state(id, queue) {
-            queue.queued.pop_back();
-            return Err(error);
-        }
-        Ok(count)
+    fn block_indeterminate(&self, id: &str, error: String, expected: &SessionQueue) -> String {
+        let message = format!("pending queue {id} commit is visible but durability is indeterminate: {error}");
+        crate::core::shared::lock(&self.blocked)
+            .insert(id.to_string(), BlockedQueue { message: message.clone(), expected: Some(expected.clone()) });
+        message
     }
 
     /// claim 队首并持久化为 in_flight。已有 in_flight 时返回同一条，供崩溃恢复重放。
     pub fn claim(&self, id: &str) -> Result<Option<QueuedMessage>, String> {
         crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
+        self.ensure_available(id)?;
         let mut map = crate::core::shared::lock(&self.map);
         let Some(queue) = map.get_mut(id) else { return Ok(None) };
-        if queue.in_flight.is_some() {
-            return Ok(queue.in_flight.clone());
+        if let Some(item) = &queue.in_flight {
+            ensure_schedule_delivery_admitted(item)?;
+            return Ok(Some(item.clone()));
         }
+        if let Some(item) = queue.queued.front() {
+            ensure_schedule_delivery_admitted(item)?;
+        }
+        let original = queue.clone();
         queue.in_flight = queue.queued.pop_front();
         let item = queue.in_flight.clone();
         if item.is_some()
             && let Err(error) = self.persist_state(id, queue)
         {
-            if let Some(item) = queue.in_flight.take() {
-                queue.queued.push_front(item);
+            let committed = error.committed();
+            let message = error.into_message();
+            if !committed {
+                *queue = original;
+                return Err(message);
             }
-            return Err(error);
+            return Err(self.block_indeterminate(id, message, queue));
         }
         Ok(item)
     }
@@ -126,6 +153,7 @@ impl PendingQueues {
     /// delivery 对应的用户消息已幂等落盘后确认消费，只有这里会删除 in_flight。
     pub fn acknowledge(&self, id: &str, delivery_id: &str) -> Result<bool, String> {
         crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
+        self.ensure_available(id)?;
         let mut map = crate::core::shared::lock(&self.map);
         let Some(queue) = map.get_mut(id) else { return Ok(false) };
         if queue.in_flight.as_ref().is_none_or(|item| item.id != delivery_id) {
@@ -133,8 +161,13 @@ impl PendingQueues {
         }
         let item = queue.in_flight.take().expect("matched in-flight delivery");
         if let Err(error) = self.persist_state(id, queue) {
-            queue.in_flight = Some(item);
-            return Err(error);
+            let committed = error.committed();
+            let message = error.into_message();
+            if !committed {
+                queue.in_flight = Some(item);
+                return Err(message);
+            }
+            return Err(self.block_indeterminate(id, message, queue));
         }
         Ok(true)
     }
@@ -142,6 +175,7 @@ impl PendingQueues {
     /// run 被中断时把 in_flight 放回队首，保留 FIFO 顺序。
     pub fn release(&self, id: &str, delivery_id: &str) -> Result<bool, String> {
         crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
+        self.ensure_available(id)?;
         let mut map = crate::core::shared::lock(&self.map);
         let Some(queue) = map.get_mut(id) else { return Ok(false) };
         if queue.in_flight.as_ref().is_none_or(|item| item.id != delivery_id) {
@@ -150,9 +184,14 @@ impl PendingQueues {
         let item = queue.in_flight.take().expect("matched in-flight delivery");
         queue.queued.push_front(item);
         if let Err(error) = self.persist_state(id, queue) {
-            let item = queue.queued.pop_front().expect("released delivery");
-            queue.in_flight = Some(item);
-            return Err(error);
+            let committed = error.committed();
+            let message = error.into_message();
+            if !committed {
+                let item = queue.queued.pop_front().expect("released delivery");
+                queue.in_flight = Some(item);
+                return Err(message);
+            }
+            return Err(self.block_indeterminate(id, message, queue));
         }
         Ok(true)
     }
@@ -160,14 +199,44 @@ impl PendingQueues {
     /// 清空该 session 队列（abort/delete 用），返回清掉条数。
     pub fn clear(&self, id: &str) -> Result<usize, String> {
         crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
+        self.ensure_available(id)?;
         let mut map = crate::core::shared::lock(&self.map);
         let previous = map.remove(id);
         let count = previous.as_ref().map(|queue| queue.queued.len() + usize::from(queue.in_flight.is_some())).unwrap_or(0);
         if let Err(error) = self.persist_state(id, &SessionQueue::default()) {
-            if let Some(previous) = previous {
-                map.insert(id.to_string(), previous);
+            let committed = error.committed();
+            let message = error.into_message();
+            if !committed {
+                if let Some(previous) = previous {
+                    map.insert(id.to_string(), previous);
+                }
+                return Err(message);
             }
-            return Err(error);
+            return Err(self.block_indeterminate(id, message, &SessionQueue::default()));
+        }
+        Ok(count)
+    }
+
+    /// 用户清空“等待中”列表时保留正在消费的 delivery；abort/delete 仍使用 clear 清全部。
+    pub fn clear_queued(&self, id: &str) -> Result<usize, String> {
+        crate::core::ids::validate_id(id).map_err(|error| error.to_string())?;
+        self.ensure_available(id)?;
+        let mut map = crate::core::shared::lock(&self.map);
+        let Some(queue) = map.get_mut(id) else { return Ok(0) };
+        let previous = std::mem::take(&mut queue.queued);
+        let count = previous.len();
+        if let Err(error) = self.persist_state(id, queue) {
+            let committed = error.committed();
+            let message = error.into_message();
+            if !committed {
+                queue.queued = previous;
+                return Err(message);
+            }
+            return Err(self.block_indeterminate(id, message, queue));
+        }
+        let empty = queue.in_flight.is_none();
+        if empty {
+            map.remove(id);
         }
         Ok(count)
     }
@@ -176,53 +245,42 @@ impl PendingQueues {
         crate::core::shared::lock(&self.map).get(id).map(|q| q.queued.iter().map(|m| m.text.clone()).collect()).unwrap_or_default()
     }
 
-    pub fn snapshot(&self, id: &str) -> Vec<QueuedMessage> {
-        crate::core::shared::lock(&self.map)
+    /// 错误恢复使用：即使 store 已因 post-commit 不确定性进入 blocked，也允许调用方确认
+    /// 某个稳定 delivery id 是否已经进入可见内存状态，避免再写其他真源造成重复投递。
+    pub fn contains_delivery(&self, id: &str, delivery_id: &str) -> bool {
+        crate::core::shared::lock(&self.map).get(id).is_some_and(|queue| {
+            queue.in_flight.as_ref().is_some_and(|item| item.id == delivery_id) || queue.queued.iter().any(|item| item.id == delivery_id)
+        })
+    }
+
+    pub fn snapshot(&self, id: &str) -> Result<Vec<QueuedMessage>, String> {
+        self.ensure_available(id)?;
+        Ok(crate::core::shared::lock(&self.map)
             .get(id)
             .map(|q| q.in_flight.iter().chain(q.queued.iter()).cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     pub fn has_queued(&self, id: &str) -> bool {
-        crate::core::shared::lock(&self.map).get(id).is_some_and(|q| q.in_flight.is_some() || !q.queued.is_empty())
+        self.ensure_available(id).is_err()
+            || crate::core::shared::lock(&self.map).get(id).is_some_and(|q| q.in_flight.is_some() || !q.queued.is_empty())
     }
 
     /// 全量非空队列长度快照（workspace 看板聚合：一次锁取出，避免逐 session 加锁）
     pub fn counts(&self) -> HashMap<String, usize> {
-        crate::core::shared::lock(&self.map)
+        let mut counts: HashMap<String, usize> = crate::core::shared::lock(&self.map)
             .iter()
             .filter(|(_, q)| !q.queued.is_empty())
             .map(|(id, q)| (id.clone(), q.queued.len()))
-            .collect()
-    }
-
-    /// 启动恢复：读全部 queue 文件进内存，返回有待跑消息的 session id（调用方据此续跑）。
-    /// 坏文件跳过不删：可能是另一版本写的新格式，留给人工处置比静默丢消息安全。
-    pub fn restore(&self) -> Vec<String> {
-        let mut ready = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return ready;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(id) = name.strip_suffix(".queue.json") else {
-                continue;
-            };
-            if crate::core::ids::validate_id(id).is_err() {
-                continue;
-            }
-            let state = std::fs::read_to_string(entry.path()).ok().and_then(|text| serde_json::from_str::<OnDiskQueue>(&text).ok());
-            let Some(state) = state else { continue };
-            let state = match state {
-                OnDiskQueue::Current(state) => state,
-                OnDiskQueue::Legacy(items) => SessionQueue { queued: items.into(), in_flight: None },
-            };
-            if state.queued.is_empty() && state.in_flight.is_none() {
-                continue;
-            }
-            crate::core::shared::lock(&self.map).insert(id.to_string(), state);
-            ready.push(id.to_string());
+            .collect();
+        for id in crate::core::shared::lock(&self.blocked).keys() {
+            counts.entry(id.clone()).or_insert(1);
         }
-        ready
+        counts
     }
+}
+
+fn ensure_schedule_delivery_admitted(item: &QueuedMessage) -> Result<(), String> {
+    let Some(job_id) = item.schedule_job_id.as_deref() else { return Ok(()) };
+    crate::core::schedule::ensure_delivery_admitted(job_id, &item.id)
 }

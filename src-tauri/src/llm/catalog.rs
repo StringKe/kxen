@@ -4,6 +4,7 @@
 
 use crate::core::session::now_ms;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
@@ -47,10 +48,16 @@ fn cache_file() -> std::path::PathBuf {
 /// 目录读取：内存 -> 磁盘 -> 静态兜底；磁盘过期/缺失时后台刷新（不阻塞调用方）。
 pub fn catalog() -> Vec<ProviderCatalog> {
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Some(c) = crate::core::shared::lock(&cache).as_ref() {
+    if let Some(c) = crate::core::shared::lock(cache).as_ref() {
         return c.clone();
     }
-    let disk = std::fs::read_to_string(cache_file()).ok().and_then(|text| serde_json::from_str::<Vec<ProviderCatalog>>(&text).ok());
+    let disk = match read_disk_cache() {
+        Ok(cache) => cache,
+        Err(error) => {
+            tracing::warn!(%error, "models.dev cache unavailable; using static catalog until refresh");
+            None
+        }
+    };
     let (out, stale) = match disk {
         Some(c) if !c.is_empty() => {
             let stale = now_ms().saturating_sub(c[0].fetched_at) > TTL_MS;
@@ -58,7 +65,7 @@ pub fn catalog() -> Vec<ProviderCatalog> {
         }
         _ => (static_catalog(), true),
     };
-    *crate::core::shared::lock(&cache) = Some(out.clone());
+    *crate::core::shared::lock(cache) = Some(out.clone());
     if stale {
         refresh_async();
     }
@@ -70,7 +77,7 @@ pub fn refresh_async() {
     static REFRESHING: OnceLock<Mutex<bool>> = OnceLock::new();
     let flag = REFRESHING.get_or_init(|| Mutex::new(false));
     {
-        let mut running = crate::core::shared::lock(&flag);
+        let mut running = crate::core::shared::lock(flag);
         if *running {
             return;
         }
@@ -78,7 +85,7 @@ pub fn refresh_async() {
     }
     // 纯同步上下文（如同步单测）没有 reactor：tokio::spawn 会 panic，跳过本次后台刷新
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        *crate::core::shared::lock(&flag) = false;
+        *crate::core::shared::lock(flag) = false;
         return;
     };
     handle.spawn(async move {
@@ -88,24 +95,63 @@ pub fn refresh_async() {
                 .timeout(std::time::Duration::from_secs(20))
                 .send()
                 .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
                 .map_err(|e| e.to_string())?;
-            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let text = crate::net_response::text(resp, crate::net_response::CATALOG_BODY_LIMIT, "models.dev catalog").await?;
             parse_models_dev(&text).ok_or_else(|| "parse failed".to_string())
         }
         .await;
         match result {
             Ok(c) => {
-                if let Ok(json) = serde_json::to_string_pretty(&c) {
-                    let _ = std::fs::write(cache_file(), json);
+                if let Err(error) = write_disk_cache(&c) {
+                    tracing::warn!(%error, "models.dev cache persistence failed; keeping refreshed in-memory catalog");
                 }
                 let cache = CACHE.get_or_init(|| Mutex::new(None));
-                *crate::core::shared::lock(&cache) = Some(c);
+                *crate::core::shared::lock(cache) = Some(c);
                 tracing::info!("models.dev catalog refreshed");
             }
             Err(e) => tracing::warn!(error = %e, "models.dev refresh failed (keep old cache)"),
         }
-        *crate::core::shared::lock(&flag) = false;
+        *crate::core::shared::lock(flag) = false;
     });
+}
+
+fn read_disk_cache() -> Result<Option<Vec<ProviderCatalog>>, String> {
+    let path = cache_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let cache = serde_json::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    Ok(Some(cache))
+}
+
+fn write_disk_cache(catalog: &[ProviderCatalog]) -> Result<(), String> {
+    let path = cache_file();
+    let parent = path.parent().ok_or_else(|| format!("cache path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(catalog).map_err(|error| format!("serialize models.dev cache: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+    file.write_all(&bytes).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, &path).map_err(|error| {
+        std::fs::remove_file(&tmp).ok();
+        format!("replace {}: {error}", path.display())
+    })?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+    Ok(())
 }
 
 /// models.dev api.json 解析：按 registry 的 models_dev 键映射提取（api.json 全量 ~200 provider，只收 registry 覆盖的）。

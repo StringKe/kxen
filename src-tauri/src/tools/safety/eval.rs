@@ -3,6 +3,8 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+mod parse;
+
 use super::rules::{
     ASK_PATTERNS, CRED_CMDS, DELETE_CMDS, DESTROY_CMDS, DISK_PATTERNS, EXEMPT_PREFIXES, GIT_DESTROY, GIT_SEGMENT, MOVE_CMDS, SYSTEM_CMDS,
     SYSTEM_PATHS, VAR_PATTERN, Verdict, deny, home_credential_dot, home_top,
@@ -10,16 +12,11 @@ use super::rules::{
 
 /// 主入口：评估一条 shell 命令文本。cwd 用于相对路径解析。
 pub fn evaluate_shell_command(command: &str, cwd: &str) -> Verdict {
-    let inner = extract_nested(command).map(|i| evaluate_shell_command(i, cwd));
-    if let Some(v @ Verdict::Deny { .. }) = inner {
-        return v;
-    }
-
     let mut recoverable_seen = false;
     let mut ask_seen: Option<Verdict> = None;
     let mut check = |cmd: &str| {
-        for seg in split_segments(cmd) {
-            match eval_segment(seg, cwd) {
+        for tokens in parse::segments(cmd) {
+            match eval_segment(&tokens, cwd) {
                 v @ Verdict::Deny { .. } => return Some(v),
                 v @ Verdict::Ask { .. } => {
                     if ask_seen.is_none() {
@@ -45,23 +42,6 @@ pub fn evaluate_shell_command(command: &str, cwd: &str) -> Verdict {
         return v;
     }
     if recoverable_seen { Verdict::Recoverable } else { Verdict::Allow }
-}
-
-fn extract_nested(command: &str) -> Option<&str> {
-    static NESTED: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-        vec![Regex::new(r#"(?:bash|zsh|sh|fish)\s+-c\s+["']([^"']+)["']"#).unwrap(), Regex::new(r#"\beval\s+["']([^"']+)["']"#).unwrap()]
-    });
-    NESTED.iter().find_map(|re| re.captures(command).and_then(|c| c.get(1)).map(|m| m.as_str()))
-}
-
-fn split_segments(command: &str) -> Vec<&str> {
-    command
-        .split([';', '|', '\n'])
-        .flat_map(|part| part.split("&&"))
-        .flat_map(|part| part.split("||"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect()
 }
 
 /// 命令替换展开：反引号与 $() 内嵌的命令同样要进评估（`rm -rf $(cat f)` 类绕过）。
@@ -97,67 +77,120 @@ fn expand_substitutions(command: &str) -> Vec<String> {
     out
 }
 
-fn eval_segment(seg: &str, cwd: &str) -> Verdict {
-    if DISK_PATTERNS.iter().any(|re| re.is_match(seg)) {
+fn eval_segment(tokens: &[String], cwd: &str) -> Verdict {
+    let seg = tokens.join(" ");
+    let cmd_idx = parse::command_index(tokens);
+    let cmd_token = tokens.get(cmd_idx).map(String::as_str).unwrap_or("");
+    let cmd = parse::command_name(cmd_token);
+
+    if command_is_dynamic(cmd_token) {
+        return deny_permanent(format!("命令位置 {cmd_token} 无法静态解析，可能执行不可恢复删除"));
+    }
+    if cmd == "env" && parse::env_split_requested(tokens, cmd_idx) {
+        return deny_permanent("env -S 会重新拆分命令字符串，无法可靠排除不可恢复删除");
+    }
+    if matches!(cmd, "ash" | "bash" | "dash" | "fish" | "ksh" | "sh" | "zsh") {
+        if let Some(script) = parse::nested_script(tokens, cmd_idx) {
+            if command_is_dynamic(script) {
+                return deny_permanent("嵌套 shell 的脚本来自动态值，无法排除不可恢复删除");
+            }
+            let verdict = evaluate_shell_command(script, cwd);
+            if !matches!(verdict, Verdict::Allow) {
+                return verdict;
+            }
+        } else if !tokens.iter().any(|token| matches!(token.as_str(), "--help" | "--version" | "-n")) {
+            return deny_permanent("嵌套 shell 的输入或脚本无法静态检查，无法排除不可恢复删除");
+        }
+    }
+    if cmd == "eval" {
+        let script = tokens.get(cmd_idx + 1..).unwrap_or_default().join(" ");
+        if script.is_empty() || command_is_dynamic(&script) {
+            return deny_permanent("eval 脚本无法静态解析，无法排除不可恢复删除");
+        }
+        let verdict = evaluate_shell_command(&script, cwd);
+        if !matches!(verdict, Verdict::Allow) {
+            return verdict;
+        }
+    }
+    if matches!(cmd, "source" | ".") {
+        return deny_permanent("source 脚本无法静态检查，无法排除不可恢复删除");
+    }
+    if DELETE_CMDS.contains(&cmd) && cmd != "trash" {
+        return deny_permanent(format!("{cmd} 会执行不可恢复删除"));
+    }
+    if cmd == "find" && tokens.iter().any(|token| token == "-delete") {
+        return deny_permanent("find -delete 会执行不可恢复删除");
+    }
+    if cmd == "find"
+        && let Some(exec_idx) = tokens.iter().position(|token| matches!(token.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+    {
+        let nested = tokens.get(exec_idx + 1..).unwrap_or_default().join(" ");
+        let verdict = evaluate_shell_command(&nested, cwd);
+        if matches!(verdict, Verdict::Recoverable) {
+            for target in tokens.iter().skip(cmd_idx + 1).take_while(|target| !target.starts_with('-')) {
+                if VAR_PATTERN.is_match(target) {
+                    return deny("F5", format!("删除目标含未求值变量 {target}，无法静态判定"), Some("使用 delete tool 并明确目标路径"));
+                }
+                if let Some(blocked) = protected_path_verdict("trash", target, cwd, true) {
+                    return blocked;
+                }
+            }
+        }
+        if !matches!(verdict, Verdict::Allow) {
+            return verdict;
+        }
+    }
+    if cmd == "xargs" {
+        let nested_idx = parse::xargs_command_index(tokens, cmd_idx);
+        if nested_idx < tokens.len() {
+            let verdict = evaluate_shell_command(&tokens[nested_idx..].join(" "), cwd);
+            if !matches!(verdict, Verdict::Allow) {
+                return verdict;
+            }
+        }
+    }
+    if cmd == "rsync" && tokens.iter().any(|token| token == "--delete" || token.starts_with("--delete-")) {
+        return deny_permanent("rsync --delete 会执行不可恢复删除");
+    }
+
+    if DISK_PATTERNS.iter().any(|re| re.is_match(&seg)) {
         return deny("F1", "磁盘级操作（dd/mkfs/erase/fdisk/parted）", None);
     }
-    if SYSTEM_CMDS.iter().any(|re| re.is_match(seg)) {
+    if SYSTEM_CMDS.iter().any(|re| re.is_match(&seg)) {
         return deny("F1", "系统属性或系统级进程操作", None);
     }
-    if CRED_CMDS.iter().any(|re| re.is_match(seg)) {
+    if CRED_CMDS.iter().any(|re| re.is_match(&seg)) {
         return deny("F2", "凭证存储销毁（Keychain / GPG 私钥）", None);
     }
-    if let Some((_, id, why)) = DESTROY_CMDS.iter().find(|(re, _, _)| re.is_match(seg)) {
+    if let Some((_, id, why)) = DESTROY_CMDS.iter().find(|(re, _, _)| re.is_match(&seg)) {
         return deny(id, *why, None);
     }
-    if let Some((_, why)) = GIT_DESTROY.iter().find(|(re, _)| re.is_match(seg)) {
+    if let Some((_, why)) = GIT_DESTROY.iter().find(|(re, _)| re.is_match(&seg)) {
         return deny("F3", *why, Some("删除单个分支用 git branch -d"));
     }
-    let delete_verdict = eval_delete_segment(seg, cwd);
+    let delete_verdict = eval_delete_segment(tokens, &seg, cwd);
     if !matches!(delete_verdict, Verdict::Allow) {
         return delete_verdict;
     }
     // Ask 档最后判定：具体危险（Deny/Recoverable）优先于审批
-    if let Some((_, why)) = ASK_PATTERNS.iter().find(|(re, _)| re.is_match(seg)) {
+    if let Some((_, why)) = ASK_PATTERNS.iter().find(|(re, _)| re.is_match(&seg)) {
         return Verdict::Ask { reason: (*why).into() };
     }
     delete_verdict
 }
 
-fn tokens_of(seg: &str) -> Vec<&str> {
-    seg.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\'')).filter(|t| !t.is_empty()).collect()
+fn command_is_dynamic(command: &str) -> bool {
+    command.starts_with('$') || command.starts_with('`') || VAR_PATTERN.is_match(command)
 }
 
-/// 前导环境变量赋值（X=1 cmd 的 X=1 段）：不算命令本身。
-/// 不跳过则 tokens.first() 拿到赋值，`X=1 rm -rf ~` 整体绕过删除判定。
-fn is_env_assignment(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else { return false };
-    !name.is_empty() && !name.chars().next().unwrap().is_ascii_digit() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+fn deny_permanent(reason: impl Into<std::borrow::Cow<'static, str>>) -> Verdict {
+    deny("F5", reason, Some("使用 delete tool 将目标移入系统废纸篓"))
 }
 
-/// 命令 token 下标：跳过前导 VAR=value 赋值（sudo/doas 后面的赋值同样跳过）。
-fn command_index(tokens: &[&str]) -> usize {
-    let mut i = 0;
-    while i < tokens.len() && is_env_assignment(tokens[i]) {
-        i += 1;
-    }
-    if matches!(tokens.get(i).copied(), Some("sudo") | Some("doas")) {
-        i += 1;
-        while i < tokens.len() && is_env_assignment(tokens[i]) {
-            i += 1;
-        }
-    }
-    i
-}
-
-fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
-    let tokens = tokens_of(seg);
-    let cmd_idx = command_index(&tokens);
-    let cmd = tokens.get(cmd_idx).copied().unwrap_or("");
-
-    let is_delete = DELETE_CMDS.contains(&cmd)
-        || (seg.starts_with("find ") && (seg.contains(" -delete") || seg.contains(" -exec rm") || seg.contains(" -exec trash")))
-        || (seg.starts_with("rsync ") && seg.contains("--delete"));
+fn eval_delete_segment(tokens: &[String], seg: &str, cwd: &str) -> Verdict {
+    let cmd_idx = parse::command_index(tokens);
+    let cmd = tokens.get(cmd_idx).map(|value| parse::command_name(value)).unwrap_or("");
+    let is_delete = cmd == "trash" || (cmd == "find" && seg.contains(" -exec trash"));
     let is_move = MOVE_CMDS.contains(&cmd);
     if !is_delete && !is_move {
         return Verdict::Allow;
@@ -166,7 +199,7 @@ fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
     // trash 命令按可恢复降档（删除进回收站）：只拦 .git 与系统路径
     let recoverable = cmd == "trash";
 
-    let targets: Vec<&str> = tokens.iter().skip(cmd_idx + 1).filter(|t| !t.starts_with('-')).copied().collect();
+    let targets: Vec<&str> = tokens.iter().skip(cmd_idx + 1).filter(|t| !t.starts_with('-')).map(String::as_str).collect();
 
     if targets.is_empty() && is_delete && (seg.contains("-r") || seg.contains("-f")) {
         return deny("F5", "递归/强制删除缺少可静态确定的目标路径", Some("明确写出完整目标路径后再执行"));
@@ -176,20 +209,8 @@ fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
         if VAR_PATTERN.is_match(target) {
             return deny("F5", format!("删除/移动目标含未求值变量 {target}，无法静态判定"), Some("先 echo 展开确认实际路径"));
         }
-        if let Some(hit) = classify_path(target, cwd) {
-            if recoverable && hit.family == Family::Home {
-                continue; // trash 的用户目录删除可恢复，放行
-            }
-            let rule = match hit.family {
-                Family::Git => "F3",
-                Family::Home | Family::Credential => "F2",
-                Family::System => "F1",
-            };
-            return deny(
-                rule,
-                format!("{cmd} 的目标 {target} 命中保护路径 {}", hit.guard),
-                Some("工作区内的具体子路径操作不受限，请缩小范围"),
-            );
+        if let Some(verdict) = protected_path_verdict(cmd, target, cwd, recoverable) {
+            return verdict;
         }
     }
 
@@ -197,6 +218,19 @@ fn eval_delete_segment(seg: &str, cwd: &str) -> Verdict {
         return Verdict::Recoverable;
     }
     Verdict::Allow
+}
+
+fn protected_path_verdict(cmd: &str, target: &str, cwd: &str, recoverable: bool) -> Option<Verdict> {
+    let hit = classify_path(target, cwd)?;
+    if recoverable && hit.family == Family::Home {
+        return None;
+    }
+    let rule = match hit.family {
+        Family::Git => "F3",
+        Family::Home | Family::Credential => "F2",
+        Family::System => "F1",
+    };
+    Some(deny(rule, format!("{cmd} 的目标 {target} 命中保护路径 {}", hit.guard), Some("工作区内的具体子路径操作不受限，请缩小范围")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

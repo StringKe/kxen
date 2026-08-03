@@ -17,6 +17,15 @@ fn usage_accumulates_across_requests() {
 }
 
 #[test]
+fn usage_accumulator_saturates_untrusted_provider_counters() {
+    let mut acc = UsageAcc::default();
+    acc.push(u64::MAX, u64::MAX);
+    acc.push(1, 1);
+    assert_eq!(acc.total(), (u64::MAX, u64::MAX));
+    assert_eq!(acc.goal_delta(), u64::MAX);
+}
+
+#[test]
 fn goal_delta_charges_each_turn_exactly_once() {
     let mut acc = UsageAcc::default();
     acc.push(100, 20);

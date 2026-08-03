@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 use super::events::AgentEvent;
 
+pub type PersistCompaction = Arc<dyn Fn(&str, &[crate::llm::Message]) -> Result<(), String> + Send + Sync>;
+pub use super::usage::UsageReporter;
+
 /// 会话级共享态：tool_search 挂载的 deferred 工具 + todo 清单。
 /// 按 session 隔离（SessionExtrasRegistry 惰性创建），同 session 的 lead/teammate/subagent 共享。
 #[derive(Default)]
@@ -73,6 +76,11 @@ pub struct AgentContext {
     pub team_identity: Option<(String, String)>,
     /// lead 的 session id（team 工具路由用）。
     pub session_id: Option<String>,
+    /// run 首次进入 Provider 前绑定的 Goal。结算必须按 id，不能在终态后重新 focus。
+    pub bound_goal_id: Option<String>,
+    /// `bound_goal_id = None` 既可能表示尚未捕获，也可能表示本 run 开始时没有 Goal。
+    /// 该标记冻结后一律不得二次 focus，避免把早先请求的费用误扣到运行中才创建的 Goal。
+    pub goal_binding_frozen: bool,
     /// 子代理活动注册表（teammate/subagent/workflow 统一视图）。
     pub agents: Option<Arc<crate::agent::activity::AgentRegistry>>,
     /// 事件总线（子代理流式事件上 UI 用）。
@@ -85,8 +93,27 @@ pub struct AgentContext {
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
     /// 后台 agent 完成通知路由（仅主会话 ctx 开；子代理不再嵌套派发，None）。
     pub notify: Option<Arc<crate::agent::background::NotifyRouter>>,
+    /// 主会话把 run 内 compaction 摘要落为 checkpoint；无持久化会话的子环境为 None。
+    pub persist_compaction: Option<PersistCompaction>,
+    /// completion judge 等辅助请求的 session/run 统计汇入点；Goal 已在调用处独立记账。
+    pub auxiliary_usage: Arc<super::usage::AuxiliaryUsage>,
+    /// 所有 lead/subagent/background/team run 共用的 session usage 汇入点。
+    pub usage_reporter: Option<UsageReporter>,
     pub on_event: Arc<dyn Fn(AgentEvent) + Send + Sync>,
     /// 测试注入缝：替换 LLM 流式调用（None = LlmClient::stream_with_tools 静态分发）。
     /// 生产路径不设置；单测注入假流以直接覆盖 run 的重试/终态/预算分支。
     pub stream_override: Option<crate::llm::StreamFn>,
+}
+
+impl AgentContext {
+    pub fn freeze_goal_binding(&mut self) -> Result<(), String> {
+        if self.goal_binding_frozen {
+            return Ok(());
+        }
+        self.bound_goal_id = crate::core::goal::Goal::focus_for_checked(&crate::core::paths::goals_dir(), self.session_id.as_deref())
+            .map_err(|error| error.to_string())?
+            .map(|goal| goal.id);
+        self.goal_binding_frozen = true;
+        Ok(())
+    }
 }

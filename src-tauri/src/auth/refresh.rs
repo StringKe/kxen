@@ -4,8 +4,14 @@
 //! Anthropic 刷新即吊销旧 refresh token：RECENT 跨 clone 去重，绝不重复刷新同一旧凭证。
 
 use crate::auth::credential::{AuthStore, CredentialKind, account_id};
-use crate::core::shared::now_ms;
 use std::sync::{Mutex, OnceLock};
+
+mod grant;
+#[cfg(test)]
+use crate::core::shared::now_ms;
+use grant::run_grant;
+#[cfg(test)]
+use grant::{apply_refresh_to, run_grant_to};
 
 const BUFFER_MS: u64 = 5 * 60 * 1000;
 
@@ -29,60 +35,70 @@ struct RefreshResponse {
 static REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static RECENT: OnceLock<Mutex<std::collections::HashMap<String, CredentialKind>>> = OnceLock::new();
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    NotNeeded,
+    Refreshed,
+    Failed(String),
+}
+
 fn recent() -> &'static Mutex<std::collections::HashMap<String, CredentialKind>> {
     RECENT.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
-/// 快过期则刷新（store 更新返回 true）；无凭证/端点不支持/失败保持原样返回 false。
-pub async fn ensure_fresh(store: &mut AuthStore, provider: &str, account: Option<&str>) -> bool {
-    let Some((url, client_id)) = token_endpoint(provider) else { return false };
+/// 快过期则刷新。真正的刷新失败必须显式返回，调用方不得拿即将失效的凭证继续请求。
+pub async fn ensure_fresh(store: &mut AuthStore, provider: &str, account: Option<&str>) -> RefreshOutcome {
+    let Some((url, client_id)) = token_endpoint(provider) else { return RefreshOutcome::NotNeeded };
     let key = account.map(|a| account_id(provider, a)).unwrap_or_else(|| provider.to_string());
-    let Some(cred) = store.get(&key).cloned() else { return false };
-    let CredentialKind::Oauth { refresh, account_id: acc_id, .. } = &cred else { return false };
-    if refresh.is_empty() || !cred.is_expired_within(BUFFER_MS) {
-        return false;
+    let Some(cred) = store.get(&key).cloned() else { return RefreshOutcome::NotNeeded };
+    let CredentialKind::Oauth { refresh, account_id: acc_id, .. } = &cred else { return RefreshOutcome::NotNeeded };
+    if !cred.is_expired_within(BUFFER_MS) {
+        return RefreshOutcome::NotNeeded;
+    }
+    if refresh.is_empty() {
+        return RefreshOutcome::Failed("OAuth credential requires refresh but its refresh token is empty".into());
     }
     // 其它 clone 刚刷过：直接采用（旧 refresh 已吊销，再刷必败）
     if adopt_recent(store, &key, None) {
-        return true;
+        return RefreshOutcome::Refreshed;
     }
     let _guard = REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     // 锁内复查：等待期间可能已被另一 run 刷新
     let current = store.get(&key).cloned();
     if current.as_ref().is_some_and(|c| !c.is_expired_within(BUFFER_MS)) {
-        return false;
+        return RefreshOutcome::NotNeeded;
     }
     if adopt_recent(store, &key, None) {
-        return true;
+        return RefreshOutcome::Refreshed;
     }
-    if !run_grant(store, &key, url, client_id, refresh, acc_id).await {
-        return false;
+    if let Err(error) = run_grant(store, &key, url, client_id, refresh, acc_id).await {
+        return RefreshOutcome::Failed(error);
     }
     tracing::info!(provider, "oauth token refreshed proactively");
-    true
+    RefreshOutcome::Refreshed
 }
 
 /// 反应式强制刷新：无视本地过期窗口直接走 refresh grant（store 更新返回 true）。
 /// WHY: token 被服务端吊销时本地 expires 未到，预防式 ensure_fresh 不会触发，401/403 后必须强刷。
-pub async fn force_refresh(store: &mut AuthStore, provider: &str, account: Option<&str>) -> bool {
-    let Some((url, client_id)) = token_endpoint(provider) else { return false };
+pub async fn force_refresh(store: &mut AuthStore, provider: &str, account: Option<&str>) -> RefreshOutcome {
+    let Some((url, client_id)) = token_endpoint(provider) else { return RefreshOutcome::NotNeeded };
     let key = account.map(|a| account_id(provider, a)).unwrap_or_else(|| provider.to_string());
-    let Some(cred) = store.get(&key).cloned() else { return false };
-    let CredentialKind::Oauth { access, refresh, account_id: acc_id, .. } = &cred else { return false };
+    let Some(cred) = store.get(&key).cloned() else { return RefreshOutcome::NotNeeded };
+    let CredentialKind::Oauth { access, refresh, account_id: acc_id, .. } = &cred else { return RefreshOutcome::NotNeeded };
     if refresh.is_empty() {
-        return false;
+        return RefreshOutcome::Failed("OAuth credential cannot be refreshed because its refresh token is empty".into());
     }
     let _guard = REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     // 并发 401：另一 run 可能已换新（旧 refresh 已吊销，重复刷必败），直接采用；
     // 与刚失败的 access 同源则不采用——采用等于没换，重试只会再 401
     if adopt_recent(store, &key, Some(access)) {
-        return true;
+        return RefreshOutcome::Refreshed;
     }
-    if !run_grant(store, &key, url, client_id, refresh, acc_id).await {
-        return false;
+    if let Err(error) = run_grant(store, &key, url, client_id, refresh, acc_id).await {
+        return RefreshOutcome::Failed(error);
     }
     tracing::info!(provider, "oauth token force-refreshed after auth failure");
-    true
+    RefreshOutcome::Refreshed
 }
 
 /// 错误串中的凭证失败判定（provider 错误格式 "{provider} HTTP {status}: ..."，见 llm::client::format_http_error）。
@@ -110,41 +126,6 @@ fn adopt_recent(store: &mut AuthStore, key: &str, must_differ_from: Option<&str>
     true
 }
 
-/// 执行 refresh grant：POST token 端点 -> 解析 -> 落 RECENT + store + 写盘。成功返回 true。
-async fn run_grant(store: &mut AuthStore, key: &str, url: &str, client_id: &str, refresh: &str, acc_id: &Option<String>) -> bool {
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh,
-        "client_id": client_id,
-    });
-    let resp = crate::llm::client::shared_http().post(url).json(&body).timeout(std::time::Duration::from_secs(15)).send().await;
-    let Ok(resp) = resp else { return false };
-    if !resp.status().is_success() {
-        tracing::warn!(status = %resp.status(), "oauth refresh grant failed");
-        return false;
-    }
-    let Ok(parsed) = resp.json::<RefreshResponse>().await else { return false };
-    apply_refresh(store, key, parsed, refresh, acc_id);
-    true
-}
-
-/// grant 响应落进 RECENT + store（纯函数，测试直达；写盘归调用方）。
-fn apply_refresh(store: &mut AuthStore, key: &str, parsed: RefreshResponse, old_refresh: &str, acc_id: &Option<String>) {
-    let new_cred = CredentialKind::Oauth {
-        access: parsed.access_token,
-        refresh: parsed.refresh_token.unwrap_or_else(|| old_refresh.to_string()),
-        expires: now_ms() + parsed.expires_in.unwrap_or(28_800) * 1000,
-        account_id: acc_id.clone(),
-    };
-    crate::core::shared::lock(recent()).insert(key.to_string(), new_cred.clone());
-    store.insert(key.to_string(), new_cred.clone());
-    // 回写登记的共享 store：本 run 外的克隆点（父 run 下一 run / teammate 下一轮 / 下次 dispatch）即时拿到新凭证
-    crate::auth::shared_store::propagate(key, &new_cred);
-    if let Err(e) = crate::auth::credential::write_auth_entry(&crate::core::paths::auth_file(), key, Some(&new_cred)) {
-        tracing::error!(error = %e, "oauth credential persistence failed");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +142,7 @@ mod tests {
         let mut store = AuthStore::default();
         store.insert("openai".into(), CredentialKind::Api { key: "k".into(), region: None });
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert!(!rt.block_on(ensure_fresh(&mut store, "openai", None)));
+        assert_eq!(rt.block_on(ensure_fresh(&mut store, "openai", None)), RefreshOutcome::NotNeeded);
     }
 
     #[test]
@@ -172,7 +153,7 @@ mod tests {
             CredentialKind::Oauth { access: "a".into(), refresh: "r".into(), expires: now_ms() + 3_600_000, account_id: None },
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert!(!rt.block_on(ensure_fresh(&mut store, "anthropic", None)));
+        assert_eq!(rt.block_on(ensure_fresh(&mut store, "anthropic", None)), RefreshOutcome::NotNeeded);
     }
 
     #[test]
@@ -201,25 +182,38 @@ mod tests {
         // 无公开刷新端点的 provider
         let mut store = AuthStore::default();
         store.insert("xai".into(), CredentialKind::Api { key: "k".into(), region: None });
-        assert!(!rt.block_on(force_refresh(&mut store, "xai", None)));
+        assert_eq!(rt.block_on(force_refresh(&mut store, "xai", None)), RefreshOutcome::NotNeeded);
         // api-key 凭证不可刷
         let mut store = AuthStore::default();
         store.insert("openai".into(), CredentialKind::Api { key: "k".into(), region: None });
-        assert!(!rt.block_on(force_refresh(&mut store, "openai", None)));
+        assert_eq!(rt.block_on(force_refresh(&mut store, "openai", None)), RefreshOutcome::NotNeeded);
         // 空 refresh token
         let mut store = AuthStore::default();
         store.insert(
             "anthropic".into(),
             CredentialKind::Oauth { access: "a".into(), refresh: String::new(), expires: now_ms() + 3_600_000, account_id: None },
         );
-        assert!(!rt.block_on(force_refresh(&mut store, "anthropic", None)));
+        assert!(matches!(
+            rt.block_on(force_refresh(&mut store, "anthropic", None)),
+            RefreshOutcome::Failed(message) if message.contains("refresh token is empty")
+        ));
     }
 
     #[test]
     fn apply_refresh_keeps_old_refresh_when_absent() {
+        setup_auth_file();
+        let _io = io_lock().lock().unwrap();
         let key = format!("test:apply-{}", std::process::id());
         let mut store = AuthStore::default();
-        apply_refresh(&mut store, &key, RefreshResponse { access_token: "a2".into(), refresh_token: None, expires_in: None }, "r1", &None);
+        apply_refresh_to(
+            &mut store,
+            &key,
+            RefreshResponse { access_token: "a2".into(), refresh_token: None, expires_in: None },
+            "r1",
+            &None,
+            &crate::core::paths::auth_file(),
+        )
+        .unwrap();
         let Some(CredentialKind::Oauth { access, refresh, .. }) = store.get(&key) else { panic!("oauth") };
         assert_eq!(access, "a2");
         assert_eq!(refresh, "r1", "响应缺 refresh_token 保留旧的");
@@ -255,13 +249,13 @@ mod tests {
             CredentialKind::Oauth { access: "old-access".into(), refresh: "old-refresh".into(), expires: 1, account_id: None },
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        assert!(rt.block_on(run_grant(&mut store, &key, &url, "cid", "old-refresh", &None)));
+        rt.block_on(run_grant(&mut store, &key, &url, "cid", "old-refresh", &None)).unwrap();
         // run.rs 重试以同账号读 store 构造请求：access 必须已换成新 token
         let Some(CredentialKind::Oauth { access, refresh, .. }) = store.get(&key) else { panic!("oauth") };
         assert_eq!(access, "new-access");
         assert_eq!(refresh, "new-refresh");
         // 落盘同步发生（进程外与其他 clone 经读盘收敛）
-        let on_disk = crate::auth::credential::read_auth_file(&crate::core::paths::auth_file());
+        let on_disk = crate::auth::credential::read_auth_file(&crate::core::paths::auth_file()).unwrap();
         assert!(matches!(on_disk.get(&key), Some(CredentialKind::Oauth { access, .. }) if access == "new-access"));
         recent().lock().expect("recent").remove(&key);
     }
@@ -280,8 +274,36 @@ mod tests {
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         // 刷新失败保持原样返回 false：run.rs 落原错误路径，不会无限重试
-        assert!(!rt.block_on(run_grant(&mut store, &key, &url, "cid", "old-refresh", &None)));
+        assert!(rt.block_on(run_grant(&mut store, &key, &url, "cid", "old-refresh", &None)).is_err());
         assert!(matches!(store.get(&key), Some(CredentialKind::Oauth { access, .. }) if access == "old-access"));
+    }
+
+    #[test]
+    fn grant_persistence_failure_returns_false_without_publishing_refresh() {
+        let url = mock_token_server("HTTP/1.1 200 OK", r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#);
+        let key = format!("test:grant-persist-fail-{}", std::process::id());
+        let mut store = AuthStore::default();
+        store.insert(
+            key.clone(),
+            CredentialKind::Oauth { access: "old-access".into(), refresh: "old-refresh".into(), expires: 1, account_id: None },
+        );
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(store.clone()));
+        crate::auth::shared_store::register_shared_store(&shared);
+        let root = std::env::temp_dir().join(format!("kxen-refresh-persist-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let impossible_auth_file = blocker.join("auth.json");
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(rt.block_on(run_grant_to(&mut store, &key, &url, "cid", "old-refresh", &None, &impossible_auth_file,)).is_err());
+        assert!(matches!(store.get(&key), Some(CredentialKind::Oauth { access, .. }) if access == "old-access"));
+        assert!(!crate::core::shared::lock(recent()).contains_key(&key), "持久化失败的凭证不得进入 RECENT");
+        assert!(
+            matches!(crate::core::shared::lock(&shared).get(&key), Some(CredentialKind::Oauth { access, .. }) if access == "old-access"),
+            "持久化失败的凭证不得传播到共享 store"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// 进程级隔离 auth 落盘路径（与 trust.rs 同规约：Once 写序，同值无竞态）。

@@ -1,29 +1,22 @@
-//! 流式调用重试：429/5xx/网络类错误指数退避 + 同 provider 账号池轮换。
-//! 只在「本轮尚未产出任何内容」时重试——部分产出后重试会重复文本，直接终态。
+//! 流式调用重试：只重试 Provider 明确拒绝且未返回 usage 的限流响应。
+//! 5xx、timeout、EOF、reset 等都可能发生在 Provider 已接收并计费之后，没有
+//! idempotency key 时自动重发会重复付费或重复副作用，因此一律终态交由用户确认。
 
 use crate::auth::credential::AuthStore;
 
 pub const MAX_ATTEMPTS: usize = 3;
 
-/// 可重试的错误类：限流 / 5xx / 网络断连。401/403（凭证）与业务错误不重试。
+/// 可重试的错误类：仅明确限流。调用方还必须确认本 attempt 没有任何内容或 usage。
 pub fn retryable(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    if e.contains("401") || e.contains("403") {
-        return false;
-    }
-    e.contains("429")
-        || e.contains("rate limit")
-        || e.contains("rate_limit")
-        || e.contains("500")
-        || e.contains("502")
-        || e.contains("503")
-        || e.contains("504")
-        || e.contains("timeout")
-        || e.contains("timed out")
-        || e.contains("connect")
-        || e.contains("eof")
-        || e.contains("reset")
-        || e.contains("request failed")
+    e.contains("429") || e.contains("rate limit") || e.contains("rate_limit")
+}
+
+/// An explicit HTTP rejection with no streamed content or usage is a known
+/// zero-cost result. Ambiguous transport and 5xx failures are deliberately
+/// excluded because the Provider may already have accepted and billed them.
+pub fn known_zero_rejection(err: &str) -> bool {
+    retryable(err) || crate::auth::refresh::is_auth_failure(err)
 }
 
 /// 指数退避 + 抖动：800ms / 1.6s / 3.2s 起步。
@@ -49,11 +42,14 @@ mod tests {
     #[test]
     fn retryable_classification() {
         assert!(retryable("xai HTTP 429: too many requests"));
-        assert!(retryable("HTTP 503: upstream unavailable"));
-        assert!(retryable("request failed: connection reset"));
-        assert!(retryable("operation timed out"));
+        assert!(!retryable("HTTP 503: upstream unavailable"));
+        assert!(!retryable("request failed: connection reset"));
+        assert!(!retryable("operation timed out"));
         assert!(!retryable("HTTP 401: unauthorized"));
         assert!(!retryable("missing command"));
+        assert!(known_zero_rejection("openai HTTP 401: revoked"));
+        assert!(known_zero_rejection("xai HTTP 429: too many requests"));
+        assert!(!known_zero_rejection("request failed: connection reset"));
     }
 
     #[test]

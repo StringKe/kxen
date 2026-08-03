@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+const SNAPSHOT_READ_CAP: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStore {
     /// path -> 首次修改前的原文（None = 当时不存在 = agent 新建）
@@ -77,7 +79,7 @@ impl SnapshotStore {
         let Some(baseline) = crate::core::shared::lock(&self.originals).get(path).cloned() else { return Ok(None) };
         let Some(before) = baseline.content.as_ref() else { return Ok(None) };
         let after = read_current(path, &baseline)?.unwrap_or_default();
-        Ok(Some(unified_diff(&before, &after, path)))
+        Ok(Some(unified_diff(before, &after, path)))
     }
 
     /// 新建文件的 diff（before 为空）。
@@ -114,6 +116,14 @@ impl SnapshotStore {
 }
 
 fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.len() > SNAPSHOT_READ_CAP => {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds 1MB snapshot cap"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -123,7 +133,7 @@ fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
 
 fn read_current(path: &Path, baseline: &SnapshotBaseline) -> std::io::Result<Option<String>> {
     match &baseline.authority {
-        Some(authority) => authority.read_optional(),
+        Some(authority) => authority.read_optional_capped(SNAPSHOT_READ_CAP as usize),
         None => read_optional(path),
     }
 }

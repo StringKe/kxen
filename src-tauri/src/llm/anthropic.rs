@@ -196,12 +196,8 @@ impl AnthropicProvider {
 
     /// 自定义 anthropic 兼容端点：x-api-key 直连，无 OAuth 契约要素。
     pub fn custom(base_url: String, api_key: impl Into<String>) -> Self {
-        Self {
-            url: base_url.into(),
-            http: crate::llm::client::shared_http(),
-            bearer: crate::core::shared::SharedStr::from(api_key.into()),
-            oauth: false,
-        }
+        let http = crate::llm::client::shared_http_for_url(&base_url);
+        Self { url: base_url.into(), http, bearer: crate::core::shared::SharedStr::from(api_key.into()), oauth: false }
     }
 
     pub fn stream_chat(
@@ -211,6 +207,7 @@ impl AnthropicProvider {
         tools: &[crate::llm::tool::ToolDefinition],
     ) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
         let bearer = self.bearer.clone();
+        let error_bearer = bearer.clone();
         let url = self.url.clone();
         let oauth = self.oauth;
         let model = model.to_string();
@@ -253,16 +250,24 @@ impl AnthropicProvider {
             builder.header("anthropic-version", "2023-06-01").header("content-type", "application/json").json(&req).send().await
         };
 
-        Box::pin(futures::stream::once(start).flat_map(|result| {
-            match result {
-                Ok(resp) if resp.status().is_success() => super::anthropic_sse::stream_sse(resp),
-                Ok(resp) => futures::stream::once(async move {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Delta::Error(crate::llm::client::format_http_error("anthropic", status, &body))
+        Box::pin(futures::stream::once(start).flat_map(move |result| match result {
+            Ok(resp) if resp.status().is_success() => super::anthropic_sse::stream_sse(resp),
+            Ok(resp) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(crate::llm::client::bounded_http_error("anthropic", resp, &[error_bearer.as_ref()]).await)
                 })
-                .boxed(),
-                Err(e) => futures::stream::once(async move { Delta::Error(format!("anthropic request failed: {e}")) }).boxed(),
+                .boxed()
+            }
+            Err(error) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(format!(
+                        "anthropic request failed: {}",
+                        crate::core::net_security::sanitize_authenticated_error(&error, &[error_bearer.as_ref()])
+                    ))
+                })
+                .boxed()
             }
         }))
     }

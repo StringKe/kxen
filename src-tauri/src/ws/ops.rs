@@ -4,17 +4,38 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
+#[cfg(test)]
+pub(super) use super::ops_config::update_toml_then;
+pub(super) use super::ops_config::{update_toml, update_toml_with_runtime};
 use crate::AppState;
+
+#[derive(Debug, PartialEq, Eq)]
+struct UsageTotals {
+    total_input: u64,
+    total_output: u64,
+    unmetered_calls: u64,
+    sessions: usize,
+    completeness: kxen_app::core::usage::UsageCompleteness,
+}
+
+fn usage_totals(tokens: &std::collections::HashMap<String, kxen_app::core::usage::SessionUsage>) -> UsageTotals {
+    let total_input = tokens.values().map(|usage| usage.input).sum();
+    let total_output = tokens.values().map(|usage| usage.output).sum();
+    let unmetered_calls = tokens.values().map(|usage| usage.unmetered_calls).sum();
+    UsageTotals {
+        total_input,
+        total_output,
+        unmetered_calls,
+        // Global billable actions use synthetic system_* ledgers so crash
+        // recovery remains durable, but they are not chat Sessions.
+        sessions: tokens.keys().filter(|id| !id.starts_with("system_")).count(),
+        completeness: kxen_app::core::usage::completeness(unmetered_calls),
+    }
+}
 
 const METHODS: &[&str] = &[
     "mrm.stats",
     "agent.test_dispatch",
-    "knowledge.list",
-    "knowledge.add",
-    "knowledge.remove",
-    "knowledge.set_enabled",
-    "knowledge.move",
-    "knowledge.injection_preview",
     "schedule.list",
     "usage.overview",
     "schedule.add",
@@ -41,8 +62,14 @@ pub(super) async fn try_handle(method: &str, params: &Value, app: &AppHandle) ->
     if super::ops_workspace::METHODS.contains(&method) {
         return Some(super::ops_workspace::handle(method, params, app).await);
     }
+    if super::ops_knowledge::METHODS.contains(&method) {
+        return Some(super::ops_knowledge::handle(method, params, app).await);
+    }
     if super::ops_mcp::METHODS.contains(&method) {
         return Some(super::ops_mcp::handle(method, params, app).await);
+    }
+    if super::ops_recovery::METHODS.contains(&method) {
+        return Some(super::ops_recovery::handle(method, params, app));
     }
     if !METHODS.contains(&method) {
         return None;
@@ -54,75 +81,20 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
     match method {
         "mrm.stats" => {
             let state = app.state::<Arc<AppState>>();
-            let mrm = kxen_app::core::shared::read(&state.mrm).clone();
+            let mrm = state.active_runtime()?.mrm();
             Ok(json!({
                 "describe": mrm.describe().await,
                 "history": mrm.history().await,
                 "health": mrm.health().await,
+                "metering_warning": kxen_app::core::usage_trend::warning(),
             }))
         }
         "agent.test_dispatch" => test_dispatch(app, params).await,
-        "knowledge.list" => {
-            let state = app.state::<Arc<AppState>>();
-            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
-            serde_json::to_value(kxen_app::knowledge::list(&dir)).map_err(|e| e.to_string())
-        }
-        "knowledge.add" => {
-            let scope = kxen_app::knowledge::Scope::parse(params.get("scope").and_then(Value::as_str).unwrap_or("personal"))?;
-            let slug = params.get("slug").and_then(Value::as_str);
-            let kind = params.get("type").and_then(Value::as_str).unwrap_or("note");
-            let description = params.get("description").and_then(Value::as_str).ok_or("missing description")?;
-            let content = params.get("content").and_then(Value::as_str).ok_or("missing content")?;
-            let state = app.state::<Arc<AppState>>();
-            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
-            let path = kxen_app::knowledge::add(scope, &dir, slug, kind, description, content)?;
-            Ok(json!({ "path": path }))
-        }
-        "knowledge.remove" => {
-            let scope = kxen_app::knowledge::Scope::parse(params.get("scope").and_then(Value::as_str).ok_or("missing scope")?)?;
-            let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
-            let state = app.state::<Arc<AppState>>();
-            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
-            kxen_app::knowledge::remove(scope, &dir, slug)?;
-            Ok(json!({ "removed": true }))
-        }
-        "knowledge.set_enabled" => {
-            let scope = kxen_app::knowledge::Scope::parse(params.get("scope").and_then(Value::as_str).ok_or("missing scope")?)?;
-            let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
-            let enabled = params.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
-            let state = app.state::<Arc<AppState>>();
-            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
-            kxen_app::knowledge::set_enabled(scope, &dir, slug, enabled)?;
-            Ok(json!({ "scope": scope.as_str(), "slug": slug, "enabled": enabled }))
-        }
-        "knowledge.move" => {
-            let scope = kxen_app::knowledge::Scope::parse(params.get("scope").and_then(Value::as_str).ok_or("missing scope")?)?;
-            let slug = params.get("slug").and_then(Value::as_str).ok_or("missing slug")?;
-            let to = kxen_app::knowledge::Scope::parse(params.get("to").and_then(Value::as_str).ok_or("missing to")?)?;
-            let state = app.state::<Arc<AppState>>();
-            let dir = kxen_app::core::shared::read(&state.active_workspace).clone();
-            let path = kxen_app::knowledge::move_entry(scope, &dir, slug, to)?;
-            Ok(json!({ "path": path }))
-        }
-        "knowledge.injection_preview" => {
-            let state = app.state::<Arc<AppState>>();
-            // 真实 involved：最近一轮 run 的文件集（空集会漏掉 glob 动态命中的文件）
-            let session_id = params.get("session_id").and_then(Value::as_str);
-            let dir = match session_id {
-                Some(sid) => state.runtime_for_session(sid)?.root().to_path_buf(),
-                None => kxen_app::core::shared::read(&state.active_workspace).clone(),
-            };
-            let involved =
-                session_id.and_then(|sid| kxen_app::core::shared::lock(&state.session_involved).get(sid).cloned()).unwrap_or_default();
-            let block = kxen_app::knowledge::render(&dir, &involved);
-            Ok(json!({ "block": block }))
-        }
-        "schedule.list" => Ok(serde_json::to_value(kxen_app::core::schedule::list()).map_err(|e| e.to_string())?),
+        "schedule.list" => Ok(serde_json::to_value(kxen_app::core::schedule::list()?).map_err(|e| e.to_string())?),
         "usage.overview" => {
             let state = app.state::<Arc<AppState>>();
             let tokens = kxen_app::core::shared::lock(&state.session_tokens).clone();
-            let total_input: u64 = tokens.values().map(|t| t.0).sum();
-            let total_output: u64 = tokens.values().map(|t| t.1).sum();
+            let totals = usage_totals(&tokens);
             let history = {
                 let mrm = kxen_app::core::shared::read(&state.mrm).clone();
                 mrm.history().await
@@ -139,14 +111,19 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
                 .collect();
             let today = kxen_app::core::usage_trend::today();
             Ok(json!({
-                "total_input": total_input,
-                "total_output": total_output,
-                "sessions": tokens.len(),
+                "total_input": totals.total_input,
+                "total_output": totals.total_output,
+                "unmetered_calls": totals.unmetered_calls,
+                "usage_complete": totals.completeness.usage_complete,
+                "storage_complete": totals.completeness.storage_complete,
+                "storage_warning": totals.completeness.storage_warning,
+                "sessions": totals.sessions,
                 "dispatches": history.len(),
                 "by_model": by_model,
                 "today_input": today.input,
                 "today_output": today.output,
                 "daily": daily,
+                "metering_warning": kxen_app::core::usage_trend::warning(),
             }))
         }
         "schedule.add" => {
@@ -154,17 +131,21 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let prompt = params.get("prompt").and_then(Value::as_str).ok_or("missing prompt")?;
             let session_id = params.get("session_id").and_then(Value::as_str).ok_or("missing session_id")?;
             let once = params.get("once").and_then(Value::as_bool).unwrap_or(false);
+            let sessions_dir = kxen_app::core::paths::sessions_dir();
+            let _lifecycle = kxen_app::core::session_lifecycle::admit_mutation(&sessions_dir, session_id)?;
             let job = kxen_app::core::schedule::add(cron, prompt, session_id, once)?;
             Ok(serde_json::to_value(job).map_err(|e| e.to_string())?)
         }
         "schedule.remove" => {
             let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
-            Ok(json!(kxen_app::core::schedule::remove(id)))
+            let _lifecycle = kxen_app::core::session_lifecycle::admit_schedule_mutation(id)?;
+            Ok(json!(kxen_app::core::schedule::remove(id)?))
         }
         "schedule.set_enabled" => {
             let id = params.get("id").and_then(Value::as_str).ok_or("missing id")?;
             let enabled = params.get("enabled").and_then(Value::as_bool).ok_or("missing enabled")?;
-            Ok(json!(kxen_app::core::schedule::set_enabled(id, enabled)))
+            let _lifecycle = kxen_app::core::session_lifecycle::admit_schedule_mutation(id)?;
+            Ok(json!(kxen_app::core::schedule::set_enabled(id, enabled)?))
         }
         "diagnostics.export" => super::ops_diagnostics::export(app).await,
         "notifications.list" => {
@@ -175,8 +156,12 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
         "notifications.clear" => {
             let state = app.state::<Arc<AppState>>();
             let mut buf = state.notifications.lock().map_err(|e| e.to_string())?;
+            let previous = buf.clone();
             buf.clear();
-            kxen_app::core::notifications::persist(&buf);
+            if let Err(error) = kxen_app::core::notifications::persist_checked(&buf) {
+                *buf = previous;
+                return Err(format!("clear notifications: {error}"));
+            }
             Ok(json!(true))
         }
         "voice.engines" => {
@@ -208,9 +193,10 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
                 .unwrap_or_default();
             let locale = params.get("locale").and_then(Value::as_str);
             let path = kxen_app::core::paths::config_dir().join("config.toml");
-            let mut doc = read_toml(&path)?;
-            kxen_app::core::config::merge_voice_engine(&mut doc, engine, &fallback, locale);
-            write_toml(&path, &doc)?;
+            update_toml(&path, |doc| {
+                kxen_app::core::config::merge_voice_engine(doc, engine, &fallback, locale);
+                Ok(())
+            })?;
             Ok(json!({ "engine": engine }))
         }
         "config.set_send_policy" => {
@@ -219,9 +205,10 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
                 return Err("policy 只支持 queue / interrupt".into());
             }
             let path = kxen_app::core::paths::config_dir().join("config.toml");
-            let mut doc = read_toml(&path)?;
-            doc.insert("send_when_running".into(), toml::Value::String(policy.into()));
-            write_toml(&path, &doc)?;
+            update_toml(&path, |doc| {
+                doc.insert("send_when_running".into(), toml::Value::String(policy.into()));
+                Ok(())
+            })?;
             Ok(json!({ "send_when_running": policy }))
         }
         "config.set_experimental" => super::settings::set_experimental(params, &app.state::<Arc<AppState>>()).await,
@@ -246,7 +233,14 @@ async fn handle(method: &str, params: &Value, app: &AppHandle) -> Result<Value, 
             let session_id = params.get("session_id").and_then(Value::as_str).unwrap_or("");
             let state = app.state::<Arc<AppState>>();
             let store = state.auth_store.lock().map_err(|e| e.to_string())?.clone();
-            let text = kxen_app::voice::stop(&config, &store, session_id).await?;
+            let runtime = if session_id.is_empty() { state.active_runtime()? } else { state.runtime_for_session(session_id)? };
+            let mrm = runtime.mrm();
+            let usage_reporter = if session_id.is_empty() {
+                kxen_app::agent::agent_loop::UsageReporter::new_unscoped("system_voice", state.session_tokens.clone(), state.bus.clone())
+            } else {
+                kxen_app::agent::agent_loop::UsageReporter::new(session_id.to_string(), state.session_tokens.clone(), state.bus.clone())
+            };
+            let text = kxen_app::voice::stop(&config, &store, session_id, &mrm, &usage_reporter).await?;
             Ok(json!({ "text": text }))
         }
         other => Err(format!("unknown method: {other}")),
@@ -257,31 +251,21 @@ fn load_config() -> Result<kxen_app::core::config::Config, String> {
     kxen_app::core::config::Config::load(&kxen_app::core::paths::config_dir().join("config.toml"), None).map_err(|e| e.to_string())
 }
 
-/// toml 1.x 文档读（Value::from_str 解析的是值不是文档）。
-pub(super) fn read_toml(path: &std::path::Path) -> Result<toml::Table, String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    if text.trim().is_empty() {
-        return Ok(toml::Table::new());
-    }
-    toml::from_str(&text).map_err(|e| format!("config.toml parse: {e}"))
-}
-
-/// 原子写回（tmp + rename）。
-pub(super) fn write_toml(path: &std::path::Path, doc: &toml::Table) -> Result<(), String> {
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, toml::to_string(doc).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
-}
+#[cfg(test)]
+mod tests;
 
 async fn test_dispatch(app: &AppHandle, params: &Value) -> Result<Value, String> {
     let role = params.get("role").and_then(Value::as_str).ok_or("missing role")?;
     let state = app.state::<Arc<AppState>>();
     let store = state.auth_store.lock().map_err(|e| e.to_string())?.clone();
-    let mrm = kxen_app::core::shared::read(&state.mrm).clone();
-    let resolved = mrm.resolve(role, &store).await.ok_or_else(|| format!("no available model for role {role}"))?;
-    let degraded = resolved.degraded_from.clone();
     let active = state.active_workspace.read().map_err(|_| "workspace lock poisoned".to_string())?.clone();
     let runtime = state.workspace_runtimes.ready(&active).await?;
+    let mrm = runtime.mrm();
+    let usage_reporter = kxen_app::agent::agent_loop::UsageReporter::new_unscoped(
+        "system_agent_test_dispatch",
+        state.session_tokens.clone(),
+        state.bus.clone(),
+    );
     let deps = kxen_app::agent::subagent::SubagentDeps {
         registry: state.registry.clone(),
         workdir: Arc::from(runtime.root()),
@@ -297,8 +281,10 @@ async fn test_dispatch(app: &AppHandle, params: &Value) -> Result<Value, String>
         approvals: Some(state.approvals.clone()),
         mcp: Some(runtime.mcp()),
         lsp: Some(runtime.lsp()),
+        stream_override: None,
+        usage_reporter: Some(usage_reporter),
     };
-    let (_name, _degraded, answer) = kxen_app::agent::subagent::dispatch(
+    let dispatch = kxen_app::agent::subagent::dispatch(
         role,
         "Reply with exactly: PONG".to_string(),
         &deps,
@@ -307,10 +293,10 @@ async fn test_dispatch(app: &AppHandle, params: &Value) -> Result<Value, String>
     .await?;
     Ok(json!({
         "role": role,
-        "provider": resolved.provider,
-        "model": resolved.model,
-        "account": resolved.account,
-        "degraded_from": degraded,
-        "answer": answer.chars().take(200).collect::<String>(),
+        "provider": dispatch.model.provider,
+        "model": dispatch.model.model,
+        "account": dispatch.model.account,
+        "degraded_from": dispatch.degraded_from,
+        "answer": dispatch.answer.chars().take(200).collect::<String>(),
     }))
 }

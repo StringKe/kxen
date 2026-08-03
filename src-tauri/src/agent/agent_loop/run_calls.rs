@@ -42,17 +42,11 @@ pub async fn execute_calls(
                 arguments: call.arguments.clone(),
             });
         }
-        // 工具执行段：cancel 打断即落 interrupted 终态（不等待执行完成，后续任务由 registry 收尾）
+        // 工具执行段逐项挂 cancel。会持有 Provider/进程/子 run 状态的工具先获得短暂清理窗口，
+        // 避免直接 drop future 造成 UNKNOWN 用量未记账、子代理状态悬挂或前台进程泄漏。
         let cancel = ctx.cancel.clone();
         let cx: &AgentContext = ctx;
-        let run_batch = futures::future::join_all(batch.iter().map(|c| execute_tool(&c.name, &c.arguments, cx)));
-        let batch_results = match &cancel {
-            Some(token) => tokio::select! {
-                r = run_batch => r,
-                _ = token.wait() => batch.iter().map(|_| Err("(interrupted)".to_string())).collect::<Vec<_>>(),
-            },
-            None => run_batch.await,
-        };
+        let batch_results = futures::future::join_all(batch.iter().map(|call| execute_one(call, cx, cancel.clone()))).await;
         for (call, result) in batch.iter().zip(batch_results) {
             if matches!(&result, Err(e) if e == "(interrupted)") {
                 (ctx.on_event)(AgentEvent::ToolResult {
@@ -88,6 +82,33 @@ pub async fn execute_calls(
     messages.push(Message::assistant_with_tools(text, assistant_calls));
     push_tool_results(calls, results, messages);
     (aborted, loop_stop)
+}
+
+const CANCEL_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn needs_cancel_cleanup(name: &str) -> bool {
+    matches!(name, "exec" | "agent" | "workflow" | "goal" | "websearch") || name.starts_with("mcp__")
+}
+
+async fn execute_one(call: &ToolCall, ctx: &AgentContext, cancel: Option<crate::agent::cancel::CancelToken>) -> Result<String, String> {
+    let run = execute_tool(&call.name, &call.arguments, ctx);
+    tokio::pin!(run);
+    let Some(cancel) = cancel else { return run.await };
+    if !needs_cancel_cleanup(&call.name) {
+        return tokio::select! {
+            result = &mut run => result,
+            _ = cancel.wait() => Err("(interrupted)".to_string()),
+        };
+    }
+
+    let result = tokio::select! {
+        result = &mut run => result,
+        _ = cancel.wait() => {
+            let _ = tokio::time::timeout(CANCEL_CLEANUP_GRACE, &mut run).await;
+            return Err("(interrupted)".to_string());
+        },
+    };
+    if cancel.is_cancelled() { Err("(interrupted)".to_string()) } else { result }
 }
 
 /// 中断/截断时 results 短于 calls：provider 要求每个 tool_call 都有配对 tool_result，
@@ -134,5 +155,15 @@ mod tests {
         let mut messages = Vec::new();
         push_tool_results(calls, results, &mut messages);
         assert_eq!(messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+    }
+
+    #[test]
+    fn provider_and_process_tools_receive_a_cancel_cleanup_window() {
+        for name in ["exec", "agent", "workflow", "goal", "websearch", "mcp__server__tool"] {
+            assert!(needs_cancel_cleanup(name), "{name}");
+        }
+        for name in ["read", "glob", "grep", "webfetch", "browser", "mcp_server_tool"] {
+            assert!(!needs_cancel_cleanup(name), "{name}");
+        }
     }
 }

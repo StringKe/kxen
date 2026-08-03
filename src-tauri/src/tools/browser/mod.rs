@@ -1,12 +1,14 @@
 //! browser 工具：CDP 驱动系统 Chrome headless（deferred 工具，经 tool_search 挂载）。
 //! per-session 懒启动单实例（SessionExtras 键控）；同 session 复用同一页面，导航累加历史。
-//! SSRF 守卫：初始 URL 事前过 net_guard；页内跳转（点击/回退/JS/meta refresh）在每个动作后
-//! 复检落地 URL，命中拒绝段即断开浏览器并报错（事前拦截不可行的取舍见 dispatch 尾部注释）。
+//! SSRF 守卫：Chrome 的全部 HTTP/HTTPS 流量强制经过进程内 fail-closed proxy。
+//! proxy 在实际连接使用的 DNS 结果上拒绝 loopback、私网、link-local 与 CGNAT，覆盖导航、
+//! redirect、iframe、子资源与页面脚本请求；动作后的落地 URL 复检是额外的 scheme 防线。
 
 pub mod ax;
 pub mod chrome;
 pub mod driver;
 pub mod fake;
+mod proxy;
 
 use driver::{BrowserDriver, NavOutcome};
 use serde_json::Value;
@@ -138,11 +140,8 @@ pub async fn dispatch(args: &Value, slot: Option<&BrowserSlot>, session_id: Opti
         }
         other => Err(format!("unknown browser action: {other}")),
     }?;
-    // 页内跳转守卫：click/back/evaluate 乃至页面自己的 meta refresh/JS 定时跳转都会改当前 URL。
-    // CDP 的 frameRequestedNavigation 是 experimental 纯通知事件，没有否决跳转的配套命令
-    // （旧 processNavigation 已从协议删除），事前拦截不可行，只能事后复检落地 URL。
-    // 复检窗口内目标请求可能已发出、脚本已执行，所以拦截时关掉整个浏览器进程而不是只停加载：
-    // 既停止后续加载，也保证被拦页面内容不经 snapshot/evaluate 进入 prompt。
+    // proxy 已在网络连接前拦截所有 frame/子资源请求。此处仍复检最终 URL，拒绝非 HTTP(S)
+    // scheme，并在异常状态下关闭整个浏览器，避免内容进入后续 snapshot/evaluate。
     // close 跳过：实例已释放，无落地 URL 可检。
     if action != "close" {
         let landed = match guard.as_mut() {

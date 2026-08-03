@@ -15,6 +15,44 @@ fn state(tag: &str) -> (Arc<TeamState>, PathBuf) {
     (mgr.state_for("s1").unwrap(), dir)
 }
 
+fn role_mrm(model: &str) -> Arc<crate::llm::mrm::ModelResourceManager> {
+    let mut config = crate::core::config::Config::default();
+    config.roles.insert(
+        "execution".into(),
+        crate::core::config::RoleBinding { provider: "xai".into(), model: model.into(), fallback: None, account: None },
+    );
+    Arc::new(crate::llm::mrm::ModelResourceManager::new(config))
+}
+
+#[test]
+fn member_context_uses_each_session_workspace_mrm() {
+    let root = std::env::temp_dir().join(format!("kxen-team-context-mrm-{}", uuid::Uuid::new_v4()));
+    let work_a = root.join("workspace-a");
+    let work_b = root.join("workspace-b");
+    std::fs::create_dir_all(&work_a).unwrap();
+    std::fs::create_dir_all(&work_b).unwrap();
+    let sessions = root.join("sessions");
+    super::super::types::seed_test_session(&sessions, "ses_a", &work_a);
+    super::super::types::seed_test_session(&sessions, "ses_b", &work_b);
+    let deps = deps();
+    let runtime_a = deps.runtimes.runtime(&work_a).unwrap();
+    let runtime_b = deps.runtimes.runtime(&work_b).unwrap();
+    runtime_a.set_mrm_for_test(role_mrm("workspace-a-model"));
+    runtime_b.set_mrm_for_test(role_mrm("workspace-b-model"));
+    *crate::core::shared::write(&deps.mrm) = role_mrm("global-model");
+    let manager = crate::agent::team::TeamManager::new(root.join("teams"), deps, EventBus::default(), sessions, None);
+    let state_a = manager.state_for("ses_a").unwrap();
+    let state_b = manager.state_for("ses_b").unwrap();
+
+    let ctx_a =
+        build_ctx(&state_a, &runtime_a, "worker-a", &ModelRef::new("xai", "explicit"), None, crate::agent::cancel::CancelToken::new());
+    let ctx_b =
+        build_ctx(&state_b, &runtime_b, "worker-b", &ModelRef::new("xai", "explicit"), None, crate::agent::cancel::CancelToken::new());
+    assert_eq!(ctx_a.mrm.unwrap().role("execution").unwrap().model, "workspace-a-model");
+    assert_eq!(ctx_b.mrm.unwrap().role("execution").unwrap().model, "workspace-b-model");
+    std::fs::remove_dir_all(root).ok();
+}
+
 /// 凭证预防刷新回写：ensure_fresh 换新的凭证必须落回共享 store（含命名账号键），
 /// 否则下轮 build_ctx 快照又拿旧值。grant 路径不触网测不了，见 auth::refresh 测试。
 #[test]
@@ -146,11 +184,38 @@ fn awaiting_plan_approval_maps_through_to_activity() {
         plan_approval: true,
         prompt: String::new(),
         approved: false,
+        pending_verdict: None,
+        applied_verdict_id: None,
     });
     state.deps.agents.register("s1", "w", crate::agent::activity::AgentKind::Teammate, &ModelRef::new("p", "m"));
-    set_status(&state, "w", MemberStatus::AwaitingPlanApproval);
+    set_status(&state, "w", MemberStatus::AwaitingPlanApproval).unwrap();
     let list = state.deps.agents.list("s1");
     assert!(matches!(list[0].status, crate::agent::activity::ActivityStatus::AwaitingPlanApproval));
     assert_eq!(serde_json::to_value(list[0].status).unwrap(), "awaiting_plan_approval", "前端契约为 snake_case");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pending_verdict_does_not_grant_tools_before_config_finalize() {
+    let (state, dir) = state("pending-verdict-permission");
+    lock(&state.members).push(crate::agent::team::Member {
+        name: "w".into(),
+        role: "execution".into(),
+        model: ModelRef::new("p", "m"),
+        status: MemberStatus::AwaitingPlanApproval,
+        plan_approval: true,
+        prompt: "plan".into(),
+        approved: false,
+        pending_verdict: Some(super::super::types::PendingPlanVerdict {
+            delivery_id: "msg_pending".into(),
+            approved: true,
+            feedback: String::new(),
+        }),
+        applied_verdict_id: None,
+    });
+
+    assert!(!durable_approval(&state, "w", true), "pending inbox intent must not grant write tools");
+    lock(&state.members)[0].approved = true;
+    assert!(durable_approval(&state, "w", false), "finalized config grants write tools");
     let _ = std::fs::remove_dir_all(&dir);
 }

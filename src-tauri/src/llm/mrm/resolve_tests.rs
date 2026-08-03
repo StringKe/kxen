@@ -26,3 +26,20 @@ async fn peek_resolves_without_recording_history() {
     assert!(mrm.resolve("chat", &store).await.is_some());
     assert_eq!(mrm.history().await.len(), 1, "resolve 保持记录语义");
 }
+
+#[tokio::test]
+async fn local_free_provider_resolves_with_unrelated_credentials_present() {
+    let mut config = Config::default();
+    config.roles.insert(
+        "execution".into(),
+        crate::core::config::RoleBinding { provider: "ollama".into(), model: "qwen".into(), ..Default::default() },
+    );
+    let mrm = ModelResourceManager::new(config);
+    let mut store = crate::auth::credential::AuthStore::default();
+    store.insert("openai".into(), crate::auth::credential::CredentialKind::Api { key: "unrelated".into(), region: None });
+
+    let resolved = mrm.resolve("execution", &store).await.expect("local-free provider needs no credential");
+
+    assert_eq!(resolved.provider, "ollama");
+    assert!(resolved.account.is_none());
+}

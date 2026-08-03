@@ -2,7 +2,6 @@
 //! GET 长连接收事件，首帧 endpoint 事件给出回 POST 地址；请求走 POST（202 Accepted），
 //! 响应经 SSE 流按 id 路由回挂起的 oneshot（与 stdio 读循环同构）。
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -12,10 +11,28 @@ use std::sync::{Arc, Mutex};
 use super::oauth;
 use super::oauth_store::BearerAuth;
 use super::remote::Guard;
-use super::transport::Transport;
+use super::transport::{CancelRequest, PendingRequestGuard, Transport};
+
+mod read;
 
 const ENDPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn take(&mut self) -> tokio::task::JoinHandle<()> {
+        self.0.take().expect("reader task")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
 
 pub struct SseTransport {
     client: reqwest::Client,
@@ -25,7 +42,8 @@ pub struct SseTransport {
     auth: Option<Arc<BearerAuth>>,
     explicit_auth: bool,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
-    reader: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    reader: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    self_weak: std::sync::Weak<Self>,
     next_id: AtomicU64,
 }
 
@@ -38,13 +56,15 @@ impl SseTransport {
         guard: Guard,
         auth: Option<Arc<BearerAuth>>,
     ) -> Result<Arc<Self>, String> {
+        super::config::validate_secure_endpoint(url, true).map_err(|error| format!("MCP SSE endpoint {error}"))?;
         if guard == Guard::Enforced {
             crate::tools::net_guard::check_url(url).await?;
         }
         let base = reqwest::Url::parse(url).map_err(|e| format!("invalid mcp sse url: {e}"))?;
         let pairs = super::remote::validate_headers(headers)?;
         let explicit_auth = headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
-        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
+        let builder = if guard == Guard::Enforced { crate::tools::net_guard::guarded_client_builder() } else { reqwest::Client::builder() };
+        let client = builder.redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
         let send_get = || {
             let mut req = client.get(url).header(reqwest::header::ACCEPT, "text/event-stream");
             for (k, v) in &pairs {
@@ -64,7 +84,7 @@ impl SseTransport {
                 let Some(a) = &auth else {
                     return Err(oauth::err_auth_required(&format!("mcp sse connect http {s}")));
                 };
-                a.refresh().await.map_err(|e| oauth::err_auth_required(&format!("token refresh failed: {e}")))?;
+                a.refresh().await.map_err(super::remote::refresh_failure)?;
                 let retry = send_get().await.map_err(|e| format!("mcp sse connect {url}: {e}"))?;
                 let st = retry.status();
                 if st == reqwest::StatusCode::UNAUTHORIZED || st == reqwest::StatusCode::FORBIDDEN {
@@ -79,87 +99,67 @@ impl SseTransport {
         }
 
         let pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel::<reqwest::Url>();
-        let reader = {
+        let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel::<Result<reqwest::Url, String>>();
+        let mut reader = AbortOnDrop(Some({
             let pending = pending.clone();
             let client = client.clone();
             let pairs = pairs.clone();
-            tokio::spawn(read_loop(resp, base, pending, endpoint_tx, client, pairs, roots))
-        };
+            let reader_auth = auth.clone();
+            let context = read::ReadLoopContext { pending, client, headers: pairs, auth: reader_auth, explicit_auth, roots, guard };
+            tokio::spawn(read::read_loop(resp, base, endpoint_tx, context))
+        }));
         let post_url = match tokio::time::timeout(ENDPOINT_TIMEOUT, endpoint_rx).await {
-            Ok(Ok(u)) => u,
+            Ok(Ok(Ok(url))) => url,
+            Ok(Ok(Err(error))) => return Err(error),
             Ok(Err(_)) => return Err("mcp sse stream closed before endpoint event".into()),
             Err(_) => return Err("mcp sse endpoint event timed out".into()),
         };
-        Ok(Arc::new(Self {
+        let reader = reader.take();
+        Ok(Arc::new_cyclic(|self_weak| Self {
             client,
             post_url,
             headers: pairs,
             auth,
             explicit_auth,
             pending,
-            reader: tokio::sync::Mutex::new(Some(reader)),
+            reader: Mutex::new(Some(reader)),
+            self_weak: self_weak.clone(),
             next_id: AtomicU64::new(1),
         }))
-    }
-
-    fn decorate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut req = req;
-        for (k, v) in &self.headers {
-            req = req.header(k, v);
-        }
-        if let Some(a) = &self.auth {
-            req = req.header(reqwest::header::AUTHORIZATION, a.header_value());
-        }
-        req
     }
 
     /// POST 一帧到 endpoint；2xx（规范为 202）即视为送达，响应经 SSE 流回来。
     /// 401/403：与 streamable http 同一自愈链（refresh -> 重试一次 -> 拒则 AUTH_REQUIRED）。
     async fn post(&self, frame: Value) -> Result<(), String> {
-        let resp =
-            self.decorate(self.client.post(self.post_url.clone())).json(&frame).send().await.map_err(|e| format!("mcp sse post: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            if self.explicit_auth {
-                return Err(format!("mcp sse post http {status}: configured Authorization header rejected"));
-            }
-            let Some(auth) = &self.auth else {
-                return Err(oauth::err_auth_required(&format!("mcp sse post http {status}")));
-            };
-            auth.refresh().await.map_err(|e| oauth::err_auth_required(&format!("token refresh failed: {e}")))?;
-            let resp = self
-                .decorate(self.client.post(self.post_url.clone()))
-                .json(&frame)
-                .send()
-                .await
-                .map_err(|e| format!("mcp sse post: {e}"))?;
-            let status = resp.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-                return Err(oauth::err_auth_required(&format!("mcp sse post http {status} after token refresh")));
-            }
-            if !status.is_success() {
-                return Err(format!("mcp sse post http {status}"));
-            }
-            return Ok(());
-        }
-        if !status.is_success() {
-            return Err(format!("mcp sse post http {status}"));
-        }
-        Ok(())
+        post_frame(&self.client, self.post_url.clone(), &self.headers, self.auth.as_ref(), self.explicit_auth, &frame).await
     }
 
     async fn request_inner(&self, method: &str, params: Value, timeout: std::time::Duration) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        crate::core::shared::lock(&self.pending).insert(id, tx);
-        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(e) = self.post(frame).await {
-            crate::core::shared::lock(&self.pending).remove(&id);
-            return Err(e);
+        if crate::core::shared::lock(&self.reader).as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
+            return Err("mcp sse stream closed".into());
         }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let weak = self.self_weak.clone();
+        let cancel: CancelRequest = Box::new(move |request_id| {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+            runtime.spawn(async move {
+                let Some(transport) = weak.upgrade() else { return };
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": { "requestId": request_id, "reason": "client request cancelled" }
+                });
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), transport.post(frame)).await;
+            });
+        });
+        let (mut pending, rx) = PendingRequestGuard::insert(self.pending.clone(), id, Some(cancel));
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.post(frame).await?;
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(v)) => Ok(v),
+            Ok(Ok(v)) => {
+                pending.complete();
+                Ok(v)
+            }
             Ok(Err(_)) => Err("mcp sse stream closed".into()),
             Err(_) => Err(format!("mcp request {method} timed out")),
         }
@@ -170,68 +170,81 @@ impl SseTransport {
     }
 
     async fn close_inner(&self) {
-        if let Some(task) = self.reader.lock().await.take() {
+        if let Some(task) = crate::core::shared::lock(&self.reader).take() {
             task.abort();
         }
+        crate::core::shared::lock(&self.pending).clear();
     }
 }
 
-/// SSE 读循环：endpoint 事件交出 POST 地址；message 事件按 id 路由或应答 server 反向请求。
-async fn read_loop(
-    resp: reqwest::Response,
-    base: reqwest::Url,
-    pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
-    endpoint_tx: tokio::sync::oneshot::Sender<reqwest::Url>,
-    client: reqwest::Client,
-    headers: Vec<(String, String)>,
-    roots: Value,
-) {
-    let mut endpoint_tx = Some(endpoint_tx);
-    let mut post_url: Option<reqwest::Url> = None;
-    let mut parser = super::sse::SseParser::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
-        for ev in parser.feed(&chunk) {
-            match ev.event.as_deref().unwrap_or("message") {
-                "endpoint" => {
-                    // data 常为相对路径（/messages/?session_id=x），按 base join
-                    if let Ok(u) = base.join(ev.data.trim()) {
-                        post_url = Some(u.clone());
-                        if let Some(tx) = endpoint_tx.take() {
-                            let _ = tx.send(u);
-                        }
-                    }
-                }
-                _ => {
-                    let Ok(v) = serde_json::from_str::<Value>(&ev.data) else {
-                        continue;
-                    };
-                    if v.get("method").is_some() {
-                        // server 反向请求（roots/list）：应答帧 POST 回 endpoint
-                        if let (Some(rid), Some(url)) = (v.get("id").and_then(|i| i.as_u64()), post_url.clone()) {
-                            let answer = super::transport::answer_server_request(&v, rid, &roots);
-                            let mut req = client.post(url).json(&answer);
-                            for (k, val) in &headers {
-                                req = req.header(k, val);
-                            }
-                            tokio::spawn(async move {
-                                let _ = tokio::time::timeout(POST_TIMEOUT, req.send()).await;
-                            });
-                        }
-                        continue;
-                    }
-                    if let Some(id) = v.get("id").and_then(|i| i.as_u64())
-                        && let Some(tx) = crate::core::shared::lock(&pending).remove(&id)
-                    {
-                        let _ = tx.send(v);
-                    }
-                }
-            }
+impl Drop for SseTransport {
+    fn drop(&mut self) {
+        if let Some(task) = crate::core::shared::lock(&self.reader).take() {
+            task.abort();
         }
+        crate::core::shared::lock(&self.pending).clear();
     }
-    // 流断：挂起请求全部按失败结束（调用方走 lazy restart）
-    crate::core::shared::lock(&pending).clear();
+}
+
+fn decorate_request(
+    mut request: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+    auth: Option<&Arc<BearerAuth>>,
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(auth) = auth {
+        request = request.header(reqwest::header::AUTHORIZATION, auth.header_value());
+    }
+    request
+}
+
+async fn post_frame(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    headers: &[(String, String)],
+    auth: Option<&Arc<BearerAuth>>,
+    explicit_auth: bool,
+    frame: &Value,
+) -> Result<(), String> {
+    let status = send_frame(client, url.clone(), headers, auth, frame).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if explicit_auth {
+            return Err(format!("mcp sse post http {status}: configured Authorization header rejected"));
+        }
+        let Some(auth) = auth else {
+            return Err(oauth::err_auth_required(&format!("mcp sse post http {status}")));
+        };
+        auth.refresh().await.map_err(super::remote::refresh_failure)?;
+        let retry = send_frame(client, url, headers, Some(auth), frame).await?;
+        if retry == reqwest::StatusCode::UNAUTHORIZED || retry == reqwest::StatusCode::FORBIDDEN {
+            return Err(oauth::err_auth_required(&format!("mcp sse post http {retry} after token refresh")));
+        }
+        if !retry.is_success() {
+            return Err(format!("mcp sse post http {retry}"));
+        }
+        return Ok(());
+    }
+    if !status.is_success() {
+        return Err(format!("mcp sse post http {status}"));
+    }
+    Ok(())
+}
+
+async fn send_frame(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    headers: &[(String, String)],
+    auth: Option<&Arc<BearerAuth>>,
+    frame: &Value,
+) -> Result<reqwest::StatusCode, String> {
+    let send = decorate_request(client.post(url), headers, auth).json(frame).send();
+    tokio::time::timeout(POST_TIMEOUT, send)
+        .await
+        .map_err(|_| "mcp sse post timed out".to_string())?
+        .map(|response| response.status())
+        .map_err(|error| format!("mcp sse post: {error}"))
 }
 
 impl Transport for SseTransport {
@@ -251,3 +264,7 @@ impl Transport for SseTransport {
         "sse"
     }
 }
+
+#[cfg(test)]
+#[path = "remote_sse/tests.rs"]
+mod tests;

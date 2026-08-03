@@ -3,6 +3,18 @@
 use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 
+mod completion;
+#[cfg(test)]
+mod completion_tests;
+mod runtime;
+mod storage;
+pub use completion::{
+    CompletionAdmission, CompletionIdentity, CompletionOutcome, CompletionPhase, CompletionScore, CompletionUsage, GoalCompletionAttempt,
+    completion_lock,
+};
+pub use runtime::RuntimeBudget;
+pub use storage::{GoalPersistFailure, GoalPersistPhase};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalStatus {
@@ -63,6 +75,12 @@ pub struct Goal {
     pub turns_used: u32,
     #[serde(default)]
     pub tokens_used: u64,
+    /// 已发起但 Provider 未返回完整 usage 的调用。有限 token budget 下必须 fail closed。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unmetered_calls: u64,
+    /// 用户通过 adjust_budget 明确认领过的 UNKNOWN 调用数，保留审计但不再阻断后续执行。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub acknowledged_unmetered_calls: u64,
     #[serde(default)]
     pub last_block_reason: Option<String>,
     #[serde(default)]
@@ -80,6 +98,12 @@ pub struct Goal {
     /// 进入 Paused 的时刻（ms epoch）：resume 时结算进 paused_ms
     #[serde(default)]
     pub paused_at: Option<u64>,
+    /// Idempotency receipts for auxiliary Provider usage settlement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metering_receipts: Vec<String>,
+    /// Durable semantic transaction for one paid completion judge call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_attempt: Option<GoalCompletionAttempt>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -88,14 +112,29 @@ pub enum GoalError {
     InvalidTransition { from: GoalStatus, to: GoalStatus },
     #[error("contract incomplete: {0}")]
     ContractIncomplete(&'static str),
+    #[error("invalid budget: {0}")]
+    InvalidBudget(&'static str),
+    #[error("invalid goal id: {0}")]
+    InvalidId(String),
     #[error("goal not found: {0}")]
     NotFound(String),
+    #[error("goal storage error: {0}")]
+    Storage(String),
+    #[error("completion transaction conflict: {0}")]
+    CompletionConflict(String),
+    #[error("completion verification rejected: {0}")]
+    CompletionRejected(String),
+}
+
+pub fn checked_turn_budget(value: Option<u64>) -> Result<Option<u32>, GoalError> {
+    value.map(u32::try_from).transpose().map_err(|_| GoalError::InvalidBudget("turns exceeds u32::MAX"))
 }
 
 fn transitions(from: GoalStatus) -> &'static [GoalStatus] {
     use GoalStatus::*;
     match from {
-        Draft => &[Queued, Active, Canceled],
+        // Queued 仅为旧持久化记录的反序列化兼容态；新 Goal 没有 queue 入口。
+        Draft => &[Active, Canceled],
         Queued => &[Active, Canceled],
         Active => &[Paused, Complete, Blocked, BudgetLimited, Canceled],
         Paused => &[Active, Canceled],
@@ -107,6 +146,7 @@ fn transitions(from: GoalStatus) -> &'static [GoalStatus] {
 
 impl Goal {
     pub fn create(contract: GoalContract, id: String) -> Result<Self, GoalError> {
+        crate::core::ids::validate_id(&id).map_err(GoalError::InvalidId)?;
         if contract.objective.trim().is_empty() {
             return Err(GoalError::ContractIncomplete("objective is required"));
         }
@@ -123,6 +163,8 @@ impl Goal {
             activated_at: None,
             turns_used: 0,
             tokens_used: 0,
+            unmetered_calls: 0,
+            acknowledged_unmetered_calls: 0,
             last_block_reason: None,
             consecutive_blocks: 0,
             block_reason: None,
@@ -130,6 +172,8 @@ impl Goal {
             session_id: None,
             paused_ms: 0,
             paused_at: None,
+            metering_receipts: Vec::new(),
+            completion_attempt: None,
         })
     }
 
@@ -156,16 +200,30 @@ impl Goal {
     }
 
     pub fn resume(&mut self) -> Result<(), GoalError> {
+        // 预算不变时裸 resume 下一轮必然再次触顶。BudgetLimited 只能走
+        // adjust_budget_and_resume，确保先提高或确认预算再恢复执行。
+        if self.status == GoalStatus::BudgetLimited {
+            return Err(GoalError::InvalidTransition { from: self.status, to: GoalStatus::Active });
+        }
+        let resumed_from_blocked = self.status == GoalStatus::Blocked;
         // 结算本段暂停时长；Blocked/BudgetLimited resume 本无进行中的暂停
         if self.status == GoalStatus::Paused {
-            self.paused_ms += now_ms().saturating_sub(self.paused_at.unwrap_or_else(now_ms));
+            self.paused_ms = self.paused_ms.saturating_add(now_ms().saturating_sub(self.paused_at.unwrap_or_else(now_ms)));
             self.paused_at = None;
         }
-        self.transit(GoalStatus::Active)
+        self.transit(GoalStatus::Active)?;
+        if resumed_from_blocked {
+            self.consecutive_blocks = 0;
+            self.last_block_reason = None;
+            self.block_reason = None;
+        }
+        Ok(())
     }
 
     pub fn cancel(&mut self) -> Result<(), GoalError> {
-        self.transit(GoalStatus::Canceled)
+        self.transit(GoalStatus::Canceled)?;
+        self.completion_attempt = None;
+        Ok(())
     }
 
     pub fn complete(&mut self, evidence: &str) -> Result<(), GoalError> {
@@ -179,8 +237,11 @@ impl Goal {
     }
 
     /// 提高预算并恢复（BudgetLimited 唯一入口，goal.adjust RPC）：各已设维度提到 max(原限, 2x 已用)，
-    /// 保证 resume 后下一轮不会立刻再次超限（裸 resume 是无效操作的根因：已用量 >= 限额不变）。
+    /// 保证恢复后下一轮不会立刻再次超限（裸 resume 是无效操作的根因：已用量 >= 限额不变）。
     pub fn adjust_budget_and_resume(&mut self) -> Result<(), GoalError> {
+        if self.adjust_completion_without_budget()? {
+            return Ok(());
+        }
         if self.status != GoalStatus::BudgetLimited {
             return Err(GoalError::InvalidTransition { from: self.status, to: GoalStatus::Active });
         }
@@ -196,7 +257,10 @@ impl Goal {
         if let Some(w) = b.wall_clock_ms {
             b.wall_clock_ms = Some(w.max(elapsed.saturating_mul(2)));
         }
-        self.resume()
+        self.acknowledged_unmetered_calls = self.acknowledged_unmetered_calls.saturating_add(self.unmetered_calls);
+        self.unmetered_calls = 0;
+        self.adjust_completion_after_budget_limit();
+        self.transit(GoalStatus::Active)
     }
 
     /// 记录一轮推进；预算与阻塞三次规则在此。
@@ -204,8 +268,8 @@ impl Goal {
         if self.status != GoalStatus::Active {
             return Err(GoalError::InvalidTransition { from: self.status, to: GoalStatus::Active });
         }
-        self.turns_used += 1;
-        self.tokens_used += tokens;
+        self.turns_used = self.turns_used.saturating_add(1);
+        self.tokens_used = self.tokens_used.saturating_add(tokens);
         self.updated_at = now_ms();
 
         let b = &self.contract.budget;
@@ -215,7 +279,7 @@ impl Goal {
 
         if let Some(reason) = blocked_reason {
             let same = self.last_block_reason.as_deref() == Some(reason);
-            self.consecutive_blocks = if same { self.consecutive_blocks + 1 } else { 1 };
+            self.consecutive_blocks = if same { self.consecutive_blocks.saturating_add(1) } else { 1 };
             self.last_block_reason = Some(reason.to_string());
             if terminal || self.consecutive_blocks >= 3 {
                 self.block_reason = Some(reason.to_string());
@@ -227,98 +291,10 @@ impl Goal {
         }
         Ok(())
     }
+}
 
-    /// 有效 wall 耗时（ms）：Paused 区间不计入预算（P2-06），进行中的暂停即时扣除。
-    pub fn wall_elapsed_ms(&self, now: u64) -> Option<u64> {
-        let activated = self.activated_at?;
-        let open = if self.status == GoalStatus::Paused { now.saturating_sub(self.paused_at.unwrap_or(now)) } else { 0 };
-        Some(now.saturating_sub(activated).saturating_sub(self.paused_ms + open))
-    }
-
-    pub fn wall_over_budget(&self, now: u64) -> bool {
-        matches!((self.contract.budget.wall_clock_ms, self.wall_elapsed_ms(now)), (Some(limit), Some(elapsed)) if elapsed >= limit)
-    }
-
-    /// 当前时刻的 wall 超限判定（record_turn 与 P2-07 轮内检查点共用）。
-    pub fn wall_exceeded(&self) -> bool {
-        self.wall_over_budget(now_ms())
-    }
-
-    // --- 持久化 ---
-
-    pub fn save(&self, dir: &std::path::Path) -> crate::core::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{}.json", self.id));
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    pub fn load(dir: &std::path::Path, id: &str) -> Result<Self, GoalError> {
-        let path = dir.join(format!("{id}.json"));
-        let text = std::fs::read_to_string(&path).map_err(|_| GoalError::NotFound(id.to_string()))?;
-        serde_json::from_str(&text).map_err(|_| GoalError::ContractIncomplete("corrupt goal file"))
-    }
-
-    pub fn list(dir: &std::path::Path) -> Vec<Self> {
-        let mut out: Vec<Self> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-            .filter_map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok())
-            .collect();
-        out.sort_by_key(|g| std::cmp::Reverse(g.updated_at));
-        out
-    }
-    /// 当前焦点 goal（active/paused/blocked/budget_limited 中最近更新的一个），用于状态注入与 GUI 焦点显示。
-    pub fn focus(dir: &std::path::Path) -> Option<Self> {
-        Self::focus_for(dir, None)
-    }
-
-    /// session 粒度焦点：同 session 的活态 goal 优先，其次无归属的全局 goal。
-    /// 多会话并发时各推各的计数器，全局单例会互相误伤。
-    pub fn focus_for(dir: &std::path::Path, session_id: Option<&str>) -> Option<Self> {
-        let live = |g: &Self| matches!(g.status, GoalStatus::Active | GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::BudgetLimited);
-        let goals = Self::list(dir);
-        session_id
-            .and_then(|sid| goals.iter().find(|g| live(g) && g.session_id.as_deref() == Some(sid)))
-            .or_else(|| goals.iter().find(|g| live(g) && g.session_id.is_none()))
-            .cloned()
-    }
-
-    /// 会话删除连带：该 session 的活态 goal 标 Canceled（终态保留审计痕迹，不物理删除；
-    /// Complete/Canceled 等终态不动）。返回标记条数。
-    pub fn cancel_for_session(dir: &std::path::Path, session_id: &str) -> usize {
-        let mut n = 0;
-        for mut g in Self::list(dir) {
-            if g.session_id.as_deref() != Some(session_id) {
-                continue;
-            }
-            if g.cancel().is_ok() && g.save(dir).is_ok() {
-                n += 1;
-            }
-        }
-        n
-    }
-
-    pub fn remove_for_session(dir: &std::path::Path, session_id: &str) -> usize {
-        let mut removed = 0;
-        for goal in Self::list(dir) {
-            if goal.session_id.as_deref() != Some(session_id) {
-                continue;
-            }
-            if std::fs::remove_file(dir.join(format!("{}.json", goal.id))).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
-    }
-
-    pub fn restore_all(dir: &std::path::Path, goals: &[Self]) -> usize {
-        goals.iter().filter(|goal| goal.save(dir).is_ok()).count()
-    }
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// complete 证据最小校验（P2-05）：trim 后 >= 20 字符，且不能只是 done/ok 类占位词

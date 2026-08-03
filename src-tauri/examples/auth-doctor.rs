@@ -3,9 +3,9 @@
 use kxen_app::auth::{ProbeOutcome, credential::read_auth_file, credential::write_auth_file, probe_all};
 use kxen_app::core::paths;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = paths::auth_file();
-    let mut store = read_auth_file(&path);
+    let mut store = read_auth_file(&path)?;
     let outcomes = probe_all(&mut store, true);
     if let Err(e) = write_auth_file(&path, &store) {
         eprintln!("write auth.json failed: {e}");
@@ -24,4 +24,5 @@ fn main() {
         let expired = store.get(*provider).is_some_and(|c| c.is_expired());
         println!("{mark}  {display:28} ({provider}){}", if expired { "  [expired, will refresh]" } else { "" });
     }
+    Ok(())
 }

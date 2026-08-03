@@ -8,6 +8,7 @@ mod member_loop;
 mod member_wake;
 mod relay;
 mod spawn;
+mod storage;
 mod tasks;
 mod types;
 
@@ -34,7 +35,7 @@ fn _assert_resolve_send(mrm: &crate::llm::mrm::ModelResourceManager) {
 
 #[cfg(test)]
 mod tests {
-    use super::inbox::{append_inbox, drain_inbox};
+    use super::inbox::{append_inbox, claim_inbox_entries, drain_inbox};
     use super::tasks::{claim_task, complete_task, create_task};
     use super::*;
     use crate::core::event::EventBus;
@@ -59,7 +60,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kxen-team-{tag}-{}", std::process::id()));
         let sessions = dir.join("sessions");
         super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
-        let pending = Arc::new(crate::core::pending_queue::PendingQueues::new(dir.join("queues")));
+        let queues = dir.join("queues");
+        super::types::seed_test_session(&queues, "s1", PathBuf::from("/tmp").as_path());
+        let pending = Arc::new(crate::core::pending_queue::PendingQueues::new(queues));
         let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, Some(pending.clone()));
         (mgr, dir, pending)
     }
@@ -83,15 +86,16 @@ mod tests {
         let state = mgr.state_for("s1").unwrap();
         append_inbox(&state.dir, "a", "x", "hello").unwrap();
         let path = dir.join("s1/inboxes/a.json");
-        let mut content = std::fs::read_to_string(&path).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let mut content = String::from_utf8(valid.clone()).unwrap();
         content.push_str("not json\n");
         std::fs::write(&path, &content).unwrap();
         let before = std::fs::read(&path).unwrap();
         let error = drain_inbox(&state.dir, "a").expect_err("坏行必须阻止整批交付和清空");
-        assert!(error.contains("line 2"));
+        assert!(error.contains("parse inbox"));
         assert_eq!(std::fs::read(&path).unwrap(), before, "损坏 inbox 原件必须保持不变");
 
-        std::fs::write(&path, content.lines().next().unwrap().to_string() + "\n").unwrap();
+        std::fs::write(&path, valid).unwrap();
         let drained = drain_inbox(&state.dir, "a").unwrap();
         assert_eq!(drained, vec![("x".to_string(), "hello".to_string())]);
         assert!(drain_inbox(&state.dir, "a").unwrap().is_empty(), "修复后 drain 应清空");
@@ -170,13 +174,14 @@ mod tests {
         let state = mgr.state_for("s1").unwrap();
         mgr.send(&state, "worker1", "lead", "durable result").unwrap();
         let sessions = dir.join("sessions");
-        let meta_tmp = sessions.join("s1.json.tmp");
-        std::fs::create_dir_all(&meta_tmp).unwrap();
-
-        assert!(mgr.drain_lead_inbox("s1").is_err(), "meta 更新失败时本轮必须中止");
-        assert_eq!(crate::core::session::load_messages(&sessions, "s1").len(), 1, "JSONL 已越过真实 commit point");
-
-        std::fs::remove_dir(&meta_tmp).unwrap();
+        let delivery = claim_inbox_entries(&state.dir, "lead").unwrap();
+        let entry = &delivery.entries[0];
+        let part = crate::core::session::Part::Text { text: format!("[teammate {}] {}", entry.from, entry.text) };
+        let mut message = crate::core::session::new_message("s1", crate::core::session::Role::User, vec![part]);
+        message.id = entry.transcript_id.clone();
+        message.created_at = entry.at;
+        crate::core::session::append_message_idempotent(&sessions, &message).unwrap();
+        assert_eq!(crate::core::session::load_messages(&sessions, "s1").len(), 1);
         assert!(mgr.drain_lead_inbox("s1").unwrap().is_empty(), "历史已含该稳定 ID 时不得再次注入模型");
         assert_eq!(crate::core::session::load_messages(&sessions, "s1").len(), 1, "稳定 message id 重放不得重复追加");
         let _ = std::fs::remove_dir_all(&dir);
@@ -191,6 +196,8 @@ mod tests {
             plan_approval: false,
             prompt: String::new(),
             approved: true,
+            pending_verdict: None,
+            applied_verdict_id: None,
         });
     }
 
@@ -228,10 +235,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// restore：崩前活跃且 prompt 非空的成员重启 loop（重建取消/唤醒通道）；
-    /// 旧版落盘无 prompt 的成员降级 Shutdown（无任务上下文，重启等于失忆空跑）。
-    #[tokio::test]
-    async fn restore_restarts_prompted_members_only() {
+    /// restore：所有崩前活跃成员一律 Blocked，不从旧 brief 自动重跑 Provider/tool。
+    #[test]
+    fn restore_blocks_all_active_members_without_replay() {
         let dir = std::env::temp_dir().join(format!("kxen-team-restore-{}", std::process::id()));
         let session_dir = dir.join("s1");
         std::fs::create_dir_all(session_dir.join("inboxes")).unwrap();
@@ -249,13 +255,11 @@ mod tests {
         super::types::seed_test_session(&sessions, "s1", PathBuf::from("/tmp").as_path());
         let mgr = TeamManager::new(dir.clone(), deps(), EventBus::default(), sessions, None);
         let state = mgr.state_for("s1").unwrap();
-        // live：loop 重启（通道重建是 deterministic 信号；状态随后由 loop 自管）
-        assert!(lock(&state.cancels).contains_key("live"), "崩前活跃成员必须重建取消通道");
-        assert!(lock(&state.notifies).contains_key("live"), "崩前活跃成员必须重建唤醒通道");
-        // legacy：无 prompt 降级 Shutdown，不起 loop
-        let legacy = lock(&state.members).iter().find(|m| m.name == "legacy").unwrap().clone();
-        assert_eq!(legacy.status, MemberStatus::Shutdown);
-        assert!(!lock(&state.cancels).contains_key("legacy"));
+        assert!(lock(&state.members).iter().all(|member| member.status == MemberStatus::Blocked));
+        assert!(lock(&state.cancels).is_empty());
+        assert!(lock(&state.notifies).is_empty());
+        assert_eq!(state.active_loops.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(state.deps.agents.list("s1").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// 用户直发 teammate（RPC team.message）落 from="user"；lead LLM 工具 message 仍 from="lead"
@@ -312,11 +316,12 @@ mod tests {
         let approved = drain_inbox(&state.dir, "w").unwrap();
         assert_eq!(approved.len(), 1);
         assert!(approved[0].1.starts_with("[plan-verdict:approved]"), "approve 必须带结构化前缀: {}", approved[0].1);
-        assert!(super::member_wake::inbox_has_plan_approval(&approved), "前缀必须被批准侦测命中");
         let rejected = drain_inbox(&state.dir, "v").unwrap();
         assert!(rejected[0].1.starts_with("[plan-verdict:rejected]"));
         assert!(rejected[0].1.contains("too vague"), "reject 反馈必须保留");
-        assert!(!super::member_wake::inbox_has_plan_approval(&rejected), "reject 不得算批准");
+        let members = lock(&state.members);
+        assert!(members.iter().find(|member| member.name == "w").unwrap().approved);
+        assert!(!members.iter().find(|member| member.name == "v").unwrap().approved);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -18,6 +18,20 @@ fn statuses(state: &Arc<TeamState>) -> Vec<(u64, TeamTaskStatus)> {
     lock(&state.tasks).iter().map(|task| (task.id, task.status)).collect()
 }
 
+fn member(name: &str) -> super::super::types::Member {
+    super::super::types::Member {
+        name: name.into(),
+        role: "execution".into(),
+        model: crate::llm::ModelRef::new("p", "m"),
+        status: super::super::types::MemberStatus::Idle,
+        plan_approval: false,
+        prompt: String::new(),
+        approved: true,
+        pending_verdict: None,
+        applied_verdict_id: None,
+    }
+}
+
 #[tokio::test]
 async fn fail_task_cascades_to_pending_downstream() {
     let (state, dir) = state("fail");
@@ -106,7 +120,7 @@ async fn persist_writes_are_atomic_and_complete() {
     // P2-4 回归：config.json / tasks.json 走 tmp+rename——文件完整可解析、不留 .tmp 残骸
     let (state, dir) = state("persist");
     let t1 = create_task(&state, "root", vec![]).unwrap();
-    super::super::types::persist_config(&state).unwrap();
+    super::super::types::persist_config_locked(&state, &lock(&state.members)).unwrap();
     persist_tasks(&state).unwrap();
 
     let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(state.dir.join("config.json")).unwrap()).unwrap();
@@ -127,6 +141,8 @@ async fn reassign_returns_to_pool_and_complete_requires_in_progress() {
     // 未 claim 的任务：assignee 不匹配拒止
     assert!(complete_task(&state, "a", t1.id).await.is_err());
     assert!(claim_task(&state, "a").is_ok());
+    assert!(reassign_task(&state, t1.id, Some("ghost")).unwrap_err().contains("not found"));
+    lock(&state.members).push(member("b"));
     reassign_task(&state, t1.id, Some("b")).unwrap();
     let got = statuses(&state);
     assert!(got.contains(&(t1.id, TeamTaskStatus::Pending)));
@@ -152,8 +168,24 @@ fn create_rejects_unknown_self_duplicate_and_terminal_dependencies() {
 }
 
 #[test]
+fn task_id_exhaustion_fails_without_wrapping() {
+    let (state, dir) = state("id-exhaustion");
+    state.next_task_id.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(create_task(&state, "must not wrap", vec![]).unwrap_err(), "task id space exhausted");
+    assert!(lock(&state.tasks).is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn graph_validation_rejects_cycle_and_duplicate_ids() {
-    let task = |id, depends_on| TeamTask { id, title: format!("task-{id}"), status: TeamTaskStatus::Pending, assignee: None, depends_on };
+    let task = |id, depends_on| TeamTask {
+        id,
+        title: format!("task-{id}"),
+        status: TeamTaskStatus::Pending,
+        assignee: None,
+        depends_on,
+        attempt_id: None,
+    };
     assert!(validate_task_graph(&[task(1, vec![2]), task(2, vec![1])]).unwrap_err().contains("cycle"));
     assert!(validate_task_graph(&[task(1, vec![]), task(1, vec![])]).unwrap_err().contains("duplicate task id"));
 }
@@ -173,4 +205,84 @@ fn failed_member_finalizes_claims_and_downstream() {
     assert_eq!(tasks.iter().find(|task| task.id == child.id).unwrap().status, TeamTaskStatus::Failed);
     drop(tasks);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn task_persistence_precommit_rolls_back_and_postcommit_blocks() {
+    let (state, dir) = state("persistence-phases");
+    super::super::storage::inject_before_rename();
+    assert!(create_task(&state, "retryable", vec![]).is_err());
+    assert!(lock(&state.tasks).is_empty(), "precommit failure must roll back memory");
+    create_task(&state, "retryable", vec![]).unwrap();
+
+    super::super::storage::inject_parent_sync();
+    let error = create_task(&state, "visible", vec![]).unwrap_err();
+    assert!(error.contains("durability is indeterminate"));
+    assert_eq!(lock(&state.tasks).len(), 2, "postcommit failure keeps visible in-memory truth");
+    assert!(claim_task(&state, "worker").unwrap_err().contains("durability is indeterminate"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn only_one_concurrent_completion_claim_can_reach_hook() {
+    let (state, dir) = state("completion-claim");
+    let task = create_task(&state, "review", vec![]).unwrap();
+    let task_id = task.id;
+    claim_task(&state, "worker").unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let run = |attempt: &'static str| {
+        let state = state.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            super::completion::claim_completion(&state, "worker", task_id, attempt)
+        })
+    };
+    let first = run("attempt-one");
+    let second = run("attempt-two");
+    barrier.wait();
+    let results = [first.join().unwrap(), second.join().unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    let stored = lock(&state.tasks).iter().find(|candidate| candidate.id == task_id).unwrap().clone();
+    assert_eq!(stored.status, TeamTaskStatus::Completing);
+    assert!(matches!(stored.attempt_id.as_deref(), Some("attempt-one" | "attempt-two")));
+    assert!(cancel_task(&state, task_id).unwrap_err().contains("completion is in progress"));
+    assert!(reassign_task(&state, task_id, None).unwrap_err().contains("completion is in progress"));
+    assert!(lead_fail_task(&state, task_id, "race").unwrap_err().contains("completion is in progress"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn failed_completion_finalize_becomes_explicitly_resolvable_blocked_state() {
+    let (state, dir) = state("completion-finalize-failure");
+    let task = create_task(&state, "review", vec![]).unwrap();
+    claim_task(&state, "worker").unwrap();
+    super::completion::claim_completion(&state, "worker", task.id, "attempt-one").unwrap();
+    super::super::storage::inject_before_rename();
+
+    let error =
+        super::completion::settle_completion(&state, "worker", task.id, "attempt-one", TeamTaskStatus::Completed, false).unwrap_err();
+
+    assert!(error.contains("blocked for explicit resolution"), "{error}");
+    let stored = lock(&state.tasks).iter().find(|candidate| candidate.id == task.id).unwrap().clone();
+    assert_eq!(stored.status, TeamTaskStatus::Blocked);
+    assert_eq!(stored.attempt_id.as_deref(), Some("attempt-one"));
+    resolve_blocked_task(&state, task.id, "completed").unwrap();
+    assert_eq!(lock(&state.tasks).iter().find(|candidate| candidate.id == task.id).unwrap().status, TeamTaskStatus::Completed);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cancelled_member_blocks_an_unfinished_completion_attempt() {
+    let (state, dir) = state("completion-cancelled");
+    let task = create_task(&state, "review", vec![]).unwrap();
+    claim_task(&state, "worker").unwrap();
+    super::completion::claim_completion(&state, "worker", task.id, "attempt-cancelled").unwrap();
+
+    assert_eq!(block_member_completing_tasks(&state, "worker").unwrap(), vec![task.id]);
+    let stored = lock(&state.tasks).iter().find(|candidate| candidate.id == task.id).unwrap().clone();
+    assert_eq!(stored.status, TeamTaskStatus::Blocked);
+    assert_eq!(stored.attempt_id.as_deref(), Some("attempt-cancelled"));
+    std::fs::remove_dir_all(dir).ok();
 }

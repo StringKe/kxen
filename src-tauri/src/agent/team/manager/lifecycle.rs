@@ -52,10 +52,17 @@ impl TeamManager {
             Self::resume_when_idle(state, resume_members);
             return Err(format!("team session did not stop within {} ms", timeout.as_millis()));
         }
-        *lock(&state.members) = resume_members.clone();
-        if let Err(error) = super::super::types::persist_config(&state) {
+        let persisted = {
+            let mut members = lock(&state.members);
+            let original = members.clone();
+            *members = resume_members.clone();
+            super::super::types::commit_members(&state, &mut members, original)
+        };
+        if let Err(error) = persisted {
             state.quiescing.store(false, Ordering::Release);
-            Self::restart_members(&state, resume_members);
+            if super::super::types::ensure_available(&state).is_ok() {
+                Self::restart_members(&state, resume_members);
+            }
             return Err(format!("restore pre-delete team roster: {error}"));
         }
         let mut sessions = lock(&self.sessions);
@@ -68,7 +75,12 @@ impl TeamManager {
     fn restart_members(state: &Arc<TeamState>, members: Vec<super::super::types::Member>) {
         for member in members.into_iter().filter(|member| {
             !member.prompt.is_empty()
-                && !matches!(member.status, super::super::types::MemberStatus::Shutdown | super::super::types::MemberStatus::Failed)
+                && !matches!(
+                    member.status,
+                    super::super::types::MemberStatus::Blocked
+                        | super::super::types::MemberStatus::Shutdown
+                        | super::super::types::MemberStatus::Failed
+                )
         }) {
             Self::start_member_loop(state, member.name, member.role, member.prompt, member.model, member.approved);
         }
@@ -89,13 +101,16 @@ impl TeamManager {
             Self::wait_idle(&state).await;
             {
                 let mut members = lock(&state.members);
+                let original = members.clone();
                 *members = resume_members.clone();
-                if let Err(error) = super::super::types::persist_config_locked(&state, &members) {
+                if let Err(error) = super::super::types::commit_members(&state, &mut members, original) {
                     tracing::error!(session = state.session_id, %error, "resume team after delete timeout persist failed");
                 }
             }
             state.quiescing.store(false, Ordering::Release);
-            Self::restart_members(&state, resume_members);
+            if super::super::types::ensure_available(&state).is_ok() {
+                Self::restart_members(&state, resume_members);
+            }
         });
     }
 
@@ -105,6 +120,7 @@ impl TeamManager {
         let _registry = lock(&self.registry_lock);
         self.detach_session(session_id);
         lock(&self.restore_blocked).remove(session_id);
+        lock(&self.restore_paused).remove(session_id);
         let path = self.root.join(session_id);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {}
@@ -136,13 +152,17 @@ mod tests {
             plan_approval: false,
             prompt: "continue work".into(),
             approved: true,
+            pending_verdict: None,
+            applied_verdict_id: None,
         });
+        crate::agent::team::inbox::append_inbox(&state.dir, "worker", "lead", "must survive cancellation").unwrap();
+        let pending = crate::agent::team::inbox::claim_inbox_entries(&state.dir, "worker").unwrap();
         state.active_loops.store(1, Ordering::Release);
         let exiting = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             lock(&exiting.members)[0].status = crate::agent::team::types::MemberStatus::Shutdown;
-            crate::agent::team::types::persist_config(&exiting).unwrap();
+            crate::agent::team::types::persist_config_locked(&exiting, &lock(&exiting.members)).unwrap();
             exiting.active_loops.store(0, Ordering::Release);
             exiting.loops_idle.notify_waiters();
         });
@@ -151,6 +171,8 @@ mod tests {
         assert!(!lock(&manager.sessions).contains_key("ses_one"));
         let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("ses_one/config.json")).unwrap()).unwrap();
         assert_eq!(config["members"][0]["status"], "working", "recovery bundle 必须保留删除前可恢复状态");
+        let replay = crate::agent::team::inbox::claim_inbox_entries(&root.join("ses_one"), "worker").unwrap();
+        assert_eq!(replay.entries, pending.entries, "quiesce cancel 不得 ack 未完成的 member delivery");
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -1,6 +1,6 @@
 //! Anthropic SSE 流解析：text/thinking/tool_use 分片 -> 统一 Delta（tool_use 走 ChunkToolCall 累积）。
 
-use crate::llm::sse::SseFrame;
+use crate::llm::sse::{Projection, SseFrame};
 use crate::llm::tool::{ChunkFunction, ChunkToolCall};
 use crate::llm::types::Delta;
 use serde::Deserialize;
@@ -58,48 +58,64 @@ struct UsageMessage {
 /// 有状态投影：message_start 的 input_tokens 存到 message_delta 合并出完整 Usage。
 #[derive(Default)]
 struct DeltaParser {
-    input_seen: u64,
+    input_seen: Option<u64>,
 }
 
 impl DeltaParser {
-    fn delta_of(&mut self, frame: SseFrame) -> Option<Delta> {
-        let SseFrame::Data(data) = frame else { return None };
-        let event: SseEvent = serde_json::from_str(&data).ok()?;
+    fn delta_of(&mut self, frame: SseFrame) -> Projection {
+        let SseFrame::Data(data) = frame else {
+            return match frame {
+                SseFrame::Invalid(error) => Projection::Delta(Delta::Error(error)),
+                SseFrame::Done => Projection::Delta(Delta::Error("anthropic stream ended without message_stop".into())),
+                SseFrame::Data(_) => unreachable!(),
+            };
+        };
+        if let Some(error) = crate::llm::sse::payload_error("anthropic", &data) {
+            return Projection::Delta(Delta::Error(error));
+        }
+        let event: SseEvent = match serde_json::from_str(&data) {
+            Ok(event) => event,
+            Err(error) => return Projection::Delta(Delta::Error(format!("anthropic invalid SSE payload: {error}"))),
+        };
         match event.kind.as_str() {
             "message_start" => {
                 if let Some(input) = event.message.and_then(|m| m.usage).and_then(|u| u.input_tokens) {
-                    self.input_seen = input;
+                    self.input_seen = Some(input);
                 }
-                None
+                Projection::Ignore
             }
-            "message_delta" => event.usage.and_then(|u| u.output_tokens).map(|output| Delta::Usage { input: self.input_seen, output }),
+            "message_delta" => match (self.input_seen, event.usage.and_then(|usage| usage.output_tokens)) {
+                (Some(input), Some(output)) => Projection::Delta(Delta::Usage { input, output }),
+                _ => Projection::Ignore,
+            },
+            "message_stop" => Projection::Complete(None),
             "content_block_start" => {
-                let block = event.content_block?;
+                let Some(block) = event.content_block else { return Projection::Ignore };
                 if block.kind != "tool_use" {
-                    return None;
+                    return Projection::Ignore;
                 }
-                Some(Delta::ToolFragments(vec![ChunkToolCall {
+                Projection::Delta(Delta::ToolFragments(vec![ChunkToolCall {
                     index: event.index,
                     id: block.id,
                     function: Some(ChunkFunction { name: block.name.map(|n| super::anthropic::unmap_tool_name(&n)), arguments: None }),
                 }]))
             }
             "content_block_delta" => {
-                let delta = event.delta?;
+                let Some(delta) = event.delta else { return Projection::Ignore };
                 match delta.kind.as_deref() {
-                    Some("text_delta") => delta.text.map(Delta::Text),
-                    Some("thinking_delta") => delta.text.map(Delta::Reasoning),
-                    Some("input_json_delta") => delta.partial_json.map(|json| {
-                        Delta::ToolFragments(vec![ChunkToolCall {
+                    Some("text_delta") => delta.text.map_or(Projection::Ignore, |text| Projection::Delta(Delta::Text(text))),
+                    Some("thinking_delta") => delta.text.map_or(Projection::Ignore, |text| Projection::Delta(Delta::Reasoning(text))),
+                    Some("input_json_delta") => delta.partial_json.map_or(Projection::Ignore, |json| {
+                        Projection::Delta(Delta::ToolFragments(vec![ChunkToolCall {
                             index: event.index,
                             id: None,
                             function: Some(ChunkFunction { name: None, arguments: Some(json) }),
-                        }])
+                        }]))
                     }),
-                    _ => None,
+                    _ => Projection::Ignore,
                 }
             }
-            _ => None,
+            _ => Projection::Ignore,
         }
     }
 }
@@ -128,8 +144,8 @@ mod tests {
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" /tmp\"}"}}"#.into(),
         ));
         let mut acc = ToolCallAccumulator::default();
-        for d in [start, d1, d2].into_iter().flatten() {
-            if let Delta::ToolFragments(f) = d {
+        for projection in [start, d1, d2] {
+            if let Projection::Delta(Delta::ToolFragments(f)) = projection {
                 acc.push(&f);
             }
         }
@@ -143,12 +159,12 @@ mod tests {
     #[test]
     fn usage_merges_input_from_message_start() {
         let mut p = DeltaParser::default();
-        assert!(
-            p.delta_of(SseFrame::Data(r#"{"type":"message_start","message":{"usage":{"input_tokens":321,"output_tokens":1}}}"#.into()))
-                .is_none()
-        );
+        assert!(matches!(
+            p.delta_of(SseFrame::Data(r#"{"type":"message_start","message":{"usage":{"input_tokens":321,"output_tokens":1}}}"#.into())),
+            Projection::Ignore
+        ));
         let u = p.delta_of(SseFrame::Data(r#"{"type":"message_delta","usage":{"output_tokens":42}}"#.into()));
-        assert!(matches!(u, Some(Delta::Usage { input: 321, output: 42 })));
+        assert!(matches!(u, Projection::Delta(Delta::Usage { input: 321, output: 42 })));
     }
 
     #[test]
@@ -156,9 +172,25 @@ mod tests {
         let mut p = DeltaParser::default();
         let t =
             p.delta_of(SseFrame::Data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"pong"}}"#.into()));
-        assert!(matches!(t, Some(Delta::Text(s)) if s == "pong"));
+        assert!(matches!(t, Projection::Delta(Delta::Text(s)) if s == "pong"));
         let r =
             p.delta_of(SseFrame::Data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"hmm"}}"#.into()));
-        assert!(matches!(r, Some(Delta::Reasoning(s)) if s == "hmm"));
+        assert!(matches!(r, Projection::Delta(Delta::Reasoning(s)) if s == "hmm"));
+    }
+
+    #[test]
+    fn missing_input_usage_is_not_reported_as_zero() {
+        let mut parser = DeltaParser::default();
+        let usage = parser.delta_of(SseFrame::Data(r#"{"type":"message_delta","usage":{"output_tokens":42}}"#.into()));
+        assert!(matches!(usage, Projection::Ignore));
+    }
+
+    #[test]
+    fn message_stop_is_the_only_success_terminal() {
+        let mut parser = DeltaParser::default();
+        assert!(matches!(parser.delta_of(SseFrame::Data(r#"{"type":"message_stop"}"#.into())), Projection::Complete(None)));
+        assert!(
+            matches!(parser.delta_of(SseFrame::Data("{".into())), Projection::Delta(Delta::Error(error)) if error.contains("invalid SSE"))
+        );
     }
 }

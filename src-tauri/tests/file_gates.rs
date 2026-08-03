@@ -31,6 +31,19 @@ fn rustfmt_gate() {
     );
 }
 
+/// 原始 chat stream 只允许出现在统一治理层和主 Agent loop。
+/// 其余功能必须走 managed API，避免漏掉 budget、RPM、并发、usage 与 circuit。
+#[test]
+fn llm_stream_governance_gate() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.join("src");
+    let mut offenders = Vec::new();
+    visit_raw_llm_calls(&root, &root, &mut offenders);
+    let examples = manifest.join("examples");
+    visit_raw_llm_calls(&examples, &examples, &mut offenders);
+    assert!(offenders.is_empty(), "以下文件绕过 LLM 资源治理层:\n{}", offenders.join("\n"));
+}
+
 fn visit(dir: &Path, exts: &[&str], max: usize, offenders: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -43,6 +56,32 @@ fn visit(dir: &Path, exts: &[&str], max: usize, offenders: &mut Vec<String>) {
             if lines > max {
                 offenders.push(format!("{path:?}: {lines} 行"));
             }
+        }
+    }
+}
+
+fn visit_raw_llm_calls(dir: &Path, root: &Path, offenders: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            visit_raw_llm_calls(&path, root, offenders);
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        if relative == Path::new("llm/managed.rs") || relative == Path::new("agent/agent_loop/run.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains("LlmClient::stream_dispatch") {
+            offenders.push(relative.display().to_string());
         }
     }
 }

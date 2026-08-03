@@ -5,6 +5,16 @@ use kxen_app::core::pending_queue::{PendingQueues, file_path};
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("kxen-pq-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    for id in ["s1", "s2", "user", "scheduled", "ses_one"] {
+        let meta = serde_json::json!({
+            "id": id,
+            "title": id,
+            "directory": "/tmp",
+            "created_at": 1,
+            "updated_at": 1
+        });
+        std::fs::write(dir.join(format!("{id}.json")), serde_json::to_vec(&meta).unwrap()).unwrap();
+    }
     dir
 }
 
@@ -104,6 +114,19 @@ fn release_returns_in_flight_to_queue_head() {
 }
 
 #[test]
+fn interrupt_replacement_is_next_without_discarding_older_queue() {
+    let dir = tmp_dir("interrupt-next");
+    let q = PendingQueues::new(dir.clone());
+    q.enqueue("s1", "older one".into(), vec![], vec![]).unwrap();
+    q.enqueue("s1", "older two".into(), vec![], vec![]).unwrap();
+    q.enqueue_next("s1", "interrupt replacement".into(), vec![], vec![]).unwrap();
+
+    assert_eq!(q.texts("s1"), vec!["interrupt replacement", "older one", "older two"]);
+    assert_eq!(q.claim("s1").unwrap().unwrap().text, "interrupt replacement");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn clear_removes_memory_and_disk() {
     let dir = tmp_dir("clear");
     let q = PendingQueues::new(dir.clone());
@@ -116,6 +139,22 @@ fn clear_removes_memory_and_disk() {
 }
 
 #[test]
+fn clear_queued_preserves_the_in_flight_delivery() {
+    let dir = tmp_dir("clear-waiting");
+    let q = PendingQueues::new(dir.clone());
+    q.enqueue("s1", "running".into(), vec![], vec![]).unwrap();
+    q.enqueue("s1", "waiting".into(), vec![], vec![]).unwrap();
+    let running = q.claim("s1").unwrap().unwrap();
+
+    assert_eq!(q.clear_queued("s1").unwrap(), 1);
+    assert!(q.texts("s1").is_empty());
+    assert_eq!(q.claim("s1").unwrap().unwrap().id, running.id);
+    assert!(q.acknowledge("s1", &running.id).unwrap());
+    assert!(!file_path(&dir, "s1").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn invalid_session_id_is_rejected_before_disk() {
     let dir = tmp_dir("badid");
     let before = std::fs::read_dir(&dir).unwrap().count();
@@ -123,6 +162,18 @@ fn invalid_session_id_is_rejected_before_disk() {
     assert!(q.enqueue("../escape", "x".into(), vec![], vec![]).is_err(), "路径穿越 id 必须拒");
     assert!(!q.has_queued("../escape"));
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before, "拒绝发生在落盘之前");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn enqueue_cannot_recreate_queue_after_session_meta_is_deleted() {
+    let dir = tmp_dir("deleted-session");
+    std::fs::remove_file(dir.join("s1.json")).unwrap();
+    let q = PendingQueues::new(dir.clone());
+
+    let error = q.enqueue("s1", "late".into(), vec![], vec![]).unwrap_err();
+    assert!(error.contains("session unavailable"));
+    assert!(!file_path(&dir, "s1").exists());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -144,12 +195,157 @@ fn recovery_preserves_delivery_id() {
         "s1",
         kxen_app::core::pending_queue::QueuedMessage {
             id: "queue-stable".into(),
+            created_at: 1,
             text: "recovered".into(),
             context: vec![],
             images: vec![],
+            schedule_job_id: None,
         },
     )
     .unwrap();
     assert_eq!(q.claim("s1").unwrap().unwrap().id, "queue-stable");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn recovery_preserves_delivery_creation_time_for_idempotent_session_append() {
+    let dir = tmp_dir("stable-created-at");
+    let queue = PendingQueues::new(dir.clone());
+    queue.enqueue("s1", "recovered".into(), vec![], vec![]).unwrap();
+    let expected = queue.claim("s1").unwrap().unwrap();
+
+    let restored = PendingQueues::new(dir.clone());
+    assert!(restored.restore().contains(&"s1".to_string()));
+    let actual = restored.claim("s1").unwrap().unwrap();
+
+    assert_eq!(actual.id, expected.id);
+    assert_eq!(actual.created_at, expected.created_at);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn crash_after_session_append_replays_and_acknowledges_exactly_once() {
+    let dir = tmp_dir("append-before-ack");
+    let session = kxen_app::core::session::create(&dir, "/tmp").unwrap();
+    let queue = PendingQueues::new(dir.clone());
+    queue.enqueue(&session.id, "once".into(), vec![], vec![]).unwrap();
+    let first = queue.claim(&session.id).unwrap().unwrap();
+    let mut message = kxen_app::core::session::new_message(
+        &session.id,
+        kxen_app::core::session::Role::User,
+        vec![kxen_app::core::session::Part::Text { text: first.text.clone() }],
+    );
+    message.id = first.id.clone();
+    message.created_at = first.created_at;
+    kxen_app::core::session::append_message_idempotent_durable(&dir, &message).unwrap();
+
+    let restored = PendingQueues::new(dir.clone());
+    assert!(restored.restore().contains(&session.id));
+    let replay = restored.claim(&session.id).unwrap().unwrap();
+    assert_eq!(replay.id, first.id);
+    assert_eq!(replay.created_at, first.created_at);
+    let mut replayed = kxen_app::core::session::new_message(
+        &session.id,
+        kxen_app::core::session::Role::User,
+        vec![kxen_app::core::session::Part::Text { text: replay.text.clone() }],
+    );
+    replayed.id = replay.id.clone();
+    replayed.created_at = replay.created_at;
+    kxen_app::core::session::append_message_idempotent_durable(&dir, &replayed).unwrap();
+    assert!(restored.acknowledge(&session.id, &replay.id).unwrap());
+    assert_eq!(kxen_app::core::session::load_messages_checked(&dir, &session.id).unwrap().len(), 1);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn schedule_origin_is_structured_and_survives_restore() {
+    let dir = tmp_dir("schedule-origin");
+    let schedule_file = dir.join("schedule.json");
+    // SAFETY: this integration-test binary has no other schedule users, and the
+    // isolated path is set before the schedule store is initialized.
+    unsafe { std::env::set_var("KXEN_SCHEDULE_FILE", schedule_file) };
+    let queue = PendingQueues::new(dir.clone());
+    queue.enqueue("user", "[cron cron_fake] user text".into(), vec![], vec![]).unwrap();
+    assert_eq!(queue.claim("user").unwrap().unwrap().schedule_job_id, None, "text must not grant schedule identity");
+
+    queue
+        .enqueue_existing(
+            "scheduled",
+            kxen_app::core::pending_queue::QueuedMessage {
+                id: "queue-scheduled".into(),
+                created_at: 1,
+                text: "display text".into(),
+                context: vec![],
+                images: vec![],
+                schedule_job_id: Some("cron_real".into()),
+            },
+        )
+        .unwrap();
+    let restored = PendingQueues::new(dir.clone());
+    assert!(restored.restore().contains(&"scheduled".to_string()));
+    assert_eq!(restored.claim("scheduled").unwrap().unwrap().schedule_job_id.as_deref(), Some("cron_real"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn corrupt_queue_blocks_mutation_without_overwriting_evidence() {
+    let dir = tmp_dir("corrupt");
+    let path = file_path(&dir, "s1");
+    std::fs::write(&path, "{not json").unwrap();
+    let queue = PendingQueues::new(dir.clone());
+
+    assert!(queue.restore().is_empty());
+    assert_eq!(queue.blocked().len(), 1);
+    assert!(queue.has_queued("s1"), "blocked queue must prevent a competing run");
+    assert!(queue.enqueue("s1", "new".into(), vec![], vec![]).unwrap_err().contains("blocked"));
+    assert!(queue.clear("s1").unwrap_err().contains("blocked"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn external_commit_failure_rolls_back_durable_queue_item() {
+    let dir = tmp_dir("commit-rollback");
+    let queue = PendingQueues::new(dir.clone());
+    let item = kxen_app::core::pending_queue::QueuedMessage {
+        id: "queue-cron-stable".into(),
+        created_at: 1,
+        text: "cron".into(),
+        context: vec![],
+        images: vec![],
+        schedule_job_id: None,
+    };
+
+    let error = queue.enqueue_existing_committed("s1", item, || Err("schedule persist failed".into())).unwrap_err();
+    assert!(error.contains("schedule persist failed"));
+    assert!(!queue.has_queued("s1"));
+    assert!(!file_path(&dir, "s1").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn delete_tombstone_rejects_new_queue_items_but_allows_recovery_replay() {
+    let dir = tmp_dir("deleting");
+    let queue = PendingQueues::new(dir.clone());
+    let guard = kxen_app::core::session_recovery::begin_deletion(&dir, "ses_one").unwrap();
+    let error = queue.enqueue("ses_one", "late".into(), vec![], vec![]).unwrap_err();
+    assert!(error.contains("deletion in progress"));
+    assert!(!queue.has_queued("ses_one"));
+
+    queue
+        .enqueue_existing(
+            "ses_one",
+            kxen_app::core::pending_queue::QueuedMessage {
+                id: "queue-recovery".into(),
+                created_at: 1,
+                text: "preserved".into(),
+                context: vec![],
+                images: vec![],
+                schedule_job_id: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(queue.texts("ses_one"), vec!["preserved"]);
+    guard.finish().unwrap();
+    std::fs::remove_dir_all(dir).ok();
 }

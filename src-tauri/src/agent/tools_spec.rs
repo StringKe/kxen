@@ -91,11 +91,11 @@ pub fn core_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "goal",
-            "Manage durable goals with a completion contract. Actions: create (requires BOTH objective and completion_criteria strings; constraints/budget optional; the response contains the new goal id), activate/pause/resume/cancel/get (require id - always take it from a create or list response, never invent one), complete (requires id AND concrete verification evidence, min 20 chars, not a placeholder like 'done'), list (no params). Goals persist across turns; same block reason 3 turns in a row escalates to blocked.",
+            "Manage durable goals with a completion contract. Actions: create (requires BOTH objective and completion_criteria strings; constraints/budget optional; the response contains the new goal id), activate/pause/resume/cancel/get (require id - always take it from a create or list response, never invent one), adjust (requires a budget_limited id; raises/acknowledges budget before resuming), complete (requires id AND concrete verification evidence, min 20 chars, not a placeholder like 'done'), list (no params). Goals persist across turns; same block reason 3 turns in a row escalates to blocked. Never use resume for budget_limited; use adjust.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["create", "get", "activate", "pause", "resume", "complete", "cancel", "list"] },
+                    "action": { "type": "string", "enum": ["create", "get", "activate", "pause", "resume", "adjust", "complete", "cancel", "list"] },
                     "id": { "type": "string", "description": "Goal id from create/list response" },
                     "objective": { "type": "string", "description": "REQUIRED for create: what must become true" },
                     "completion_criteria": { "type": "string", "description": "REQUIRED for create: the observable proof of done, e.g. 'head -1 README.md prints # kxen'" },
@@ -191,11 +191,11 @@ pub fn core_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "team",
-            "Lead an agent team. spawn (name, role, prompt, model? as provider/model, plan_approval?) creates a teammate with its own context and model; message (name, text) sends to its inbox; approve/reject (name, feedback?) answers a plan approval request; shutdown (name); task_create (title, depends_on?); task_cancel (id) cancels a non-completed task; task_fail (id, reason?) marks a non-terminal task as failed and cascades to pending dependents; task_reassign (id, to?) returns a task to the pool and optionally notifies a new owner; list shows members and tasks. Teammates report back automatically - do not poll. Example: {\"action\":\"spawn\",\"name\":\"a\",\"role\":\"execution\",\"model\":\"anthropic/claude-sonnet-4-5-20250929\",\"prompt\":\"task brief\"}.",
+            "Lead an agent team. spawn creates a teammate; message sends to its inbox; approve/reject answers a plan request; resume requires a new recovery prompt for a crash-blocked teammate; shutdown stops a teammate; task_create/cancel/fail/reassign manage work; task_resolve explicitly confirms a crash-blocked completion as completed or reopens it without replaying the old hook; list shows members and tasks. Teammates report back automatically - do not poll.",
             json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["spawn", "message", "approve", "reject", "shutdown", "list", "task_create", "task_cancel", "task_fail", "task_reassign"] },
+                    "action": { "type": "string", "enum": ["spawn", "message", "approve", "reject", "resume", "shutdown", "list", "task_create", "task_cancel", "task_fail", "task_reassign", "task_resolve"] },
                     "name": { "type": "string" },
                     "role": { "type": "string", "enum": ["thinking", "planning", "execution", "review", "research", "observer"], "description": "observer = receives copies of all team traffic" },
                     "prompt": { "type": "string", "description": "REQUIRED for spawn: the teammate's standing task brief (never 'text')" },
@@ -205,9 +205,10 @@ pub fn core_tools() -> Vec<ToolDefinition> {
                     "feedback": { "type": "string" },
                     "title": { "type": "string" },
                     "depends_on": { "type": "array", "items": { "type": "integer" } },
-                    "id": { "type": "integer", "description": "task id for task_cancel/task_fail/task_reassign" },
+                    "id": { "type": "integer", "description": "task id for task_cancel/task_fail/task_reassign/task_resolve" },
                     "reason": { "type": "string", "description": "why the task failed (for task_fail)" },
-                    "to": { "type": "string", "description": "optional teammate to notify on task_reassign" }
+                    "to": { "type": "string", "description": "optional teammate to notify on task_reassign" },
+                    "resolution": { "type": "string", "enum": ["completed", "reopen"], "description": "explicit outcome for task_resolve" }
                 },
                 "required": ["action"]
             }),

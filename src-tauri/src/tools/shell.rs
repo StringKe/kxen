@@ -1,6 +1,7 @@
 //! 隔离的 fresh shell：不加载 login/rc 文件，也不回放用户 alias/function。
-//! 每条宿主机命令都必须先经过显式审批；这里仅提供稳定 PATH 与 trash 遮蔽。
+//! 包装层重复执行 safety 判定，避免无意绕过上层 gate 的直调路径。
 
+use crate::tools::safety::{Verdict, evaluate_shell_command};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,10 +25,15 @@ impl ShellKind {
 
 /// 把用户命令包装为「稳定 PATH + cd + 命令遮蔽 + 命令」的 fresh shell 调用。
 pub fn wrap_command(kind: ShellKind, workdir: &str, command: &str) -> Vec<String> {
+    if let Verdict::Deny { rule_id, reason, suggestion } = evaluate_shell_command(command, workdir) {
+        let hint = suggestion.map(|value| format!(" Suggestion: {value}")).unwrap_or_default();
+        let message = format!("blocked by safety rule {rule_id}: {reason}.{hint}");
+        let script = format!("printf '%s\\n' {} >&2\nexit 126", shell_escape(&message));
+        return vec![kind.binary().to_string(), "-c".to_string(), script];
+    }
     let script = format!(
-        "{path}\n{shadow}\n{speed}\ncd -- {workdir}\n{command}",
+        "{path}\n{speed}\ncd -- {workdir}\n{command}",
         path = path_setup(kind),
-        shadow = trash_shadow(kind),
         speed = speed_shadow(kind),
         workdir = shell_escape(workdir),
         command = command,
@@ -42,29 +48,8 @@ fn path_setup(kind: ShellKind) -> &'static str {
     }
 }
 
-/// rm -> trash 遮蔽（grok-build marker 门控模式）：过滤 rm 的 flags，文件列表进回收站。
-/// 探测到 /usr/bin/trash 缺失时遮蔽仍生效但只报明确错误并拒绝执行：
-/// fail-closed，宁可 rm 不可用也绝不放行真 rm（与 delete 工具同一口径，见 fs_tool::TRASH_MISSING）。
-fn trash_shadow(kind: ShellKind) -> String {
-    trash_shadow_for(kind, crate::tools::fs_tool::trash_available())
-}
-
-fn trash_shadow_for(kind: ShellKind, available: bool) -> String {
-    if !available {
-        let msg = crate::tools::fs_tool::TRASH_MISSING;
-        return match kind {
-            ShellKind::Fish => format!("function rm; echo '{msg}' >&2; return 1; end"),
-            _ => format!("rm() {{ echo '{msg}' >&2; return 1; }}"),
-        };
-    }
-    match kind {
-        ShellKind::Fish => "function rm; for a in $argv; switch $a; case '-*'; ; case '*'; command trash $a; end; end; end".into(),
-        _ => "rm() { local args=(); for a in \"$@\"; do case \"$a\" in -*) ;; *) args+=(\"$a\");; esac; done; command trash \"${args[@]}\"; }".into(),
-    }
-}
-
 /// 提速遮蔽（grok-build 实证）：grep -> ugrep、find -> bfs，两者都是 CLI 兼容替换。
-/// 未安装不遮蔽（按 PATH 探测逐命令门控），与 rm->trash 的硬遮蔽不同——trash 是系统自带。
+/// 未安装不遮蔽（按 PATH 探测逐命令门控）。
 fn speed_shadow(kind: ShellKind) -> String {
     match kind {
         ShellKind::Fish => "if command -vq ugrep; function grep; command ugrep $argv; end; end; if command -vq bfs; function find; command bfs $argv; end; end".into(),
@@ -85,7 +70,6 @@ mod tests {
         let wrapped = wrap_command(ShellKind::Zsh, "/tmp/x", "ls -la");
         assert_eq!(wrapped[0], "/bin/zsh");
         let script = &wrapped[2];
-        assert!(script.contains("command trash"), "should contain trash shadow");
         assert!(script.contains("ugrep"), "should contain grep->ugrep shadow");
         assert!(script.contains("bfs"), "should contain find->bfs shadow");
         assert!(script.contains("cd -- '/tmp/x'"));
@@ -101,20 +85,31 @@ mod tests {
     }
 
     #[test]
-    fn trash_shadow_missing_is_fail_closed() {
-        for kind in [ShellKind::Zsh, ShellKind::Fish] {
-            let shadow = trash_shadow_for(kind, false);
-            assert!(shadow.contains("/usr/bin/trash"), "缺失分支必须给出指明原因的错误文案");
-            assert!(!shadow.contains("command trash"), "缺失分支不得再调用不存在的 trash");
+    fn permanent_delete_is_blocked_again_at_shell_boundary() {
+        let commands = ["rm ./a", "command /bin/rm ./a", "env /usr/bin/unlink ./a", "find . -delete", "sh -c 'rmdir ./a'"];
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            for command in commands {
+                let wrapped = wrap_command(kind, "/tmp", command);
+                assert!(wrapped[2].contains("exit 126"), "shell boundary must fail closed: {kind:?}: {command}");
+                assert!(wrapped[2].contains("delete tool"), "error must guide callers to the recoverable tool");
+                assert!(!wrapped[2].ends_with(command), "blocked command must not be appended to the generated script");
+            }
         }
-        // zsh 缺失分支实跑：rm 被拒、错误进 stderr、无语法错误
-        let shadow = trash_shadow_for(ShellKind::Zsh, false);
-        let out = std::process::Command::new("/bin/zsh")
-            .args(["-c", &format!("{shadow}\nrm /tmp/kxen-should-not-delete")])
-            .output()
-            .expect("run zsh");
-        assert!(!out.status.success(), "trash 缺失时 rm 必须失败而不是静默放行");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("/usr/bin/trash"));
+    }
+
+    #[test]
+    fn blocked_shell_script_does_not_delete_the_target() {
+        let dir = std::env::temp_dir().join(format!("kxen-shell-delete-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("keep.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let command = format!("/bin/rm {}", shell_escape(&target.to_string_lossy()));
+        let wrapped = wrap_command(ShellKind::Zsh, dir.to_str().unwrap(), &command);
+        let out = std::process::Command::new(&wrapped[0]).args(&wrapped[1..]).output().expect("run zsh");
+        assert_eq!(out.status.code(), Some(126));
+        assert!(target.exists(), "fail-closed wrapper must preserve the target");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("delete tool"));
+        trash::delete(&dir).ok();
     }
 
     #[test]

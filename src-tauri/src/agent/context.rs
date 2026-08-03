@@ -98,7 +98,7 @@ fn file_block(path: &str, workdir: &Path, allowed: Option<&HashSet<PathBuf>>) ->
         );
     }
     let mut bytes = Vec::with_capacity(size);
-    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
+    if let Err(e) = std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, (FILE_CAP + 1) as u64), &mut bytes) {
         return (format!("\n<file_content path=\"{rel}\">(read failed: {e})</file_content>\n"), Some(format!("{rel}（{e}）")));
     }
     if bytes.len() > FILE_CAP {
@@ -163,14 +163,8 @@ pub async fn fetch_image_url(url: &str) -> Option<crate::llm::types::ImagePart> 
     if !mime.starts_with("image/") {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
-    if bytes.len() > 5 * 1024 * 1024 {
-        return None;
-    }
-    Some(crate::llm::types::ImagePart {
-        media_type: mime,
-        data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
-    })
+    let bytes = crate::net_response::bytes(resp, 5 * 1024 * 1024, "context image").await.ok()?;
+    Some(crate::llm::types::ImagePart { media_type: mime, data: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes) })
 }
 
 #[cfg(test)]

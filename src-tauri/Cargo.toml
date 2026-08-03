@@ -45,7 +45,6 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 futures = "0.3"
 tokio-tungstenite = "0.26"
-keyring = "4"
 dirs = "6"
 base64 = "0.22"
 time = { version = "0.3", features = ["parsing", "formatting"] }

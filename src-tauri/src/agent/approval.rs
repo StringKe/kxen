@@ -4,8 +4,26 @@
 //! 测试移至 tests/approval_broker.rs（350 行门禁）。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
 use tokio::sync::oneshot;
+
+tokio::task_local! {
+    /// 仅约束当前 task 内尚未作出决定的审批等待。`tokio::spawn` 不继承 task-local，
+    /// 因而显式移交给 durable lifecycle 的后台工作不会被原连接误取消。
+    static WAIT_CANCELLATION: crate::agent::cancel::CancelToken;
+}
+
+/// 给当前 future 内的 Approval wait 绑定一个生命周期取消令牌。
+///
+/// 取消只让尚在等待的审批 fail closed；一旦 Allow 已赢得 broker 终态，调用方继续
+/// 执行提交段，不应再因承载该 RPC 的连接消失而被强制 drop。
+pub async fn scope_wait_cancellation<F>(token: crate::agent::cancel::CancelToken, future: F) -> F::Output
+where
+    F: Future,
+{
+    WAIT_CANCELLATION.scope(token, future).await
+}
 
 /// 审批三态：超时可与主动拒绝区分（文案/遥测），放行语义只认 Allow。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +60,17 @@ pub struct ApprovalBroker {
     bus: Option<crate::core::event::EventBus>,
     /// 决定落盘目录（None = 不落盘：测试与无主会话场景的默认）
     sessions_dir: Option<std::path::PathBuf>,
+}
+
+struct WaitCleanup<'a> {
+    broker: &'a ApprovalBroker,
+    id: &'a str,
+}
+
+impl Drop for WaitCleanup<'_> {
+    fn drop(&mut self) {
+        self.broker.cancel_waiter(self.id);
+    }
 }
 
 // 手动 Default：derive 会把 Duration 置零（0 秒超时 = 所有审批立即超时拒绝）。
@@ -98,6 +127,14 @@ impl ApprovalBroker {
         }
     }
 
+    /// 等待 future 被连接生命周期取消时摘除 pending，receiver drop 后绝不能留下可被误判为可放行的审批。
+    fn cancel_waiter(&self, id: &str) {
+        let entry = crate::core::shared::lock(&self.pending).remove(id);
+        let Some(entry) = entry else { return };
+        self.persist_decision(&entry.session_id, &entry.command, &entry.reason, "cancel");
+        self.publish_resolved(id, &entry.session_id, "cancelled");
+    }
+
     /// 登记一条审批：返回 (id, 等待句柄)。session_id 记归属，cancel_session 按会话清场。
     pub fn register(&self, session_id: &str, command: &str, reason: &str) -> (String, oneshot::Receiver<bool>) {
         let id = crate::core::ids::new_id("appr");
@@ -109,12 +146,17 @@ impl ApprovalBroker {
         (id, rx)
     }
 
-    /// 等待中审批快照：会话重载时前端拉取恢复等待卡（broker 仍在等应答，卡片不该随刷新消失）。
-    pub fn list_pending(&self) -> Vec<PendingApproval> {
+    /// 等待中审批快照：Some(session) 只返回该会话；None 只返回无会话归属的全局审批。
+    /// 全局与 Session 恢复面必须互斥，否则同一 approval 会在 Layout 和时间线重复展示。
+    pub fn list_pending(&self, session_id: Option<&str>) -> Vec<PendingApproval> {
         self.pending
             .lock()
             .expect("approvals")
             .iter()
+            .filter(|(_, entry)| match session_id {
+                Some(session_id) => entry.session_id == session_id,
+                None => entry.session_id.is_empty(),
+            })
             .map(|(id, e)| PendingApproval {
                 id: id.clone(),
                 command: e.command.clone(),
@@ -158,6 +200,7 @@ impl ApprovalBroker {
     /// 等待决定：respond/timeout/cancel/abort 竞争同一 pending map entry，只有摘除成功者能决定、发布和落盘。
     /// 若 timeout/abort 醒来时 entry 已被 respond/cancel_session 摘除，必须等待其 oneshot 结果，不能自造矛盾终态。
     pub async fn wait(&self, id: &str, rx: oneshot::Receiver<bool>, cancel: Option<&crate::agent::cancel::CancelToken>) -> ApprovalOutcome {
+        let _cleanup = WaitCleanup { broker: self, id };
         enum Wake {
             Response(Result<bool, oneshot::error::RecvError>),
             Aborted,
@@ -165,17 +208,24 @@ impl ApprovalBroker {
         }
         let mut rx = rx;
         let timeout = tokio::time::sleep(self.timeout);
+        let scoped_cancel = WAIT_CANCELLATION.try_with(Clone::clone).ok();
+        let cancelled = async {
+            match (cancel, scoped_cancel.as_ref()) {
+                (Some(explicit), Some(scoped)) => tokio::select! {
+                    _ = explicit.wait() => {},
+                    _ = scoped.wait() => {},
+                },
+                (Some(explicit), None) => explicit.wait().await,
+                (None, Some(scoped)) => scoped.wait().await,
+                (None, None) => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(timeout);
-        let wake = match cancel {
-            Some(token) => tokio::select! {
-                response = &mut rx => Wake::Response(response),
-                _ = token.wait() => Wake::Aborted,
-                _ = &mut timeout => Wake::Timeout,
-            },
-            None => tokio::select! {
-                response = &mut rx => Wake::Response(response),
-                _ = &mut timeout => Wake::Timeout,
-            },
+        tokio::pin!(cancelled);
+        let wake = tokio::select! {
+            response = &mut rx => Wake::Response(response),
+            _ = &mut cancelled => Wake::Aborted,
+            _ = &mut timeout => Wake::Timeout,
         };
         match wake {
             Wake::Response(Ok(true)) => ApprovalOutcome::Allow,

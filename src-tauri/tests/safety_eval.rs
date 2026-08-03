@@ -28,9 +28,10 @@ fn f1_system() {
 
 #[test]
 fn macos_temp_exempt() {
-    assert!(allowed("rm -rf /private/var/folders/qb/xxx/T/test"));
-    assert!(allowed("rm -rf /private/tmp/foo"));
-    assert!(allowed("rm -rf /tmp/foo"));
+    assert!(denied("rm -rf /private/var/folders/qb/xxx/T/test"));
+    assert!(denied("rm -rf /private/tmp/foo"));
+    assert!(denied("rm -rf /tmp/foo"));
+    assert!(allowed("trash /private/tmp/foo"));
     assert!(denied("rm -rf /private/etc"));
     assert!(denied("rm -rf /private/var/db"));
 }
@@ -66,7 +67,8 @@ fn f2_home() {
     assert!(denied("rm -rf ~"));
     assert!(denied("rm -rf ~/Documents"));
     assert!(denied("trash ~/.ssh"));
-    assert!(allowed("rm ~/Documents/draft.txt"));
+    assert!(denied("rm ~/Documents/draft.txt"));
+    assert!(allowed("trash ~/Documents/draft.txt"));
 }
 
 #[test]
@@ -91,6 +93,72 @@ fn f4_destroy() {
 fn f5_bypass() {
     assert!(denied("bash -c \"rm -rf /usr\""));
     assert!(denied("rm -rf $DIR/"));
+}
+
+#[test]
+fn permanent_delete_commands_are_rejected_in_every_spelling() {
+    let cases = [
+        "rm ./artifact.txt",
+        "command rm -rf ./dist",
+        "env MODE=ci /bin/rm ./artifact.txt",
+        "env -S 'rm ./artifact.txt'",
+        "/usr/bin/rmdir ./empty-dir",
+        "/usr/bin/unlink ./artifact.txt",
+        "find ./target -delete",
+        "/usr/bin/find ./target -type f -delete",
+        "find ./target -exec rm -f {} +",
+        "find ./target -ok /bin/rm -f {} +",
+        "printf '%s\\0' ./artifact.txt | xargs -0 rm -f",
+        "xargs -a ./paths.txt /bin/rm -f",
+        "bash -c 'rm -rf ./dist'",
+        "bash -lc 'rm -rf ./dist'",
+        "bash --norc -c 'rm -rf ./dist'",
+        "sh -c '\"$@\"' _ rm ./artifact.txt",
+        "/bin/sh -c \"command /bin/rm ./artifact.txt\"",
+        "env -i zsh -c 'unlink ./artifact.txt'",
+        "if test -e ./artifact.txt; then /bin/rm ./artifact.txt; fi",
+        "(command rm ./artifact.txt)",
+        "TARGET=./artifact.txt; CMD=rm; $CMD $TARGET",
+        "eval 'rm ./artifact.txt'",
+        "nohup rm ./artifact.txt",
+        "nice -n 5 rm ./artifact.txt",
+        "time -p rm ./artifact.txt",
+        "timeout -k 1 5 rm ./artifact.txt",
+        "setsid rm ./artifact.txt",
+        "busybox rm ./artifact.txt",
+        "exec /bin/rm ./artifact.txt",
+        "sudo -u root /bin/rm ./artifact.txt",
+        "printf 'rm ./artifact.txt\\n' | sh",
+        "printf 'rm ./artifact.txt\\n' | dash",
+        "source ./cleanup.sh",
+        ". ./cleanup.sh",
+    ];
+
+    for command in cases {
+        let verdict = evaluate_shell_command(command, CWD);
+        match verdict {
+            Verdict::Deny { reason, suggestion, .. } => {
+                assert!(reason.contains("不可恢复"), "拒绝原因需说明风险: {command}: {reason}");
+                assert!(suggestion.is_some_and(|value| value.contains("delete tool")), "须引导使用 delete tool: {command}");
+            }
+            other => panic!("不可恢复删除必须 fail closed: {command}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn non_executing_delete_mentions_remain_allowed() {
+    for command in [
+        "printf '%s\\n' 'rm ./artifact.txt'",
+        "command -v rm",
+        "find . -name delete",
+        "printf '%s\\0' ./artifact.txt | xargs -0 echo rm",
+        "bash -c 'printf %s rm'",
+        "bash --version",
+        "bash -n ./cleanup.sh",
+    ] {
+        assert!(allowed(command), "只把删除命令当数据使用时不应误拦: {command}");
+    }
 }
 
 #[test]
@@ -121,7 +189,10 @@ fn f2_credential_list_matches_path_policy() {
 #[test]
 fn trash_recoverable() {
     assert!(matches!(evaluate_shell_command("trash ./dist", CWD), Verdict::Recoverable));
+    assert!(matches!(evaluate_shell_command("find ./dist -exec trash {} +", CWD), Verdict::Recoverable));
     assert!(denied("trash .git"));
+    assert!(denied("find .git -exec trash {} +"));
+    assert!(denied("find \"$HOME/.ssh\" -exec trash {} +"));
     assert!(denied("trash ~/.ssh"));
 }
 

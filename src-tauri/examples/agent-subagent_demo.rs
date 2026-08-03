@@ -14,7 +14,7 @@ async fn main() {
     std::fs::write(workdir.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
 
     let auth_path = kxen_app::core::paths::auth_file();
-    let mut store = kxen_app::auth::credential::read_auth_file(&auth_path);
+    let mut store = kxen_app::auth::credential::read_auth_file(&auth_path).expect("read auth store");
     kxen_app::auth::probe_all(&mut store, true);
 
     let config = kxen_app::core::config::Config::load(&kxen_app::core::paths::config_dir().join("config.toml"), None).unwrap();
@@ -36,12 +36,17 @@ async fn main() {
         team: None,
         team_identity: None,
         session_id: None,
+        bound_goal_id: None,
+        goal_binding_frozen: false,
         agents: None,
         bus: None,
         approvals: None,
         mcp: None,
         lsp: None,
         notify: None,
+        persist_compaction: None,
+        auxiliary_usage: Arc::default(),
+        usage_reporter: None,
         loop_detector: kxen_app::agent::loop_detect::LoopDetector::new(),
         on_event: Arc::new(|event| match event {
             AgentEvent::Text { text } => print!("{text}"),

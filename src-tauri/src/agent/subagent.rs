@@ -27,6 +27,18 @@ pub struct SubagentDeps {
     pub approvals: Option<Arc<crate::agent::approval::ApprovalBroker>>,
     pub mcp: Option<Arc<crate::mcp::McpManager>>,
     pub lsp: Option<Arc<crate::lsp::LspManager>>,
+    pub stream_override: Option<crate::llm::StreamFn>,
+    pub usage_reporter: Option<crate::agent::agent_loop::UsageReporter>,
+}
+
+#[derive(Debug)]
+pub struct DispatchResult {
+    pub name: String,
+    pub degraded_note: Option<String>,
+    pub answer: String,
+    /// run 最后一次真实尝试使用的模型和账号；账号可能在 retry 时轮转。
+    pub model: crate::llm::ModelRef,
+    pub degraded_from: Option<String>,
 }
 
 impl SubagentDeps {
@@ -46,6 +58,8 @@ impl SubagentDeps {
             approvals: ctx.approvals.clone(),
             mcp: ctx.mcp.clone(),
             lsp: ctx.lsp.clone(),
+            stream_override: ctx.stream_override.clone(),
+            usage_reporter: ctx.usage_reporter.clone(),
         })
     }
 }
@@ -158,12 +172,7 @@ fn parse_frontmatter(text: &str) -> (std::collections::HashMap<String, String>, 
 /// agent 派发：角色 -> mrm 路由 model -> 独立子 loop -> (定名, 降级标注, 结果) 回传；
 /// 定名给 background 拼完成通知，kind 统一进活动注册表供 UI 多窗格展示。
 /// 降级标注 = mrm 状态注入：主绑定不可用（限流/满载）时给调用方一句可回执的说明，让编排模型看得见降级。
-pub async fn dispatch(
-    role: &str,
-    prompt: String,
-    deps: &SubagentDeps,
-    kind: AgentKind,
-) -> Result<(String, Option<String>, String), String> {
+pub async fn dispatch(role: &str, prompt: String, deps: &SubagentDeps, kind: AgentKind) -> Result<DispatchResult, String> {
     // 未知 role 显式报错：静默回落只读会把实现类任务做成"跑完但没改"，比直接报错更难被发现
     if !role_exists(role, &deps.workdir) {
         return Err(format!(
@@ -171,12 +180,12 @@ pub async fn dispatch(
         ));
     }
     let agent = role_agent_for(role, &deps.workdir);
-    // 原子 acquire：resolve 与占槽一体，杜绝并发派发时同 provider 超发；grant 持槽整轮
-    let grant = deps.mrm.acquire_role(role, &deps.store).await.ok_or_else(|| format!("no available model for role {role}"))?;
+    // 派发只选择模型；每次实际请求由 child context 重新做 admission、RPM 和并发占槽。
+    let resolved = deps.mrm.resolve(role, &deps.store).await.ok_or_else(|| format!("no available model for role {role}"))?;
 
-    let model = match grant.resolved.account.clone() {
-        Some(acc) => crate::llm::ModelRef::with_account(grant.resolved.provider.clone(), grant.resolved.model.clone(), acc),
-        None => crate::llm::ModelRef::new(grant.resolved.provider.clone(), grant.resolved.model.clone()),
+    let model = match resolved.account.clone() {
+        Some(acc) => crate::llm::ModelRef::with_account(resolved.provider.clone(), resolved.model.clone(), acc),
+        None => crate::llm::ModelRef::new(resolved.provider.clone(), resolved.model.clone()),
     };
     let allowed = agent.permission.allowed_tools();
     let session_id = deps.session_id.clone().unwrap_or_else(|| "default".into());
@@ -206,7 +215,7 @@ pub async fn dispatch(
         model: model.clone(),
         store: deps.store.clone(),
         max_turns: agent.max_turns,
-        mrm: None,
+        mrm: Some(deps.mrm.clone()),
         allowed_tools: if allowed.is_empty() { None } else { Some(allowed) },
         // 与父 run 同 session 共享 extras（todo/deferred 工具互通）；deps.extras 为 None（无 session 上下文）给临时实例
         extras: Some(deps.extras.clone().unwrap_or_default()),
@@ -215,13 +224,18 @@ pub async fn dispatch(
         team: None,
         team_identity: None,
         session_id: Some(session_id.clone()),
+        bound_goal_id: None,
+        goal_binding_frozen: false,
         agents: Some(deps.agents.clone()),
         bus: Some(deps.bus.clone()),
         approvals: deps.approvals.clone(),
         mcp: deps.mcp.clone(),
         lsp: deps.lsp.clone(),
         notify: None, // 子代理不开通知通道：不嵌套派发（background 只从主会话发起）
-        stream_override: None,
+        persist_compaction: None,
+        auxiliary_usage: Arc::default(),
+        usage_reporter: deps.usage_reporter.clone(),
+        stream_override: deps.stream_override.clone(),
         loop_detector: crate::agent::loop_detect::LoopDetector::new(),
         on_event: {
             let bus = deps.bus.clone();
@@ -244,10 +258,10 @@ pub async fn dispatch(
         },
     };
 
-    let degraded_note = grant.resolved.degraded_from.as_ref().map(|from| {
+    let degraded_note = resolved.degraded_from.as_ref().map(|from| {
         format!(
             "degraded: role '{from}' primary binding unavailable (rate limit or capacity); ran on {}/{}",
-            grant.resolved.provider, grant.resolved.model
+            resolved.provider, resolved.model
         )
     });
     let mut system_prompt = crate::agent::prompt::subagent_prompt(&agent.name, &agent.prompt, crate::core::config::coding_rules_enabled());
@@ -259,24 +273,12 @@ pub async fn dispatch(
     }
     let mut messages = vec![Message::system(system_prompt), Message::user(prompt)];
     let outcome = run_turn(&mut child, &mut messages).await;
-    record_outcome(deps, &model.provider, &outcome).await;
     deps.agents.set_status(
         &session_id,
         &name,
         if outcome.aborted { crate::agent::activity::ActivityStatus::Shutdown } else { crate::agent::activity::ActivityStatus::Done },
     );
-    drop(grant);
-    Ok((name, degraded_note, outcome.final_text))
-}
-
-/// 子代理终态记账：aborted（手动 abort / 父级级联取消）豁免熔断统计——
-/// 用户主动停止不是 provider 故障，连续 abort 计入失败会误触熔断（与 run.rs 主路径同口径）。
-async fn record_outcome(deps: &SubagentDeps, provider: &str, outcome: &crate::agent::agent_loop::AgentOutcome) {
-    if outcome.aborted {
-        return;
-    }
-    let success = matches!(outcome.terminal, crate::agent::agent_loop::AgentEvent::Done { .. });
-    deps.mrm.record_result(provider, success).await;
+    Ok(DispatchResult { name, degraded_note, answer: outcome.final_text, model: child.model, degraded_from: resolved.degraded_from })
 }
 
 #[cfg(test)]

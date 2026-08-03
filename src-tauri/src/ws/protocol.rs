@@ -1,31 +1,33 @@
-//! JSON-RPC 3.0 协议帧（KrishnaPG 提案 + kxen 增补 reqId/resId/seq/complete）。
-//! 全部帧带 "jsonrpc":"3.0"；流帧身份只在 stream.id（无根 id）。
-//! 2.0 向后兼容：无版本字段的帧按 2.0 处理。
+//! JSON-RPC 3.0 协议帧（KrishnaPG 提案 + kxen 增补 resId/seq）。
+//! 服务端帧统一返回 "jsonrpc":"3.0"；流帧身份只在 stream.id（无根 id）。
+//! 入站兼容显式 2.0 与缺版本字段的旧请求。
 
 use kxen_app::core::shared::now_ms;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 pub const VERSION: &str = "3.0";
 
-/// 客户端 -> 服务端：请求（2.0 兼容：jsonrpc 字段可缺省）。
-#[derive(Debug, Deserialize)]
+/// 客户端 -> 服务端：完成结构校验后的请求。
+#[derive(Debug)]
 pub struct Request {
     pub id: Value,
     pub method: String,
-    #[serde(default)]
     pub params: Value,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub options: Option<RequestOptions>,
+    pub options: RequestOptions,
+    pub version: RequestVersion,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default)]
 pub struct RequestOptions {
-    /// 3.0 规范字段（请求方期望流式响应）。当前所有支持流的方法默认流式，保留备查。
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub stream: bool,
+    /// `None` 区分未声明与显式 false，3.0 订阅必须显式请求 stream。
+    pub stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestVersion {
+    Compat2,
+    V3,
 }
 
 /// 服务端 -> 客户端：响应。
@@ -57,6 +59,16 @@ impl Response {
     pub fn err(id: Value, code: i64, message: impl Into<String>) -> Self {
         Self { jsonrpc: VERSION, res_id: res_id(), id, result: None, error: Some(RpcError { code, message: message.into(), data: None }) }
     }
+
+    pub fn err_with_data(id: Value, code: i64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            jsonrpc: VERSION,
+            res_id: res_id(),
+            id,
+            result: None,
+            error: Some(RpcError { code, message: message.into(), data: Some(data) }),
+        }
+    }
 }
 
 /// 流元数据（服务端 -> 客户端 chunk 的身份）。
@@ -83,13 +95,10 @@ impl StreamChunk {
 
 /// 错误码（2.0 标准 + kxen 扩展段；规范表面，未全用属正常）。
 pub const PARSE_ERROR: i64 = -32700;
-#[allow(dead_code)]
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
-#[allow(dead_code)]
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
-#[allow(dead_code)]
 pub const STREAM_NOT_FOUND: i64 = -32801;
 
 /// RPC 调用失败：携带 JSON-RPC 错误码。unknown method 必须回 METHOD_NOT_FOUND（-32601）：
@@ -97,18 +106,43 @@ pub const STREAM_NOT_FOUND: i64 = -32801;
 pub struct CallError {
     pub code: i64,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl CallError {
     pub fn method_not_found(method: &str) -> Self {
-        Self { code: METHOD_NOT_FOUND, message: format!("unknown method: {method}") }
+        Self { code: METHOD_NOT_FOUND, message: format!("unknown method: {method}"), data: Some(serde_json::json!({ "method": method })) }
+    }
+
+    pub fn invalid_params(method: &str, field: &str, expected: &str, received: &str) -> Self {
+        Self {
+            code: INVALID_PARAMS,
+            message: format!("invalid params for {method}: {field} must be {expected}"),
+            data: Some(serde_json::json!({
+                "method": method,
+                "field": field,
+                "expected": expected,
+                "received": received,
+            })),
+        }
+    }
+}
+
+pub fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
 /// 各 handler 的 String/&str 错误一律按内部错误处理。
 impl From<String> for CallError {
     fn from(message: String) -> Self {
-        Self { code: INTERNAL_ERROR, message }
+        Self { code: INTERNAL_ERROR, message, data: None }
     }
 }
 
@@ -150,6 +184,10 @@ mod tests {
         let v = serde_json::to_value(&err).unwrap();
         assert_eq!(v["error"]["code"], METHOD_NOT_FOUND);
         assert!(v.get("result").is_none());
+
+        let err = Response::err_with_data(serde_json::json!(3), INVALID_PARAMS, "bad", serde_json::json!({ "field": "id" }));
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["error"]["data"]["field"], "id");
     }
 
     #[test]
@@ -158,6 +196,7 @@ mod tests {
         assert_eq!(not_found.code, METHOD_NOT_FOUND);
         assert_eq!(not_found.code, -32601);
         assert!(not_found.message.contains("nope"));
+        assert_eq!(not_found.data.unwrap()["method"], "nope");
 
         let internal = CallError::from("boom".to_string());
         assert_eq!(internal.code, INTERNAL_ERROR);

@@ -15,6 +15,7 @@ mod store;
 pub use render::render;
 pub(crate) use render::render_with_runtime;
 pub use scan::scan;
+pub(crate) use store::add_observed;
 pub use store::{add, list, move_entry, remove, set_enabled};
 
 use serde::{Deserialize, Serialize};
@@ -163,12 +164,13 @@ pub fn slugify(text: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-');
+    let truncated = trimmed.chars().count() > 48;
     let capped: String = trimmed.chars().take(48).collect();
     let capped = capped.trim_end_matches('-');
     if capped.is_empty() {
         return "note".to_string();
     }
-    if !has_cjk {
+    if !has_cjk && !truncated {
         return capped.to_string();
     }
     // CJK slug 追加哈希后缀（取未截断原文的 sha256 前 4 字节）：同文同 slug（覆盖写可定位），
@@ -285,5 +287,15 @@ mod tests {
             assert!(body.chars().count() <= 48, "slug 体截断上限: {s}");
             assert!(!body.ends_with('-'), "截断残尾不收 -: {s}");
         }
+    }
+
+    #[test]
+    fn slugify_long_ascii_truncation_still_unique() {
+        let prefix = "a".repeat(55);
+        let first = slugify(&format!("{prefix}-first"));
+        let second = slugify(&format!("{prefix}-second"));
+        assert_ne!(first, second);
+        assert!(first.len() > 48 && second.len() > 48);
+        assert_eq!(slugify("short-ascii-note"), "short-ascii-note", "short ASCII slugs keep compatibility");
     }
 }

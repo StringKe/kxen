@@ -8,6 +8,7 @@ pub mod knowledge;
 pub mod llm;
 pub mod lsp;
 pub mod mcp;
+pub(crate) mod net_response;
 pub mod providers;
 pub mod tools;
 pub mod voice;

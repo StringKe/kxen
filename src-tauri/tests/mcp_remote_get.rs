@@ -5,7 +5,7 @@ mod common;
 
 use common::json_rpc::{http_response, json_frame};
 use kxen_app::mcp::client::McpClient;
-use kxen_app::mcp::config::{RemoteConfig, RemoteKind, ServerConfig};
+use kxen_app::mcp::config::{ConfigScope, RemoteConfig, RemoteKind, ServerConfig};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -78,6 +78,9 @@ fn route_post(body: &str, answer_tx: &Sender<Value>) -> String {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     match method {
         "initialize" => {
+            if v.pointer("/params/capabilities/roots").is_some() {
+                return http_response("400 Bad Request", None, "", "");
+            }
             let result = json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": { "tools": {} },
@@ -177,6 +180,7 @@ fn remote_config(url: &str) -> ServerConfig {
         transport: RemoteKind::Http,
         headers: HashMap::new(),
         oauth: None,
+        scope: ConfigScope::Personal,
     })
 }
 
@@ -199,10 +203,20 @@ async fn get_stream_roots_list_roundtrip_and_close_cancels() {
         assert!(gets[0].accept.as_deref().unwrap_or("").contains("text/event-stream"), "GET 必须声明收 SSE");
     }
 
-    // server 推送 roots/list（id 7）：应答帧应 POST 回来且内容正确
-    let answer = mock.answers.recv_timeout(Duration::from_secs(5)).expect("roots/list 应答应到达");
+    // Remote 未宣告 roots capability；恶意/误配 server 仍发 roots/list 时必须回空，不泄漏 workspace 路径。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let answer = loop {
+        match mock.answers.try_recv() {
+            Ok(answer) => break answer,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("roots/list 应答 channel 不应断开"),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(std::time::Instant::now() < deadline, "roots/list 应答应到达");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
     assert_eq!(answer.get("id").and_then(|i| i.as_u64()), Some(7));
-    assert_eq!(answer.pointer("/result/roots"), Some(&json!([{ "uri": "file:///tmp/ws", "name": "/tmp/ws" }])));
+    assert_eq!(answer.pointer("/result/roots"), Some(&json!([])));
 
     // GET 流不替代 POST 通道：工具调用仍走 POST 内联读应答
     let out = client.call("echo", &json!({ "text": "hi" })).await.unwrap();

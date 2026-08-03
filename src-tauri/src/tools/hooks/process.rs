@@ -86,8 +86,7 @@ pub(super) async fn run(
 async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> String {
     let mut captured = Vec::new();
     let mut buffer = [0_u8; 2048];
-    loop {
-        let Ok(count) = stderr.read(&mut buffer).await else { break };
+    while let Ok(count) = stderr.read(&mut buffer).await {
         if count == 0 {
             break;
         }

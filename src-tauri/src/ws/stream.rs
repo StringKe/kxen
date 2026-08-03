@@ -2,8 +2,8 @@
 //! 全部走订阅流：命中 topic 的订阅流 chunk（result 携带 {topic, payload}）。
 //! run 增量只经 llm.delta 下发：chunk 必须带 topic，前端按 topic 匹配消费，无 topic 的帧会被丢弃。
 //!
-//! 会话 ACL：带 session_id 的 LlmDelta 只发给订阅了 `session:<id>` topic 的连接
-//! （别的会话的增量是越权信息）；无 session_id 的全局事件（voice、审批）行为不变。
+//! 会话 ACL：带 session_id 的 LlmDelta 只发给订阅了 `session:<id>` topic 的连接。
+//! 无 session_id 的审批走独立 `approval.global`，由 App 常驻消费，不混入 Session 时间线。
 
 use serde_json::Value;
 
@@ -17,6 +17,13 @@ pub(super) fn event_to_chunks(
 ) -> Vec<StreamChunk> {
     use kxen_app::core::event::Event;
     match event {
+        Event::LlmDelta(payload) if is_global_approval(&payload) => {
+            let Some(binding) = subs.iter().find(|binding| binding.topics.contains("approval.global")) else {
+                return Vec::new();
+            };
+            let seq = sequences.next(&binding.stream_id);
+            vec![StreamChunk::new(&binding.stream_id, seq, serde_json::json!({ "topic": "approval.global", "payload": payload }))]
+        }
         Event::LlmDelta(payload) => {
             // 连接级判定：本连接的订阅里没有 session:<id> 就一帧都不发
             if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
@@ -41,6 +48,10 @@ pub(super) fn event_to_chunks(
             vec![StreamChunk::new(&binding.stream_id, seq, serde_json::json!({ "topic": topic, "payload": payload }))]
         }
     }
+}
+
+fn is_global_approval(payload: &Value) -> bool {
+    payload.get("session_id").is_none() && matches!(payload.get("kind").and_then(Value::as_str), Some("approval" | "approval.resolved"))
 }
 
 fn map_event(event: kxen_app::core::event::Event) -> (&'static str, Value) {
@@ -98,9 +109,26 @@ mod tests {
         let event = delta(Some("s1"));
         assert_eq!(event_to_chunks(event.clone(), &with, &mut StreamSequences::default()).len(), 1);
         assert!(event_to_chunks(event, &without, &mut StreamSequences::default()).is_empty());
-        // 全局事件（voice/审批，无 session_id）：行为不变，照常吃 llm.delta
+        // 普通无 session_id 的全局 delta 仍照常吃 llm.delta
         let chunks = event_to_chunks(delta(None), &without, &mut StreamSequences::default());
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn global_approval_uses_dedicated_topic_without_session_duplication() {
+        let event = kxen_app::core::event::Event::LlmDelta(serde_json::json!({
+            "kind": "approval", "approval_id": "appr-1", "command": "cmd", "reason": "r",
+        }));
+        let both = vec![binding(&["approval.global"]), binding(&["llm.delta", "session:s1"])];
+        let chunks = event_to_chunks(event, &both, &mut StreamSequences::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].result["topic"], "approval.global");
+
+        let session_only = vec![binding(&["llm.delta", "session:s1"])];
+        let resolved = kxen_app::core::event::Event::LlmDelta(serde_json::json!({
+            "kind": "approval.resolved", "approval_id": "appr-1", "outcome": "timeout",
+        }));
+        assert!(event_to_chunks(resolved, &session_only, &mut StreamSequences::default()).is_empty());
     }
 
     /// 订了别的会话不等于订了本会话（越权不泄露）

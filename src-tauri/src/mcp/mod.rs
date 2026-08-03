@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod config;
+mod lifecycle;
 pub mod oauth;
 pub mod oauth_flow;
 pub mod oauth_store;
@@ -12,13 +13,14 @@ mod remote;
 mod remote_get;
 mod remote_sse;
 mod sse;
+mod stdio_approval;
 pub mod tools;
 mod transport;
 
 use self::client::{McpClient, McpTool};
-use self::config::{PolicySet, ServerConfig, ToolPolicy};
+use self::config::{PolicySet, ServerConfig, StdioConfig, ToolPolicy};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// MCP 工具输出上限（字符）：单条 tool result 不许吃爆 context。
@@ -62,6 +64,8 @@ pub struct ServerStatus {
 struct Entry {
     config: ServerConfig,
     client: Option<Arc<McpClient>>,
+    /// 配置/手动重启代次。异步 connect 只能回写发起时的同一代 Entry。
+    generation: u64,
     /// 授权缺失标记：连接或调用吃到 AUTH_REQUIRED 时置位，成功建连清除
     needs_auth: bool,
     /// 交互授权结果：失败落原因，新一次发起/成功时清除
@@ -72,81 +76,84 @@ pub struct McpManager {
     servers: Mutex<HashMap<String, Entry>>,
     /// per-tool 策略表：随 reload 整批更换（读多写少，Mutex 足够）
     policies: Mutex<PolicySet>,
-    /// workspace roots：roots/list 反向请求应答 + 重连握手用
+    /// workspace roots 仅供 local stdio roots/list；remote transport 必须收到空清单。
     roots: Mutex<Vec<String>>,
     /// reload 串行化：快速连续 switch 若交错 drain/start，被挤掉的 client 无人 shutdown 会泄漏
     reload_lock: tokio::sync::Mutex<()>,
+    /// reload/restart/lazy connect 对同一 server 串行，不同 server 仍可独立推进。
+    lifecycle: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    next_generation: std::sync::atomic::AtomicU64,
+    /// 项目 stdio 的执行审批与 generic workspace trust 相互独立。
+    execution_approval: Option<(Arc<crate::agent::approval::ApprovalBroker>, crate::core::event::EventBus)>,
+    /// 本进程内按完整配置指纹缓存 Allow；command/args/cwd/env 任一变化都会重新审批。
+    approved_project_stdio: Mutex<HashSet<String>>,
 }
 
 impl McpManager {
     pub fn new() -> Arc<Self> {
+        Self::new_inner(None)
+    }
+
+    pub fn new_with_execution_approval(
+        broker: Arc<crate::agent::approval::ApprovalBroker>,
+        bus: crate::core::event::EventBus,
+    ) -> Arc<Self> {
+        Self::new_inner(Some((broker, bus)))
+    }
+
+    fn new_inner(execution_approval: Option<(Arc<crate::agent::approval::ApprovalBroker>, crate::core::event::EventBus)>) -> Arc<Self> {
         Arc::new(Self {
             servers: Mutex::new(HashMap::new()),
             policies: Mutex::new(PolicySet::default()),
             roots: Mutex::new(Vec::new()),
             reload_lock: tokio::sync::Mutex::new(()),
+            lifecycle: Mutex::new(HashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
+            execution_approval,
+            approved_project_stdio: Mutex::new(HashSet::new()),
         })
     }
 
-    /// 配置驱动启动（无策略/roots 的简口，测试与旧调用方用）。
-    pub async fn start(&self, configs: Vec<ServerConfig>) {
-        self.reload(configs, PolicySet::default(), Vec::new()).await;
-    }
-
-    /// 整批换：drain 旧 server 先 shutdown（进程/连接不泄漏），再按新配置重建。
-    /// 永不返回错误：单台失败记 down，状态面板可见，不拖垮整批。
-    pub async fn reload(&self, configs: Vec<ServerConfig>, policies: PolicySet, roots: Vec<String>) {
-        self.reload_inner(configs, policies, roots, remote::Guard::Enforced).await;
-    }
-
-    /// 测试钩子：mock server 监听 127.0.0.1 必被生产守卫拦（同 McpClient 的 bypass 设计）。
-    #[doc(hidden)]
-    pub async fn start_bypassing_guard_for_test(&self, configs: Vec<ServerConfig>) {
-        self.reload_inner(configs, PolicySet::default(), Vec::new(), remote::Guard::Bypassed).await;
-    }
-
-    async fn reload_inner(&self, configs: Vec<ServerConfig>, policies: PolicySet, roots: Vec<String>, guard: remote::Guard) {
-        let _guard = self.reload_lock.lock().await;
-        *crate::core::shared::lock(&self.policies) = policies;
-        *crate::core::shared::lock(&self.roots) = roots;
-        let old: Vec<Entry> = std::mem::take(&mut *crate::core::shared::lock(&self.servers)).into_values().collect();
-        for entry in old {
-            if let Some(c) = entry.client {
-                c.shutdown().await;
-            }
+    async fn approve_project_stdio(&self, config: &StdioConfig) -> bool {
+        if !config.scope.is_project() {
+            return true;
         }
-        for config in configs {
-            let name = config.name().to_string();
-            self.servers
-                .lock()
-                .expect("mcp")
-                .insert(name.clone(), Entry { config: config.clone(), client: None, needs_auth: false, last_auth_error: None });
-            let roots = crate::core::shared::lock(&self.roots).clone();
-            let connect = match guard {
-                remote::Guard::Enforced => McpClient::connect(&name, &config, &roots).await,
-                remote::Guard::Bypassed => McpClient::connect_bypassing_guard_for_test(&name, &config, &roots).await,
-            };
-            match connect {
-                Ok(client) => {
-                    tracing::info!(server = name, tools = client.tools.len(), "mcp server connected");
-                    if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(&name) {
-                        e.client = Some(Arc::new(client));
-                    }
-                }
-                Err(e) => {
-                    if oauth::is_auth_required(&e) {
-                        self.mark_needs_auth(&name, true);
-                    }
-                    tracing::warn!(server = name, error = %e, "mcp server connect failed");
-                }
-            }
+        if let Err(error) = config::validate_project_stdio(config) {
+            tracing::warn!(server = config.name, error = %error, "project stdio MCP skipped: unsafe executable or environment");
+            return false;
         }
-    }
-
-    fn mark_needs_auth(&self, server: &str, on: bool) {
-        if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(server) {
-            e.needs_auth = on;
+        let Some(cwd) = config.cwd.to_str() else {
+            tracing::warn!(server = config.name, cwd = ?config.cwd, "project stdio MCP skipped: cwd cannot be represented exactly in approval UI");
+            return false;
+        };
+        let fingerprint = stdio_approval::fingerprint(config, cwd);
+        if crate::core::shared::lock(&self.approved_project_stdio).contains(&fingerprint) {
+            return true;
         }
+        let Some((broker, bus)) = &self.execution_approval else {
+            tracing::warn!(server = config.name, "project stdio MCP skipped: no independent execution approval channel");
+            return false;
+        };
+        let exact = serde_json::json!({
+            "command": config.command,
+            "args": config.args,
+            "cwd": cwd,
+            "env": stdio_approval::visible_env(&config.env),
+        });
+        let command = serde_json::to_string_pretty(&exact).unwrap_or_else(|_| exact.to_string());
+        let reason = format!(
+            "项目级 stdio MCP '{}' 将在宿主机执行进程。此审批独立于项目信任；仅上述 canonical command、args、cwd 与 env 获批，敏感 env 值仅显示 SHA-256 摘要",
+            config.name
+        );
+        let approval = crate::tools::exec::ApprovalCtx::new(Some(broker), Some(bus), None, None).expect("MCP execution approval channel");
+        let allowed = matches!(
+            crate::agent::approval::request_approval(&approval, &command, &reason).await,
+            crate::agent::approval::ApprovalOutcome::Allow
+        );
+        if allowed {
+            crate::core::shared::lock(&self.approved_project_stdio).insert(fingerprint);
+        }
+        allowed
     }
 
     /// 交互授权结果落状态：新一次发起/成功传 None 清除，失败传原因（status 透出给设置页）。
@@ -209,18 +216,28 @@ impl McpManager {
     /// AUTH_REQUIRED（refresh 也被拒）：标 needs_auth 并丢连接——连接已无授权意义，
     /// 用户在设置页完成授权后 restart/lazy 重建即可用。
     pub async fn call(&self, server: &str, tool: &str, args: &Value) -> Result<String, String> {
-        let client = self.client_or_restart(server).await?;
+        let (client, generation) = self.client_or_restart(server).await?;
         match client.call(tool, args).await {
             Ok(out) => Ok(cap_output(&out)),
-            Err(e) => {
-                if oauth::is_auth_required(&e) {
-                    self.mark_needs_auth(server, true);
-                    let dead = crate::core::shared::lock(&self.servers).get_mut(server).and_then(|e| e.client.take());
+            Err(error) => {
+                let auth_required = oauth::is_auth_required(&error);
+                let transport_failure = client::transport_failure_detail(&error);
+                if auth_required || transport_failure.is_some() {
+                    let lock = self.server_lock(server);
+                    let _lifecycle = lock.lock().await;
+                    let dead = crate::core::shared::lock(&self.servers).get_mut(server).and_then(|entry| {
+                        let current = entry.client.as_ref()?;
+                        if entry.generation != generation || !Arc::ptr_eq(current, &client) {
+                            return None;
+                        }
+                        entry.needs_auth = auth_required;
+                        entry.client.take()
+                    });
                     if let Some(c) = dead {
                         c.shutdown().await;
                     }
                 }
-                Err(e)
+                Err(transport_failure.unwrap_or(&error).to_string())
             }
         }
     }
@@ -256,55 +273,38 @@ impl McpManager {
             }
         }
     }
-
-    async fn client_or_restart(&self, server: &str) -> Result<Arc<McpClient>, String> {
-        let entry = crate::core::shared::lock(&self.servers).get(server).map(|e| (e.config.clone(), e.client.clone()));
-        let Some((config, client)) = entry else {
-            return Err(format!("mcp server not found: {server}"));
-        };
-        if let Some(c) = client {
-            return Ok(c);
-        }
-        let roots = crate::core::shared::lock(&self.roots).clone();
-        let client = match McpClient::connect(server, &config, &roots).await {
-            Ok(c) => c,
-            Err(e) => {
-                if oauth::is_auth_required(&e) {
-                    self.mark_needs_auth(server, true);
-                }
-                return Err(e);
-            }
-        };
-        let client = Arc::new(client);
-        if let Some(e) = crate::core::shared::lock(&self.servers).get_mut(server) {
-            e.client = Some(client.clone());
-            e.needs_auth = false;
-        }
-        Ok(client)
-    }
-
-    /// 手动重启（设置页按钮）。
-    pub async fn restart(&self, server: &str) -> Result<(), String> {
-        let old = crate::core::shared::lock(&self.servers).get_mut(server).and_then(|e| e.client.take());
-        if let Some(c) = old {
-            c.shutdown().await;
-        }
-        let client = self.client_or_restart(server).await?;
-        drop(client);
-        Ok(())
-    }
 }
 
 /// 启动与 workspace switch 共用的重载入口：信任门 + 双 scope 加载 + 整批换。
 /// roots 取 workdir：roots/list 反向请求答的就是当前 workspace 根。
-pub async fn reload_for_workspace(workdir: &std::path::Path, mcp: &Arc<McpManager>) {
+pub async fn reload_for_workspace(workdir: &std::path::Path, mcp: &Arc<McpManager>) -> Result<(), String> {
     let trusted = crate::core::trust::is_trusted(workdir);
-    let (mut configs, policies) = config::load(workdir, trusted);
+    let (personal, (project_configs, project_policies)) = config::load_scoped(workdir, trusted)?;
+    let mut approved_project = Vec::with_capacity(project_configs.len());
+    let decisions = futures::future::join_all(project_configs.into_iter().map(|config| async {
+        let approved = match &config {
+            ServerConfig::Stdio(stdio) => mcp.approve_project_stdio(stdio).await,
+            ServerConfig::Remote(_) => true,
+        };
+        (config, approved)
+    }))
+    .await;
+    for (config, approved) in decisions {
+        if approved {
+            approved_project.push(config);
+        } else {
+            if let Some((_, bus)) = &mcp.execution_approval {
+                bus.publish(crate::core::event::Event::notify(format!("项目 MCP {} 未获独立执行批准，已跳过", config.name()), None));
+            }
+        }
+    }
+    let (mut configs, policies) = config::merge_scoped(personal, (approved_project, project_policies));
     if !crate::core::config::experimental_config().remote_mcp {
         configs.retain(|config| matches!(config, ServerConfig::Stdio(_)));
     }
     let roots = vec![workdir.to_string_lossy().into_owned()];
     mcp.reload(configs, policies, roots).await;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ macro_rules! engine {
         pub fn $name<'a>(query: &'a str, $store: &'a AuthStore, _cfg: &'a SearchConfig) -> TryFuture<'a> {
             Box::pin(async move {
                 let key = api_key($store, stringify!($name), &[$env])?;
-                Some($body(query, &key).await.map(|h| EngineResult { hits: h, answer: None }))
+                Some($body(query, &key).await.map(|h| EngineResult { hits: h, answer: None, usage: None }))
             })
         }
     };
@@ -291,7 +291,7 @@ engine!(firecrawl, store, "FIRECRAWL_API_KEY", firecrawl_call);
 pub fn youcom<'a>(query: &'a str, store: &'a AuthStore, _cfg: &'a SearchConfig) -> TryFuture<'a> {
     Box::pin(async move {
         let key = api_key(store, "you", &["YOU_API_KEY", "YDC_API_KEY"])?;
-        Some(youcom_call(query, &key).await.map(|h| EngineResult { hits: h, answer: None }))
+        Some(youcom_call(query, &key).await.map(|h| EngineResult { hits: h, answer: None, usage: None }))
     })
 }
 
@@ -300,7 +300,7 @@ pub fn google_cse<'a>(query: &'a str, store: &'a AuthStore, cfg: &'a SearchConfi
     Box::pin(async move {
         let key = api_key(store, "google", &["GOOGLE_SEARCH_API_KEY"])?;
         let cx = if cfg.google_cx.is_empty() { std::env::var("GOOGLE_SEARCH_CX").ok()? } else { cfg.google_cx.clone() };
-        Some(google_cse_call(query, &key, &cx).await.map(|h| EngineResult { hits: h, answer: None }))
+        Some(google_cse_call(query, &key, &cx).await.map(|h| EngineResult { hits: h, answer: None, usage: None }))
     })
 }
 
@@ -308,7 +308,7 @@ pub fn google_cse<'a>(query: &'a str, store: &'a AuthStore, cfg: &'a SearchConfi
 pub fn searxng<'a>(query: &'a str, _store: &'a AuthStore, cfg: &'a SearchConfig) -> TryFuture<'a> {
     Box::pin(async move {
         let base = if cfg.searxng_url.is_empty() { std::env::var("SEARXNG_URL").ok()? } else { cfg.searxng_url.clone() };
-        Some(searxng_call(query, &base).await.map(|h| EngineResult { hits: h, answer: None }))
+        Some(searxng_call(query, &base).await.map(|h| EngineResult { hits: h, answer: None, usage: None }))
     })
 }
 

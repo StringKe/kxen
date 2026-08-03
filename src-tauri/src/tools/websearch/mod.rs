@@ -5,6 +5,7 @@
 
 mod apis;
 mod ddg;
+mod managed;
 mod native;
 
 use crate::auth::credential::{AuthStore, CredentialKind};
@@ -15,17 +16,30 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const MAX_RESULTS: usize = 8;
 
 /// 单例 client（UA/timeout 定制，与 LLM 共享 client 配置不同，自建池复用）。
-fn http() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(TIMEOUT)
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) kxen/0.1")
-                .build()
-                .expect("websearch http client")
-        })
-        .clone()
+fn http(url: &str) -> reqwest::Client {
+    static GUARDED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    static LOOPBACK: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let (slot, builder) = if crate::core::config::endpoint_is_explicit_loopback(url) {
+        (&LOOPBACK, crate::tools::net_guard::loopback_client_builder())
+    } else {
+        (&GUARDED, crate::tools::net_guard::guarded_client_builder())
+    };
+    slot.get_or_init(|| {
+        builder
+            .timeout(TIMEOUT)
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) kxen/0.1")
+            .build()
+            .expect("websearch http client")
+    })
+    .clone()
+}
+
+async fn check_target(url: &str) -> Result<(), String> {
+    if crate::core::config::endpoint_is_explicit_loopback(url) {
+        crate::tools::net_guard::check_url_allow_loopback(url).await
+    } else {
+        crate::tools::net_guard::check_url(url).await
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,6 +53,8 @@ pub struct SearchHit {
 pub struct EngineResult {
     pub hits: Vec<SearchHit>,
     pub answer: Option<String>,
+    /// 仅模型原生搜索有 usage；响应未带 usage 时保持 None，不能伪装成 0。
+    pub usage: Option<crate::llm::managed::TokenUsage>,
 }
 
 pub struct SearchOutcome {
@@ -47,6 +63,8 @@ pub struct SearchOutcome {
     pub engine: &'static str,
     pub answer: Option<String>,
 }
+
+pub use managed::SearchRuntime;
 
 /// None = 跳过（无 key/配置）；Some(Err) = 尝试了但失败（记错误明细继续降级）。
 type TryFuture<'a> = Pin<Box<dyn std::future::Future<Output = Option<Result<EngineResult, String>>> + Send + 'a>>;
@@ -99,15 +117,22 @@ fn api_key(store: &AuthStore, engine: &str, env_names: &[&str]) -> Option<String
         .or_else(|| env_names.iter().find_map(|n| std::env::var(n).ok().filter(|k| !k.is_empty())))
 }
 
-pub async fn search(query: &str, store: &AuthStore) -> Result<SearchOutcome, String> {
+pub async fn search(query: &str, store: &AuthStore, runtime: &SearchRuntime<'_>) -> Result<SearchOutcome, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
     }
-    let cfg = crate::core::config::Config::load(&crate::core::paths::config_dir().join("config.toml"), None).unwrap_or_default();
+    let config_path = crate::core::paths::config_dir().join("config.toml");
+    let cfg = crate::core::config::Config::load(&config_path, None)
+        .map_err(|error| format!("websearch config {}: {error}", config_path.display()))?;
     let mut errs: Vec<String> = Vec::new();
     for id in engine_chain(&cfg.search.engine) {
         let f = ENGINES.iter().find(|(eid, _)| *eid == id).map(|(_, f)| f).expect("chain id 必在引擎表");
-        match f(query, store, &cfg.search).await {
+        let result = match managed::provider_for_engine(id) {
+            Some(provider) => managed::run_native(id, provider, *f, query, store, &cfg.search, runtime).await,
+            None if managed::billable_api_engine(id) => managed::run_api(id, *f, query, store, &cfg.search, runtime).await,
+            None => f(query, store, &cfg.search).await,
+        };
+        match result {
             None => errs.push(format!("{id}: skipped (no key/config)")),
             Some(Ok(r)) => return Ok(SearchOutcome { hits: r.hits, engine: id, answer: r.answer }),
             Some(Err(e)) => errs.push(format!("{id}: {e}")),
@@ -123,31 +148,47 @@ async fn post_json(
     extra_headers: &[(&str, &str)],
     body: &impl serde::Serialize,
 ) -> Result<String, String> {
-    let mut req = http().post(url).json(body);
+    check_target(url).await?;
+    let mut req = http(url).post(url).json(body);
     if let Some(token) = bearer {
         req = req.bearer_auth(token);
     }
     for (k, v) in extra_headers {
         req = req.header(*k, *v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(redacted_transport_error)?;
     if !resp.status().is_success() {
         return Err(format!("http {}", resp.status()));
     }
-    resp.text().await.map_err(|e| e.to_string())
+    crate::net_response::text(resp, crate::net_response::JSON_BODY_LIMIT, "web search response").await
 }
 
 /// GET + query 参数 + 自定义头（query 走 reqwest 原生编码，不手工拼 URL）。
 async fn get_json(url: &str, headers: &[(&str, &str)], query: &[(&str, &str)]) -> Result<String, String> {
-    let mut req = http().get(url).query(query);
+    check_target(url).await?;
+    let mut req = http(url).get(url).query(query);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(redacted_transport_error)?;
     if !resp.status().is_success() {
         return Err(format!("http {}", resp.status()));
     }
-    resp.text().await.map_err(|e| e.to_string())
+    crate::net_response::text(resp, crate::net_response::JSON_BODY_LIMIT, "web search response").await
+}
+
+fn redacted_transport_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "request timed out".into()
+    } else if error.is_connect() {
+        "connection failed".into()
+    } else if error.is_body() {
+        "request body failed".into()
+    } else if error.is_decode() {
+        "response decode failed".into()
+    } else {
+        "request failed".into()
+    }
 }
 
 pub fn format_hits(outcome: &SearchOutcome) -> String {
@@ -187,5 +228,17 @@ mod tests {
 
         // 未知配置按 auto，不挂
         assert_eq!(engine_chain("unknown"), auto);
+    }
+
+    #[tokio::test]
+    async fn query_secret_is_redacted_from_transport_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let secret = "never-leak-search-api-key";
+        let error = get_json(&url, &[], &[("api_key", secret), ("q", "query")]).await.expect_err("closed port must fail");
+        assert!(!error.contains(secret), "{error}");
+        assert!(!error.contains(&url), "transport errors must not expose full request URLs: {error}");
+        assert_eq!(error, "connection failed");
     }
 }

@@ -1,7 +1,76 @@
 //! 上下文压缩（compaction）：阈值触发把旧历史蒸馏成一条摘要消息，窗口腾出后重注入。
 //! 窗口取 catalog 的模型 limit.context（200k 硬编码的唯一替代源），失败兜底 200k。
 
-use crate::llm::{Delta, LlmClient, Message, ModelRef};
+use crate::llm::{Message, ModelRef};
+
+pub const COMPACT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactError {
+    Cancelled {
+        request_started: bool,
+        usage: Option<crate::llm::managed::TokenUsage>,
+        unmetered_call: bool,
+        metering_warning: Option<String>,
+        model_used: Option<ModelRef>,
+    },
+    Persist {
+        message: String,
+        request_started: bool,
+        usage: Option<crate::llm::managed::TokenUsage>,
+        unmetered_call: bool,
+        metering_warning: Option<String>,
+        model_used: Option<ModelRef>,
+    },
+}
+
+fn history_error(error: std::io::Error) -> CompactError {
+    CompactError::Persist {
+        message: format!("session history unavailable: {error}"),
+        request_started: false,
+        usage: None,
+        unmetered_call: false,
+        metering_warning: None,
+        model_used: None,
+    }
+}
+
+pub struct CompactResult {
+    pub messages: Vec<Message>,
+    pub summary: Option<String>,
+    pub compacted_count: usize,
+    pub usage: Option<crate::llm::managed::TokenUsage>,
+    pub request_started: bool,
+    pub unmetered_call: bool,
+    pub metering_warning: Option<String>,
+    pub model_used: Option<ModelRef>,
+}
+
+pub struct CompactionReport {
+    pub before: u64,
+    pub after: u64,
+    pub usage: Option<crate::llm::managed::TokenUsage>,
+    pub request_started: bool,
+    pub unmetered_call: bool,
+    pub metering_warning: Option<String>,
+    pub model_used: Option<ModelRef>,
+}
+
+pub struct CompactSessionOptions<'a> {
+    pub mrm: Option<&'a crate::llm::mrm::ModelResourceManager>,
+    pub keep_recent: usize,
+    pub timeout: std::time::Duration,
+    pub cancel: Option<&'a crate::agent::cancel::CancelToken>,
+}
+
+struct SummaryAttempt {
+    output: Option<crate::llm::managed::ManagedOutput>,
+    usage: Option<crate::llm::managed::TokenUsage>,
+    request_started: bool,
+    unmetered_call: bool,
+    metering_warning: Option<String>,
+    model_used: Option<ModelRef>,
+}
 
 /// 粗估 tokens（chars/4，与 composer 的预估同口径）。
 /// 计入 tool_calls 与多模态块：tool_call 的 name+arguments 同样占上下文（可占大头），
@@ -69,19 +138,32 @@ open TODOs, pitfalls encountered. Be terse and factual, no filler. \
 Output plain markdown, <= 800 words.\n\nCONVERSATION:\n";
 
 /// 压缩消息序列：保留 system（若有）与最近 keep_recent 条，旧段蒸馏为一条 user 摘要。
-/// 返回（压缩后序列，摘要文本）；无需压缩时摘要为 None。LLM 失败降级截断式保留（旧段只留首尾），绝不丢最近上下文。
+/// 返回（压缩后序列，摘要文本，被摘要的非 system 消息数）；无需压缩时摘要为 None。
+/// LLM 失败降级截断式保留（旧段只留首尾），绝不丢最近上下文。
 pub async fn compact_messages(
+    mrm: Option<&crate::llm::mrm::ModelResourceManager>,
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
     messages: &[Message],
     keep_recent: usize,
-) -> (Vec<Message>, Option<String>) {
+    timeout: std::time::Duration,
+    cancel: Option<&crate::agent::cancel::CancelToken>,
+) -> Result<CompactResult, CompactError> {
     let (system, rest) = match messages.first() {
         Some(m) if m.role == crate::llm::types::Role::System => (vec![m.clone()], &messages[1..]),
         _ => (vec![], messages),
     };
     if rest.len() <= keep_recent + 2 {
-        return (messages.to_vec(), None);
+        return Ok(CompactResult {
+            messages: messages.to_vec(),
+            summary: None,
+            compacted_count: 0,
+            usage: None,
+            request_started: false,
+            unmetered_call: false,
+            metering_warning: None,
+            model_used: None,
+        });
     }
     // 边界修正：recent 首条若是 tool result，其 assistant 调用体已被蒸进旧段，
     // 孤儿 tool result 会被 provider 拒收——split 前移把它们一起并入蒸馏段
@@ -91,20 +173,34 @@ pub async fn compact_messages(
     }
     let (old, recent) = rest.split_at(split);
     let segment: String = old.iter().map(|m| format!("{:?}: {}", m.role, m.content)).collect::<Vec<_>>().join("\n\n");
-    let summary = summarize(model, store, &segment).await.unwrap_or_else(|| {
-        // 降级：LLM 不可用时只留关键行（首条 user 意图 + 末条状态），不假装蒸留出内容
-        let mut out = String::from("(compaction fallback: LLM unavailable, kept head/tail only)\n");
-        for m in old.iter().take(1).chain(old.iter().rev().take(1)) {
-            out.push_str(&format!("{:?}: {}\n", m.role, m.content.chars().take(500).collect::<String>()));
-        }
-        out
-    });
+    let attempt = summarize(mrm, model, store, &segment, timeout, cancel).await?;
+    let summary = match attempt.output.as_ref().map(|output| output.text.trim()).filter(|text| !text.is_empty()) {
+        Some(summary) => summary.to_string(),
+        None => fallback_summary(old),
+    };
     let mut out = system;
     // 摘要角色用 user：system 会让 run loop 的 system_owned 判假吞掉真正系统提示，
     // assistant 会与 recent 首条连排（provider 要求首条非 system 消息必须 user）
     out.push(Message::user(format!("{}\n{summary}", crate::core::session::COMPACT_MARK)));
     out.extend(recent.iter().cloned());
-    (out, Some(summary))
+    Ok(CompactResult {
+        messages: out,
+        summary: Some(summary),
+        compacted_count: old.len(),
+        usage: attempt.usage,
+        request_started: attempt.request_started,
+        unmetered_call: attempt.unmetered_call,
+        metering_warning: attempt.metering_warning,
+        model_used: attempt.model_used,
+    })
+}
+
+fn fallback_summary(old: &[Message]) -> String {
+    let mut out = String::from("(compaction fallback: LLM unavailable, kept head/tail only)\n");
+    for message in old.iter().take(1).chain(old.iter().rev().take(1)) {
+        out.push_str(&format!("{:?}: {}\n", message.role, message.content.chars().take(500).collect::<String>()));
+    }
+    out
 }
 
 /// 手动压缩落检查点：原始 JSONL 一条不动（rewind 的 message id 锚点不破坏），
@@ -114,108 +210,105 @@ pub async fn compact_session(
     id: &str,
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
-    keep_recent: usize,
-) -> Option<(u64, u64)> {
-    let raw = crate::core::session::load_messages(dir, id);
+    options: CompactSessionOptions<'_>,
+) -> Result<Option<CompactionReport>, CompactError> {
+    let CompactSessionOptions { mrm, keep_recent, timeout, cancel } = options;
+    let raw = crate::core::session::load_messages_checked(dir, id).map_err(history_error)?;
     if raw.len() <= keep_recent {
-        return None;
+        return Ok(None);
     }
-    let view = crate::core::session::load_history(dir, id);
-    let llm_msgs = flatten_stored(&view);
+    let view = crate::core::session::load_history_checked(dir, id).map_err(history_error)?;
+    let raw_ids = raw.iter().map(|message| message.id.as_str()).collect::<std::collections::HashSet<_>>();
+    let flattened = view
+        .iter()
+        .filter_map(|stored| flatten_stored(std::slice::from_ref(stored)).into_iter().next().map(|message| (message, stored.id.as_str())))
+        .collect::<Vec<_>>();
+    let llm_msgs = flattened.iter().map(|(message, _)| message.clone()).collect::<Vec<_>>();
     let before = estimate_tokens(&llm_msgs);
-    let (compacted, summary) = compact_messages(model, store, &llm_msgs, keep_recent).await;
-    let summary = summary?;
-    let upto = raw[raw.len() - keep_recent - 1].id.clone();
-    crate::core::session::save_compaction(dir, id, &crate::core::session::Compaction::new(upto, summary)).ok()?;
-    Some((before, estimate_tokens(&compacted)))
+    let compacted = compact_messages(mrm, model, store, &llm_msgs, keep_recent, timeout, cancel).await?;
+    let Some(summary) = compacted.summary.clone() else { return Ok(None) };
+    let system_offset = usize::from(llm_msgs.first().is_some_and(|message| message.role == crate::llm::types::Role::System));
+    let upto = flattened
+        .iter()
+        .skip(system_offset)
+        .take(compacted.compacted_count)
+        .rev()
+        .find_map(|(_, id)| raw_ids.contains(id).then(|| (*id).to_string()))
+        .ok_or_else(|| CompactError::Persist {
+            message: "compaction boundary does not reference persisted history".into(),
+            request_started: compacted.request_started,
+            usage: compacted.usage.clone(),
+            unmetered_call: compacted.unmetered_call,
+            metering_warning: compacted.metering_warning.clone(),
+            model_used: compacted.model_used.clone(),
+        })?;
+    crate::core::session::save_compaction(dir, id, &crate::core::session::Compaction::new(upto, summary)).map_err(|error| {
+        CompactError::Persist {
+            message: error.to_string(),
+            request_started: compacted.request_started,
+            usage: compacted.usage.clone(),
+            unmetered_call: compacted.unmetered_call,
+            metering_warning: compacted.metering_warning.clone(),
+            model_used: compacted.model_used.clone(),
+        }
+    })?;
+    Ok(Some(CompactionReport {
+        before,
+        after: estimate_tokens(&compacted.messages),
+        usage: compacted.usage,
+        request_started: compacted.request_started,
+        unmetered_call: compacted.unmetered_call,
+        metering_warning: compacted.metering_warning,
+        model_used: compacted.model_used,
+    }))
 }
 
-async fn summarize(model: &ModelRef, store: &crate::auth::credential::AuthStore, segment: &str) -> Option<String> {
+async fn summarize(
+    mrm: Option<&crate::llm::mrm::ModelResourceManager>,
+    model: &ModelRef,
+    store: &crate::auth::credential::AuthStore,
+    segment: &str,
+    timeout: std::time::Duration,
+    cancel: Option<&crate::agent::cancel::CancelToken>,
+) -> Result<SummaryAttempt, CompactError> {
+    let Some(mrm) = mrm else {
+        return Ok(SummaryAttempt {
+            output: None,
+            usage: None,
+            request_started: false,
+            unmetered_call: false,
+            metering_warning: None,
+            model_used: None,
+        });
+    };
     let tail: String = segment.chars().rev().take(48_000).collect::<Vec<_>>().into_iter().rev().collect();
     let req = vec![Message::user(format!("{COMPACT_PROMPT}{tail}"))];
-    let mut stream = LlmClient::stream(model, &req, store);
-    use futures::StreamExt;
-    let mut text = String::new();
-    while let Some(delta) = stream.next().await {
-        match delta {
-            Delta::Text(t) => text.push_str(&t),
-            Delta::Error(_) => return None,
-            _ => {}
-        }
+    match crate::llm::managed::collect_text_observed(mrm, model, &req, store, timeout, None, cancel).await {
+        Ok(output) => Ok(SummaryAttempt {
+            usage: output.usage.clone(),
+            request_started: true,
+            unmetered_call: output.usage.is_none(),
+            metering_warning: output.metering_warning.clone(),
+            model_used: Some(model.clone()),
+            output: Some(output),
+        }),
+        Err(error) if error.kind == crate::llm::managed::ManagedErrorKind::Cancelled => Err(CompactError::Cancelled {
+            request_started: error.request_started,
+            usage: error.usage,
+            unmetered_call: error.request_started && !error.usage_reported,
+            metering_warning: error.metering_warning,
+            model_used: error.request_started.then(|| model.clone()),
+        }),
+        Err(error) => Ok(SummaryAttempt {
+            usage: error.usage,
+            request_started: error.request_started,
+            unmetered_call: error.request_started && !error.usage_reported,
+            metering_warning: error.metering_warning,
+            model_used: error.request_started.then(|| model.clone()),
+            output: None,
+        }),
     }
-    if text.trim().is_empty() { None } else { Some(text) }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn estimate_counts_chars() {
-        let msgs = vec![Message::user("a".repeat(400)), Message::assistant("b".repeat(400))];
-        assert_eq!(estimate_tokens(&msgs), 200);
-    }
-
-    /// tool_calls 的 name+arguments 与图片块计入预估（漏算会让大 tool_call
-    /// 历史永不触发压缩直到 provider 400）。
-    #[test]
-    fn estimate_counts_tool_calls_and_images() {
-        let call = crate::llm::types::AssistantToolCall::function("id1", "exec", "x".repeat(400));
-        let with_tools = vec![Message::assistant_with_tools("t".repeat(4), vec![call])];
-        // (4 文本 + 4 name + 400 arguments) / 4 = 102
-        assert_eq!(estimate_tokens(&with_tools), 102, "tool_call name+arguments 必须计入");
-
-        let img = crate::llm::types::ImagePart { media_type: "image/png".into(), data: "a".repeat(4000) };
-        let with_image = vec![Message::user_with_images("hi", vec![img])];
-        // 图片按固定近似 1000/张，与 base64 长度脱钩
-        assert_eq!(estimate_tokens(&with_image), 1000, "图片必须按固定近似成本计入");
-    }
-
-    #[test]
-    fn needs_compact_uses_window() {
-        let model = ModelRef::new("xai", "grok-build-0.1");
-        let big = vec![Message::user("x".repeat(900_000))]; // ~225k tokens > 256k*0.8=204.8k
-        assert!(needs_compact(&big, &model));
-        let small = vec![Message::user("hello".to_string())];
-        assert!(!needs_compact(&small, &model));
-    }
-
-    #[test]
-    fn compact_preserves_system_and_recent() {
-        let model = ModelRef::new("xai", "grok-build-0.1");
-        let mut msgs = vec![Message::system("sys")];
-        for i in 0..10 {
-            msgs.push(Message::user(format!("u{i}")));
-            msgs.push(Message::assistant(format!("a{i}")));
-        }
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let store = crate::auth::credential::AuthStore::default();
-        let (out, summary) = rt.block_on(compact_messages(&model, &store, &msgs, 4));
-        assert_eq!(out[0].content, "sys");
-        // 摘要是 user 角色（首条非 system 消息 provider 要求 user）
-        assert_eq!(out[1].role, crate::llm::types::Role::User);
-        assert!(summary.is_some());
-        // 末 4 条原样保留
-        assert_eq!(out.last().unwrap().content, "a9");
-        assert!(out.len() < msgs.len());
-    }
-
-    #[test]
-    fn compact_boundary_skips_orphan_tool_results() {
-        let model = ModelRef::new("xai", "grok-build-0.1");
-        let mut msgs = Vec::new();
-        for i in 0..8 {
-            msgs.push(Message::user(format!("u{i}")));
-        }
-        // 保留窗首条是 tool result：split 前移，recent 不许以孤儿 tool result 开头
-        msgs.push(Message::assistant_with_tools("call".to_string(), vec![]));
-        msgs.push(Message::tool_result("id1", "exec", "ok"));
-        msgs.push(Message::user("tail".to_string()));
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let store = crate::auth::credential::AuthStore::default();
-        let (out, _) = rt.block_on(compact_messages(&model, &store, &msgs, 2));
-        let first_recent = &out[out.len() - 2];
-        assert_ne!(first_recent.role, crate::llm::types::Role::Tool, "recent 首条不能是孤儿 tool result");
-        assert_eq!(out.last().unwrap().content, "tail");
-    }
-}
+mod tests;

@@ -18,10 +18,8 @@ const BUILTIN: &[(&str, &str, Option<&str>)] = &[
     ("ultracode", "大任务模式：分解 -> workflow 并行实现 -> 集成验证", Some("<实现任务>")),
     ("ultraplan", "多角度规划模式：架构/调研/风险并行 -> 综合成稿", Some("<规划问题>")),
     ("ultrareview", "对抗性多镜审查：正确性/安全/性能/约定", Some("<路径或范围>")),
+    ("compact", "手动压缩当前 Session 历史", None),
     ("doctor", "环境自检（订阅凭证/目录/配置）", None),
-    ("clear", "清空当前会话（开启草稿态）", None),
-    ("model", "切换当前模型", Some("<provider/model>")),
-    ("abort", "中断当前生成", None),
 ];
 
 /// command.list 数据源：builtin + custom（skills 由调用方拼）。
@@ -81,9 +79,18 @@ mod tests {
     fn builtin_and_custom() {
         setup();
         let dir = fixture("list");
-        crate::core::trust::trust(&dir); // 生产语义：夹具显式信任（未信任只索引）
+        crate::core::trust::trust(&dir).unwrap(); // 生产语义：夹具显式信任（未信任只索引）
         let list = list(&dir);
         assert!(list.iter().any(|c| c.name == "write-goal" && c.kind == "builtin"));
+        for name in ["compact", "doctor"] {
+            assert!(list.iter().any(|c| c.name == name && c.kind == "builtin"));
+        }
+        for name in ["clear", "model", "abort"] {
+            assert!(!list.iter().any(|c| c.name == name), "{name} 不应伪装成可执行 builtin");
+        }
+        let compact = list.iter().find(|c| c.name == "compact").unwrap();
+        assert_eq!(compact.description, "手动压缩当前 Session 历史");
+        assert_eq!(compact.argument_hint, None);
         let custom = list.iter().find(|c| c.name == "review").unwrap();
         assert_eq!(custom.kind, "custom");
         assert_eq!(custom.description, "审查指定路径");
@@ -95,7 +102,7 @@ mod tests {
     fn expand_template_with_args() {
         setup();
         let dir = fixture("expand");
-        crate::core::trust::trust(&dir);
+        crate::core::trust::trust(&dir).unwrap();
         let out = expand(&dir, "review", "src/auth").unwrap();
         assert!(out.contains("审查 src/auth"));
         assert!(expand(&dir, "nonexistent", "").is_none());

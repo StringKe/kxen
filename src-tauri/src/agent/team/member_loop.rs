@@ -5,8 +5,7 @@ mod context;
 use super::TeamState;
 use super::inbox::append_inbox;
 use super::member_wake::{
-    CLAIM_NUDGE, IDLE_TIMEOUT, IdleWake, first_prompt, idle_wait, inbox_has_plan_approval, inbox_text, push_inbox_transcript,
-    round_messages, strip_system,
+    CLAIM_NUDGE, IDLE_TIMEOUT, IdleWake, first_prompt, idle_wait, inbox_text, push_inbox_transcript, round_messages, strip_system,
 };
 use super::types::MemberStatus;
 use crate::agent::agent_loop::run_turn;
@@ -36,7 +35,9 @@ pub(super) async fn teammate_loop(
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(session = state.session_id, member = name, error = %e, "teammate workspace runtime unavailable");
-            set_status(&state, &name, MemberStatus::Failed);
+            if let Err(error) = set_status(&state, &name, MemberStatus::Failed) {
+                report_delivery_error(&state, &name, "failed status", &error);
+            }
             return;
         }
     };
@@ -44,23 +45,38 @@ pub(super) async fn teammate_loop(
     // system 不进历史（roster 每轮实时重建），装配时 prepend 新鲜副本
     let mut history: Vec<Message> = Vec::new();
     let mut first_round = true;
+    let mut pending_delivery = None;
     // approved 初值由调用方给：spawn 按 !plan_approval，restore 按落盘记录（崩溃前已批的不重批）
     let mut approved = approved;
     loop {
         if cancel.is_cancelled() {
             break;
         }
-        set_status(&state, &name, MemberStatus::Working);
+        // config.json 的已提交 verdict 是权限真相源。不能仅凭 inbox 文本提权：verdict
+        // 可能已入 mailbox，但 config finalize 尚未成功。
+        approved = durable_approval(&state, &name, approved);
+        if let Err(error) = set_status(&state, &name, MemberStatus::Working) {
+            report_delivery_error(&state, &name, "working status", &error);
+            return;
+        }
         // 阶段 ctx：plan_approval 未批准前只读
         let allowed: Option<&'static [&'static str]> = if approved { None } else { Some(READONLY_TEAM_TOOLS) };
         // 凭证预防刷新：build_ctx 只克隆共享 store 快照，长过期 token 不先换新则当轮失败下轮才自愈
         let refresh = refresh_store_credentials(&state, &model, &cancel).await;
         let stop_after_run = match refresh {
+            CredentialRefresh::Cancelled if pending_delivery.is_some() => {
+                block_member(&state, &name, "credential refresh", "cancelled with an unacknowledged inbox delivery");
+                return;
+            }
             CredentialRefresh::Cancelled => break,
             CredentialRefresh::GoalStopped => true,
             CredentialRefresh::Finished(RefreshOutcome::Failed(error)) => {
-                report_to_lead(&state, &name, &format!("{} OAuth refresh failed: {error}", model.provider));
-                set_status(&state, &name, MemberStatus::Failed);
+                if let Err(delivery_error) = report_to_lead(&state, &name, &format!("{} OAuth refresh failed: {error}", model.provider)) {
+                    report_delivery_error(&state, &name, "OAuth failure report", &delivery_error);
+                }
+                if let Err(status_error) = set_status(&state, &name, MemberStatus::Failed) {
+                    report_delivery_error(&state, &name, "failed status", &status_error);
+                }
                 return;
             }
             CredentialRefresh::Finished(RefreshOutcome::NotNeeded | RefreshOutcome::Refreshed) => false,
@@ -70,10 +86,13 @@ pub(super) async fn teammate_loop(
             first_round = false;
             // 首轮从 brief 建起（restore 场景并入残存 inbox 与本人未完成 claim，P1-2）
             let first = match first_prompt(&state, &name, &prompt) {
-                Ok(first) => first,
+                Ok((first, delivery)) => {
+                    pending_delivery = delivery;
+                    first
+                }
                 Err(error) => {
                     report_delivery_error(&state, &name, "inbox drain", &error);
-                    set_status(&state, &name, MemberStatus::Failed);
+                    block_member(&state, &name, "inbox claim", &error);
                     return;
                 }
             };
@@ -82,6 +101,13 @@ pub(super) async fn teammate_loop(
         let mut messages = round_messages(teammate_system(&state, &name, &role, approved), &history);
         let outcome = run_turn(&mut ctx, &mut messages).await;
         history = strip_system(messages);
+        if outcome.aborted {
+            if pending_delivery.is_some() {
+                block_member(&state, &name, "run cancellation", "run aborted with an unacknowledged inbox delivery");
+                return;
+            }
+            break;
+        }
 
         // refresh 等待期间 goal 到期：run_turn 的统一 preflight 负责落 BudgetLimited
         // 与终态事件。结束后重读，避免 pause/resume 恰好跨过旧 deadline 时按过期快照关闭成员。
@@ -91,8 +117,17 @@ pub(super) async fn teammate_loop(
                 crate::core::goal::RuntimeBudget::Stop(_)
             );
         if goal_still_stopped {
-            if !outcome.final_text.is_empty() {
-                report_to_lead(&state, &name, &outcome.final_text);
+            if !outcome.final_text.is_empty()
+                && let Err(error) = report_to_lead(&state, &name, &outcome.final_text)
+            {
+                block_member(&state, &name, "lead report", &error);
+                return;
+            }
+            if let Some(delivery) = pending_delivery.take()
+                && let Err(error) = super::inbox::ack_inbox_entries(&state.dir, &name, &delivery)
+            {
+                block_member(&state, &name, "inbox ack", &error);
+                return;
             }
             break;
         }
@@ -100,12 +135,21 @@ pub(super) async fn teammate_loop(
         if !approved {
             // 计划出炉：递交 lead 审批（经 manager.send：observer 抄送 + 前端通知）
             let text = format!("[plan for approval]\n{}", outcome.final_text);
-            report_to_lead(&state, &name, &text);
-            set_status(&state, &name, MemberStatus::AwaitingPlanApproval);
+            if let Err(error) = report_to_lead(&state, &name, &text) {
+                block_member(&state, &name, "plan report", &error);
+                return;
+            }
+            if let Err(error) = set_status(&state, &name, MemberStatus::AwaitingPlanApproval) {
+                report_delivery_error(&state, &name, "plan status", &error);
+                return;
+            }
         } else {
             // 本轮成果上报 lead（经 manager.send：observer 抄送 + 前端通知）
-            if !outcome.final_text.is_empty() {
-                report_to_lead(&state, &name, &outcome.final_text);
+            if !outcome.final_text.is_empty()
+                && let Err(error) = report_to_lead(&state, &name, &outcome.final_text)
+            {
+                block_member(&state, &name, "lead report", &error);
+                return;
             }
             // teammate_idle hook：exit 非零 = 打回（反馈进 inbox， teammate 继续工作）
             let appr = crate::tools::exec::ApprovalCtx::new(
@@ -121,7 +165,19 @@ pub(super) async fn teammate_loop(
             {
                 idle_rejected(&state, &name, &feedback);
             }
-            set_status(&state, &name, MemberStatus::Idle);
+            if let Err(error) = set_status(&state, &name, MemberStatus::Idle) {
+                report_delivery_error(&state, &name, "idle status", &error);
+                return;
+            }
+        }
+
+        // Provider/tool/hook outcome 已形成 durable lead report 或 durable member status 后才 ack。
+        // crash 在此之前保留 in_flight，且 restore 会把成员置 Blocked，禁止自动重跑副作用。
+        if let Some(delivery) = pending_delivery.take()
+            && let Err(error) = super::inbox::ack_inbox_entries(&state.dir, &name, &delivery)
+        {
+            block_member(&state, &name, "inbox ack", &error);
+            return;
         }
 
         // idle：听 inbox 唤醒（P1-3：5min 超时自醒；shutdown 经 cancel 即刻醒）
@@ -130,20 +186,28 @@ pub(super) async fn teammate_loop(
             IdleWake::Nudge => history.push(Message::user(CLAIM_NUDGE)),
             IdleWake::Error(error) => {
                 report_delivery_error(&state, &name, "inbox drain", &error);
-                set_status(&state, &name, MemberStatus::Failed);
+                block_member(&state, &name, "inbox claim", &error);
                 return;
             }
-            IdleWake::Inbox(inbox) => {
-                if inbox_has_plan_approval(&inbox) {
-                    approved = true;
-                }
+            IdleWake::Inbox(delivery) => {
+                let inbox = delivery.messages();
                 // P1-4：来信入 transcript（AgentFocusView 可见）
                 push_inbox_transcript(&state, &name, &inbox);
                 history.push(Message::user(inbox_text(&inbox)));
+                pending_delivery = Some(delivery);
             }
         }
     }
-    set_status(&state, &name, MemberStatus::Shutdown);
+    if let Err(error) = super::tasks::block_member_completing_tasks(&state, &name) {
+        report_delivery_error(&state, &name, "completion cancellation recovery", &error);
+        if let Err(status_error) = set_status(&state, &name, MemberStatus::Blocked) {
+            report_delivery_error(&state, &name, "blocked status", &status_error);
+        }
+        return;
+    }
+    if let Err(error) = set_status(&state, &name, MemberStatus::Shutdown) {
+        report_delivery_error(&state, &name, "shutdown status", &error);
+    }
 }
 const READONLY_TEAM_TOOLS: &[&str] = &["read", "glob", "grep", "send_message", "team_task"];
 
@@ -159,19 +223,30 @@ fn idle_rejected(state: &Arc<TeamState>, name: &str, feedback: &str) {
     }
 }
 
-fn report_to_lead(state: &Arc<TeamState>, name: &str, text: &str) {
-    let result = match state.manager.upgrade() {
+fn report_to_lead(state: &Arc<TeamState>, name: &str, text: &str) -> Result<(), String> {
+    match state.manager.upgrade() {
         Some(manager) => manager.send(state, name, "lead", text),
         None => append_inbox(&state.dir, "lead", name, text),
-    };
-    if let Err(error) = result {
-        report_delivery_error(state, name, "lead report", &error);
+    }
+}
+
+fn block_member(state: &Arc<TeamState>, name: &str, operation: &str, error: &str) {
+    report_delivery_error(state, name, operation, error);
+    if let Err(task_error) = super::tasks::block_member_completing_tasks(state, name) {
+        report_delivery_error(state, name, "completion cancellation recovery", &task_error);
+    }
+    if let Err(status_error) = set_status(state, name, MemberStatus::Blocked) {
+        report_delivery_error(state, name, "blocked status", &status_error);
     }
 }
 
 fn report_delivery_error(state: &TeamState, name: &str, operation: &str, error: &str) {
     tracing::error!(%error, member = name, %operation, "team message delivery failed");
     state.bus.publish(crate::core::event::Event::notify(format!("Teammate {name} 消息保存失败：{error}"), Some(state.session_id.clone())));
+}
+
+fn durable_approval(state: &TeamState, name: &str, fallback: bool) -> bool {
+    lock(&state.members).iter().find(|member| member.name == name).map(|member| member.approved).unwrap_or(fallback)
 }
 
 pub(super) fn teammate_system(state: &Arc<TeamState>, name: &str, role: &str, approved: bool) -> String {
@@ -200,35 +275,28 @@ pub(super) fn teammate_system(state: &Arc<TeamState>, name: &str, role: &str, ap
     )
 }
 
-fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) {
+fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) -> Result<(), String> {
+    super::types::ensure_available(state)?;
     if status == MemberStatus::Failed
         && let Err(error) = super::tasks::fail_member_tasks(state, name)
     {
-        tracing::error!(%error, member = name, "failed teammate tasks could not be finalized");
-        state.bus.publish(crate::core::event::Event::notify(
-            format!("Teammate {name} 任务失败状态保存失败：{error}"),
-            Some(state.session_id.clone()),
-        ));
+        return Err(format!("failed teammate tasks could not be finalized: {error}"));
     }
     {
         let mut members = lock(&state.members);
-        let Some(member) = members.iter_mut().find(|member| member.name == name) else { return };
-        let previous = member.status;
-        member.status = status;
-        if let Err(error) = super::types::persist_config_locked(state, &members) {
-            members.iter_mut().find(|member| member.name == name).expect("member remains present").status = previous;
-            tracing::error!(%error, member = name, "team member status save failed");
-            state.bus.publish(crate::core::event::Event::notify(
-                format!("Teammate {name} 状态保存失败：{error}"),
-                Some(state.session_id.clone()),
-            ));
-            return;
+        if !members.iter().any(|member| member.name == name) {
+            return Err(format!("teammate not found: {name}"));
         }
+        let original = members.clone();
+        let member = members.iter_mut().find(|member| member.name == name).expect("member remains present");
+        member.status = status;
+        super::types::commit_members(state, &mut members, original)?;
     }
     let activity_status = match status {
         MemberStatus::Working => crate::agent::activity::ActivityStatus::Working,
         MemberStatus::Idle => crate::agent::activity::ActivityStatus::Idle,
         MemberStatus::AwaitingPlanApproval => crate::agent::activity::ActivityStatus::AwaitingPlanApproval,
+        MemberStatus::Blocked => crate::agent::activity::ActivityStatus::Failed,
         MemberStatus::Failed => crate::agent::activity::ActivityStatus::Failed,
         MemberStatus::Shutdown => crate::agent::activity::ActivityStatus::Shutdown,
     };
@@ -237,10 +305,12 @@ fn set_status(state: &Arc<TeamState>, name: &str, status: MemberStatus) {
         MemberStatus::Working => "working",
         MemberStatus::Idle => "idle",
         MemberStatus::AwaitingPlanApproval => "awaiting_plan_approval",
+        MemberStatus::Blocked => "blocked",
         MemberStatus::Failed => "failed",
         MemberStatus::Shutdown => "shutdown",
     };
     state.bus.publish(crate::core::event::Event::TaskUpdate { id: format!("team/{name}"), status: label });
+    Ok(())
 }
 
 #[cfg(test)]

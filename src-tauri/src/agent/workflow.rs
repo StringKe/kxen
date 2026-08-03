@@ -48,7 +48,10 @@ struct WfStats {
 /// run_id 给了就开 journal resume：同 run_id 重跑时已完成 agent 派发直接回缓存（崩溃/取消可续）。
 /// run_id 经宿主按 session 派生后才进 journal（open_scoped）：模型参数不能直接命中其它会话的旧 journal。
 pub async fn run_tool(script: &str, deps: SubagentDeps, ctx: &AgentContext, run_id: Option<&str>) -> Result<String, String> {
-    let journal = run_id.and_then(|id| crate::agent::workflow_journal::Journal::open_scoped(ctx.session_id.as_deref(), id, script));
+    let journal = match run_id {
+        Some(id) => Some(crate::agent::workflow_journal::Journal::open_scoped(ctx.session_id.as_deref(), id, script)?),
+        None => None,
+    };
     let (phase_tx, mut phase_rx) = mpsc::unbounded_channel::<PhaseMsg>();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -167,35 +170,47 @@ pub async fn run_script(
             // __kxen_agent(role, prompt, label?)：agent 双签名的 JS 判别层在 js::AGENT_JS。
             // 每次调用克隆一份 deps；计数器硬性封顶；journal resume 回缓存；成败都记 WfStats（信封）。
             let counter = Arc::new(AtomicU32::new(0));
+            let occurrences = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<(String, String, Option<String>), u32>::new()));
             let journal = std::sync::Arc::new(std::sync::Mutex::new(journal));
             let stats = Arc::new(std::sync::Mutex::new(WfStats::default()));
             let stats_agent = stats.clone();
             let agent_fn = Func::from(Async(move |role: String, prompt: String, label: Option<String>| {
                 let deps = deps.clone();
                 let counter = counter.clone();
+                let occurrences = occurrences.clone();
                 let journal = journal.clone();
                 let stats = stats_agent.clone();
                 async move {
-                    if let Some(cached) = crate::core::shared::lock(&journal).as_ref().and_then(|j| j.cached(&role, &prompt).cloned()) {
-                        *crate::core::shared::lock(&stats).ok_by_role.entry(role).or_insert(0) += 1;
-                        return Ok(cached);
-                    }
                     let n = counter.fetch_add(1, Ordering::Relaxed);
                     if n >= MAX_AGENTS_PER_WORKFLOW {
                         let msg = format!("workflow agent budget exhausted ({MAX_AGENTS_PER_WORKFLOW})");
                         crate::core::shared::lock(&stats).failures.push((label.unwrap_or(role), msg.clone()));
                         return Err(workflow_err(msg));
                     }
+                    let occurrence = {
+                        let mut occurrences = crate::core::shared::lock(&occurrences);
+                        let entry = occurrences.entry((role.clone(), prompt.clone(), label.clone())).or_insert(0);
+                        let current = *entry;
+                        *entry = entry.saturating_add(1);
+                        current
+                    };
+                    if let Some(cached) = crate::core::shared::lock(&journal)
+                        .as_ref()
+                        .and_then(|j| j.cached(&role, &prompt, label.as_deref(), occurrence).cloned())
+                    {
+                        *crate::core::shared::lock(&stats).ok_by_role.entry(role).or_insert(0) += 1;
+                        return Ok(cached);
+                    }
                     match dispatch(&role, prompt.clone(), &deps, crate::agent::activity::AgentKind::Workflow).await {
-                        Ok((_name, degraded, result)) => {
+                        Ok(result) => {
                             *crate::core::shared::lock(&stats).ok_by_role.entry(role.clone()).or_insert(0) += 1;
                             if let Some(j) = crate::core::shared::lock(&journal).as_mut() {
-                                j.record(&role, &prompt, &result);
+                                j.record(&role, &prompt, label.as_deref(), occurrence, &result.answer).map_err(workflow_err)?;
                             }
                             // 降级标注回给脚本：编排逻辑可感知换型（journal 缓存只存正文，标注不进缓存键）
-                            Ok(match degraded {
-                                Some(d) => format!("{result}\n[{d}]"),
-                                None => result,
+                            Ok(match result.degraded_note {
+                                Some(detail) => format!("{}\n[{detail}]", result.answer),
+                                None => result.answer,
                             })
                         }
                         Err(e) => {
@@ -269,6 +284,28 @@ fn workflow_err(msg: String) -> rquickjs::Error {
     rquickjs::Error::FromJs { from: "workflow agent", to: "promise", message: Some(msg) }
 }
 
+/// constraints 快照：角色绑定 + provider 实时可用性 + mrm 文字描述。
+async fn build_constraints(deps: &SubagentDeps) -> serde_json::Value {
+    let mut roles = serde_json::Map::new();
+    for role in ["thinking", "planning", "execution", "review", "research"] {
+        if let Some(binding) = deps.mrm.role(role) {
+            roles.insert(
+                role.to_string(),
+                serde_json::json!({
+                    "provider": binding.provider,
+                    "model": binding.model,
+                    "available": deps.mrm.available(&binding.provider).await,
+                }),
+            );
+        }
+    }
+    serde_json::json!({
+        "roles": roles,
+        "mrm": deps.mrm.describe().await,
+        "max_agents": MAX_AGENTS_PER_WORKFLOW,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,26 +337,4 @@ mod tests {
         // 无父令牌（subagent 嵌套外路径）：不建 watcher
         assert!(cascade_parent(None, &child).is_none());
     }
-}
-
-/// constraints 快照：角色绑定 + provider 实时可用性 + mrm 文字描述。
-async fn build_constraints(deps: &SubagentDeps) -> serde_json::Value {
-    let mut roles = serde_json::Map::new();
-    for role in ["thinking", "planning", "execution", "review", "research"] {
-        if let Some(binding) = deps.mrm.role(role) {
-            roles.insert(
-                role.to_string(),
-                serde_json::json!({
-                    "provider": binding.provider,
-                    "model": binding.model,
-                    "available": deps.mrm.available(&binding.provider).await,
-                }),
-            );
-        }
-    }
-    serde_json::json!({
-        "roles": roles,
-        "mrm": deps.mrm.describe().await,
-        "max_agents": MAX_AGENTS_PER_WORKFLOW,
-    })
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use super::TeamState;
-use super::inbox::drain_inbox;
+use super::inbox::{InboxDelivery, claim_inbox_entries};
 use super::types::TeamTaskStatus;
 
 /// idle 自醒周期（P1-3）：5min。notify 无超时会让空 inbox 的成员睡到下一封外部来信，
@@ -19,8 +19,8 @@ pub(super) const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// 超时自醒的 claim 提示：实际 claim 走模型既有 team_task 工具，不新造调度
 pub(super) const CLAIM_NUDGE: &str = "(idle check) No new messages. There are pending tasks available - claim one via team_task (action: claim) if you are free; otherwise keep idling.";
 
-/// plan 审批结构化前缀：lead verdict 私信的首部标记，member_loop 只认 starts_with 精确匹配。
-/// 旧语义 contains("Plan approved") 子串——lead 手写/转述该子串的任何消息都会误批，直接换语义不留兼容期。
+/// plan 审批结构化前缀只用于 inbox 和转录可读性。权限真相来自已提交的 Member.approved，
+/// 绝不从可伪造或先于 config finalize 可见的消息文本推断。
 pub(super) const PLAN_VERDICT_APPROVED: &str = "[plan-verdict:approved]";
 pub(super) const PLAN_VERDICT_REJECTED: &str = "[plan-verdict:rejected]";
 
@@ -31,7 +31,7 @@ pub(super) const MERGED_INBOX_CAP: usize = 16_000;
 
 pub(super) enum IdleWake {
     Cancel,
-    Inbox(Vec<(String, String)>),
+    Inbox(InboxDelivery),
     Nudge,
     Error(String),
 }
@@ -55,11 +55,11 @@ pub(super) async fn idle_wait(
         if cancel.is_cancelled() {
             return IdleWake::Cancel;
         }
-        let inbox = match drain_inbox(&state.dir, name) {
+        let inbox = match claim_inbox_entries(&state.dir, name) {
             Ok(inbox) => inbox,
             Err(error) => return IdleWake::Error(error),
         };
-        if !inbox.is_empty() {
+        if !inbox.entries.is_empty() {
             return IdleWake::Inbox(inbox);
         }
         if claim_nudge && super::tasks::has_claimable(state) {
@@ -71,9 +71,10 @@ pub(super) async fn idle_wait(
 /// 首轮 user 消息：brief 本体；restore 场景并入残存 inbox（P1-2：崩溃期间来信不丢）
 /// 与本人未完成 claim 清单（列出让模型自己续，不替它改任务状态）。
 /// spawn 与 restore 同路：新成员 inbox 必空、无本人任务，并入项自然为零。
-pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> Result<String, String> {
+pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> Result<(String, Option<InboxDelivery>), String> {
     let mut out = brief.to_string();
-    let inbox = drain_inbox(&state.dir, name)?;
+    let delivery = claim_inbox_entries(&state.dir, name)?;
+    let inbox = delivery.messages();
     if !inbox.is_empty() {
         push_inbox_transcript(state, name, &inbox);
         out.push_str(&format!("\n\n---\nNew messages:\n{}", inbox_text(&inbox)));
@@ -89,7 +90,8 @@ pub(super) fn first_prompt(state: &Arc<TeamState>, name: &str, brief: &str) -> R
             mine.join("\n")
         ));
     }
-    Ok(out)
+    let delivery = (!delivery.entries.is_empty()).then_some(delivery);
+    Ok((out, delivery))
 }
 
 /// 每轮 messages 装配：新鲜 system（roster 实时重建，不随历史冻结）+ 跨 wake 历史
@@ -132,11 +134,6 @@ fn join_capped(lines: impl IntoIterator<Item = String>) -> String {
 /// inbox 拼成一条 user 消息文本（[from] 标注来源）；合并超 cap 省略尾部（见 join_capped）。
 pub(super) fn inbox_text(inbox: &[(String, String)]) -> String {
     join_capped(inbox.iter().map(|(from, text)| format!("[{from}] {text}")))
-}
-
-/// 审批通过侦测：只认 lead verdict 私信的结构化前缀（lead 手写/转述 "Plan approved" 文本不再误批）
-pub(super) fn inbox_has_plan_approval(inbox: &[(String, String)]) -> bool {
-    inbox.iter().any(|(from, text)| from == "lead" && text.starts_with(PLAN_VERDICT_APPROVED))
 }
 
 /// P1-4：来信入 transcript + bus（复用 text 事件形态，AgentFocusView 按 kind=text 渲染可见）。
@@ -203,12 +200,12 @@ mod tests {
         super::super::tasks::claim_task(&state, "w").unwrap();
         let other = super::super::tasks::create_task(&state, "job-y", vec![]).unwrap();
         super::super::tasks::claim_task(&state, "z").unwrap();
-        let text = first_prompt(&state, "w", "brief here").unwrap();
+        let (text, delivery) = first_prompt(&state, "w", "brief here").unwrap();
         assert!(text.starts_with("brief here"));
         assert!(text.contains("[lead] extra context"), "残存 inbox 必须并入首轮: {text}");
         assert!(text.contains(&format!("#{} job-x", t.id)), "本人未完成 claim 必须列出: {text}");
         assert!(!text.contains(&format!("#{}", other.id)), "他人任务不得混入: {text}");
-        assert!(drain_inbox(&state.dir, "w").unwrap().is_empty(), "首轮 drain 后 inbox 应空");
+        assert_eq!(claim_inbox_entries(&state.dir, "w").unwrap().entries, delivery.unwrap().entries, "未 ack 消息必须仍可重放");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -266,7 +263,7 @@ mod tests {
         notify.notify_one();
         let wake = idle_wait(&state, "w", &notify, &cancel, std::time::Duration::from_secs(60), false).await;
         match wake {
-            IdleWake::Inbox(list) => assert_eq!(list[0].1, "ping"),
+            IdleWake::Inbox(delivery) => assert_eq!(delivery.messages()[0].1, "ping"),
             _ => panic!("有信必须走 Inbox"),
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -306,16 +303,6 @@ mod tests {
         cancel.cancel();
         h.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plan_approval_detection() {
-        assert!(inbox_has_plan_approval(&[("lead".into(), "[plan-verdict:approved] Plan approved. Proceed.".into())]));
-        assert!(!inbox_has_plan_approval(&[("lead".into(), "[plan-verdict:rejected] Revise.".into())]), "拒绝不得算通过");
-        // 误批回归：lead 手写/转述 "Plan approved" 文本（无结构化前缀）不再触发批准
-        assert!(!inbox_has_plan_approval(&[("lead".into(), "[lead] Plan approved. Proceed.".into())]));
-        assert!(!inbox_has_plan_approval(&[("lead".into(), "teammate keeps asking: Plan approved?".into())]));
-        assert!(!inbox_has_plan_approval(&[("peer".into(), "[plan-verdict:approved] x".into())]), "非 lead 伪造前缀不算数");
     }
 
     /// 合并 cap：批量来信超 MERGED_INBOX_CAP 省略尾部并标注条数；单条超限仍完整保留

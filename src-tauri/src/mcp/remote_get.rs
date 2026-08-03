@@ -1,6 +1,6 @@
 //! streamable http 的 standalone GET 流（MCP 2025-03-26 的 server 主动推送通道）：
 //! initialize 拿到 Mcp-Session-Id 后由 remote 拉起一次，断线按指数退避重连（上限 30s）。
-//! 只收 server 推送：反向请求（roots/list）与 stdio/SSE 同路径应答后走 POST 回传；
+//! 只收 server 推送：反向请求应答后走 POST 回传；remote roots/list 始终回空；
 //! notification 仅记录（kxen 无对应消费面）；response 帧按 id 路由给 request_inner 的在飞等待方。
 
 use super::remote::StreamableHttpTransport;
@@ -61,8 +61,9 @@ impl StreamableHttpTransport {
             // 与 POST 同一自愈思路：非显式配置先 refresh，本轮仍按失败退避，下轮用新 token
             if !self.explicit_auth
                 && let Some(auth) = &self.auth
+                && let Err(error) = auth.refresh().await
             {
-                let _ = auth.refresh().await;
+                tracing::warn!(error = %super::remote::refresh_failure(error), "mcp http GET stream token refresh failed");
             }
             return Attempt::Failed;
         }
@@ -82,25 +83,29 @@ impl StreamableHttpTransport {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let Ok(chunk) = chunk else { return Attempt::Failed };
-            for ev in parser.feed(&chunk) {
-                self.handle_push(&ev.data).await;
+            let Ok(events) = parser.feed(&chunk) else { return Attempt::Failed };
+            for ev in events {
+                if let Err(error) = self.handle_push(&ev.data).await {
+                    tracing::warn!(%error, "mcp http GET stream reverse response failed");
+                    return Attempt::Failed;
+                }
             }
         }
         Attempt::Closed
     }
 
     /// 一帧 server 推送：反向请求应答 / notification 记录 / response 按 id 路由。
-    async fn handle_push(&self, data: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(data) else { return };
+    async fn handle_push(&self, data: &str) -> Result<(), String> {
+        let Ok(v) = serde_json::from_str::<Value>(data) else { return Ok(()) };
         if v.get("method").is_some() {
-            if let Some(rid) = v.get("id").and_then(|i| i.as_u64()) {
-                // server 反向请求：应答帧走 POST（server 期待 202），失败不阻断读流
+            if let Some(rid) = super::transport::reverse_request_id(&v) {
+                // GET reader 不在自己的 task 内触发 session recovery，避免恢复流程 abort 当前 task。
                 let answer = super::transport::answer_server_request(&v, rid, &self.roots);
-                let _ = self.post(answer, ANSWER_TIMEOUT).await;
+                self.post_get_answer(answer, ANSWER_TIMEOUT).await?;
             } else {
                 tracing::debug!(frame = %v, "mcp http GET stream notification ignored");
             }
-            return;
+            return Ok(());
         }
         // response 帧：按 id 路由给等待方；正常应答走 POST 内联读取，无等待方属异常形态，记日志丢弃
         if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
@@ -112,5 +117,6 @@ impl StreamableHttpTransport {
                 None => tracing::debug!(id, "mcp http GET stream response with no waiter"),
             }
         }
+        Ok(())
     }
 }

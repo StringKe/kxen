@@ -11,9 +11,6 @@ pub enum Error {
     #[error("toml parse: {0}")]
     Toml(#[from] toml::de::Error),
 
-    #[error("keychain: {0}")]
-    Keyring(#[from] keyring::Error),
-
     #[error("{0}")]
     Custom(String),
 }

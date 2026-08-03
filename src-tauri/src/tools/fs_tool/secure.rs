@@ -97,12 +97,12 @@ fn read_capped_resolved(path: &ResolvedPath) -> Result<String, FsToolError> {
     if size > READ_MAX_BYTES {
         return Err(FsToolError::TooLarge { size });
     }
-    let mut text = String::with_capacity(size as usize);
-    file.read_to_string(&mut text)?;
-    if text.len() as u64 > READ_MAX_BYTES {
-        return Err(FsToolError::TooLarge { size: text.len() as u64 });
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.by_ref().take(READ_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > READ_MAX_BYTES {
+        return Err(FsToolError::TooLarge { size: bytes.len() as u64 });
     }
-    Ok(text)
+    Ok(String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?)
 }
 
 fn render_read_result(text: &str, offset: Option<usize>, limit: Option<usize>) -> ReadResult {
@@ -168,5 +168,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
         std::fs::remove_dir_all(workspace).ok();
         std::fs::remove_file(outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_edit_preserves_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = std::env::temp_dir().join(format!("kxen-cap-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = workspace.join("run.sh");
+        std::fs::write(&script, "echo old\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = crate::tools::path_policy::resolve("run.sh", &workspace, &HashSet::new()).unwrap();
+        let spec = EditSpec::Match { old_string: "old".into(), new_string: "new".into(), expected_replacements: Some(1) };
+
+        edit_resolved(&resolved, &spec, &FileTracker::default(), workspace.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::metadata(&script).unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::remove_dir_all(workspace).ok();
     }
 }

@@ -1,6 +1,6 @@
 //! OpenAI/Codex provider（ChatGPT Plus/Pro 订阅：backend-api 端点 + account 头）。
 
-use crate::llm::sse::SseFrame;
+use crate::llm::sse::{Projection, SseFrame};
 use crate::llm::tool::{ChunkFunction, ChunkToolCall};
 use crate::llm::types::{Delta, Message, Role};
 use futures::StreamExt;
@@ -136,6 +136,7 @@ impl OpenAiProvider {
         tools: &[crate::llm::tool::ToolDefinition],
     ) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
         let bearer = self.bearer.clone();
+        let error_bearer = bearer.clone();
         let account_id = self.account_id.clone();
         let url = if self.subscription { SUBSCRIPTION_URL } else { API_URL };
         let model = model.to_string();
@@ -166,16 +167,24 @@ impl OpenAiProvider {
             builder.json(&req).send().await
         };
 
-        Box::pin(futures::stream::once(start).flat_map(|result| {
-            match result {
-                Ok(resp) if resp.status().is_success() => stream_sse(resp),
-                Ok(resp) => futures::stream::once(async move {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Delta::Error(crate::llm::client::format_http_error("openai", status, &body))
+        Box::pin(futures::stream::once(start).flat_map(move |result| match result {
+            Ok(resp) if resp.status().is_success() => stream_sse(resp),
+            Ok(resp) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(crate::llm::client::bounded_http_error("openai", resp, &[error_bearer.as_ref()]).await)
                 })
-                .boxed(),
-                Err(e) => futures::stream::once(async move { Delta::Error(format!("openai request failed: {e}")) }).boxed(),
+                .boxed()
+            }
+            Err(error) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(format!(
+                        "openai request failed: {}",
+                        crate::core::net_security::sanitize_authenticated_error(&error, &[error_bearer.as_ref()])
+                    ))
+                })
+                .boxed()
             }
         }))
     }
@@ -185,29 +194,48 @@ fn stream_sse(resp: reqwest::Response) -> Pin<Box<dyn futures::Stream<Item = Del
     crate::llm::sse::stream_deltas(resp, delta_of)
 }
 
-fn delta_of(frame: SseFrame) -> Option<Delta> {
-    let SseFrame::Data(data) = frame else { return None };
-    let event: ResponsesEvent = serde_json::from_str(&data).ok()?;
+fn delta_of(frame: SseFrame) -> Projection {
+    let SseFrame::Data(data) = frame else {
+        return match frame {
+            SseFrame::Invalid(error) => Projection::Delta(Delta::Error(error)),
+            SseFrame::Done => Projection::Delta(Delta::Error("openai stream ended without response.completed".into())),
+            SseFrame::Data(_) => unreachable!(),
+        };
+    };
+    if let Some(error) = crate::llm::sse::payload_error("openai", &data) {
+        return Projection::Delta(Delta::Error(error));
+    }
+    let event: ResponsesEvent = match serde_json::from_str(&data) {
+        Ok(event) => event,
+        Err(error) => return Projection::Delta(Delta::Error(format!("openai invalid SSE payload: {error}"))),
+    };
     match event.kind.as_str() {
-        "response.output_text.delta" => event.delta.map(Delta::Text),
-        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => event.delta.map(Delta::Reasoning),
+        "response.output_text.delta" => event.delta.map_or(Projection::Ignore, |text| Projection::Delta(Delta::Text(text))),
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            event.delta.map_or(Projection::Ignore, |text| Projection::Delta(Delta::Reasoning(text)))
+        }
         // function_call 完整项一次性给出（output_item.done 必发），走累积器归位
         "response.output_item.done" => {
-            let item = event.item?;
+            let Some(item) = event.item else { return Projection::Ignore };
             if item.kind != "function_call" {
-                return None;
+                return Projection::Ignore;
             }
-            Some(Delta::ToolFragments(vec![ChunkToolCall {
+            Projection::Delta(Delta::ToolFragments(vec![ChunkToolCall {
                 index: event.output_index,
                 id: item.call_id.or(item.id),
                 function: Some(ChunkFunction { name: item.name, arguments: item.arguments }),
             }]))
         }
-        "response.completed" => event
-            .response
-            .and_then(|r| r.usage)
-            .map(|u| Delta::Usage { input: u.input_tokens.unwrap_or(0), output: u.output_tokens.unwrap_or(0) }),
-        _ => None,
+        "response.completed" => Projection::Complete(
+            event
+                .response
+                .and_then(|response| response.usage)
+                .and_then(|usage| Some(Delta::Usage { input: usage.input_tokens?, output: usage.output_tokens? })),
+        ),
+        "response.failed" | "response.incomplete" => {
+            Projection::Delta(Delta::Error(format!("openai stream terminal error: {}", event.kind)))
+        }
+        _ => Projection::Ignore,
     }
 }
 
@@ -249,8 +277,7 @@ mod tests {
         let frame = SseFrame::Data(
             r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"exec","arguments":"{\"command\":\"ls\"}"}}"#.into(),
         );
-        let d = delta_of(frame).expect("function_call 应产出 fragments");
-        let Delta::ToolFragments(f) = d else { panic!("wrong delta") };
+        let Projection::Delta(Delta::ToolFragments(f)) = delta_of(frame) else { panic!("wrong delta") };
         let mut acc = ToolCallAccumulator::default();
         acc.push(&f);
         let calls = acc.take();
@@ -258,5 +285,20 @@ mod tests {
         assert_eq!(calls[0].id, "call_9");
         assert_eq!(calls[0].name, "exec");
         assert_eq!(calls[0].arguments, "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn completed_requires_complete_usage_fields_but_still_terminates() {
+        let frame = SseFrame::Data(r#"{"type":"response.completed","response":{"usage":{"input_tokens":10}}}"#.into());
+        assert!(matches!(delta_of(frame), Projection::Complete(None)));
+    }
+
+    #[test]
+    fn failed_and_malformed_events_are_errors() {
+        assert!(matches!(
+            delta_of(SseFrame::Data(r#"{"type":"response.failed","response":{"error":{"message":"denied"}}}"#.into())),
+            Projection::Delta(Delta::Error(error)) if error.contains("denied")
+        ));
+        assert!(matches!(delta_of(SseFrame::Data("{".into())), Projection::Delta(Delta::Error(error)) if error.contains("invalid SSE")));
     }
 }

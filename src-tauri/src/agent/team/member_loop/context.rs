@@ -2,7 +2,7 @@ use super::super::TeamState;
 use crate::agent::agent_loop::AgentContext;
 use crate::agent::cancel::CancelToken;
 use crate::auth::refresh::RefreshOutcome;
-use crate::core::shared::{lock, read};
+use crate::core::shared::lock;
 use crate::llm::ModelRef;
 use serde_json::json;
 use std::future::Future;
@@ -31,7 +31,7 @@ pub(super) fn build_ctx(
         model: model.clone(),
         store: lock(&state.deps.store).clone(),
         max_turns: 16,
-        mrm: Some(read(&state.deps.mrm).clone()),
+        mrm: Some(runtime.mrm()),
         allowed_tools: allowed,
         extras: Some(state.deps.extras.extras_for(&state.session_id)),
         hooks: Some(runtime.hooks()),
@@ -68,17 +68,7 @@ pub(super) fn build_ctx(
 }
 
 fn usage_reporter(state: &Arc<TeamState>) -> crate::agent::agent_loop::UsageReporter {
-    let session_usage = state.deps.session_usage.clone();
-    let session_id = state.session_id.clone();
-    let bus = state.bus.clone();
-    Arc::new(move |stats| {
-        let mut usage = crate::core::shared::lock(&session_usage);
-        crate::core::usage::add_run(&mut usage, &session_id, stats);
-        if let Err(error) = crate::core::usage::persist(&usage) {
-            tracing::error!(%error, %session_id, "teammate session usage save failed");
-            bus.publish(crate::core::event::Event::notify(format!("会话用量保存失败：{error}"), Some(session_id.clone())));
-        }
-    })
+    crate::agent::agent_loop::UsageReporter::new(state.session_id.clone(), state.deps.session_usage.clone(), state.bus.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

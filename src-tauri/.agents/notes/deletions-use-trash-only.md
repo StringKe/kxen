@@ -4,4 +4,4 @@ description: Deletions use trash only
 date: 2026-07-24
 ---
 
-All file removal must go through trash for recoverability. Direct rm is forbidden; high-risk ops route through ApprovalBroker.
+User-requested removal of Workspace or knowledge content must go through trash for recoverability. Shell `rm` and equivalent destructive commands are denied; high-risk operations route through ApprovalBroker. Internal cleanup may unlink owned temporary, lock, cache, or transaction files after their exact path has been resolved.

@@ -54,8 +54,11 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
         }
         "diff.agent_status" => {
             let id = params.get("session_id").and_then(Value::as_str).ok_or("missing session_id")?;
-            let entries =
-                kxen_app::core::shared::lock(&state.session_snapshots).get(id).map(|snapshot| snapshot.status()).unwrap_or_default();
+            let snapshot = kxen_app::core::shared::lock(&state.session_snapshots).get(id).cloned();
+            let entries = match snapshot {
+                Some(snapshot) => snapshot.status().map_err(|error| error.to_string())?,
+                None => Vec::new(),
+            };
             serde_json::to_value(entries).map_err(|error| error.to_string())
         }
         "diff.agent_file" => {
@@ -63,7 +66,13 @@ pub(super) async fn try_handle(method: &str, params: &Value, state: &Arc<AppStat
             let path = params.get("path").and_then(Value::as_str).ok_or("missing path")?;
             let store = kxen_app::core::shared::lock(&state.session_snapshots).get(id).cloned();
             let path = std::path::Path::new(path);
-            let text = store.and_then(|snapshot| snapshot.diff(path).or_else(|| snapshot.diff_created(path)));
+            let text = match store {
+                Some(snapshot) => match snapshot.diff(path).map_err(|error| error.to_string())? {
+                    Some(text) => Some(text),
+                    None => snapshot.diff_created(path).map_err(|error| error.to_string())?,
+                },
+                None => None,
+            };
             Ok(json!({ "text": text.unwrap_or_default() }))
         }
         "diff.file" => {

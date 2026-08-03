@@ -1,5 +1,5 @@
 // goal 生命周期 / 预算 / 证据校验测试。
-use kxen_app::core::goal::{Goal, GoalBudget, GoalContract, GoalStatus, evidence_sufficient};
+use kxen_app::core::goal::{Goal, GoalBudget, GoalContract, GoalStatus, checked_turn_budget, evidence_sufficient};
 
 fn contract() -> GoalContract {
     GoalContract {
@@ -32,6 +32,24 @@ fn blocked_after_three_same_reasons() {
     for _ in 0..2 {
         g.record_turn(0, Some("网络不可达"), false).unwrap();
         assert_eq!(g.status, GoalStatus::Active);
+    }
+    g.record_turn(0, Some("网络不可达"), false).unwrap();
+    assert_eq!(g.status, GoalStatus::Blocked);
+}
+
+#[test]
+fn resumed_blocked_goal_requires_a_fresh_three_turn_audit() {
+    let mut g = Goal::create(GoalContract { budget: GoalBudget::default(), ..contract() }, "g-block-resume".into()).unwrap();
+    g.activate().unwrap();
+    for _ in 0..3 {
+        g.record_turn(0, Some("网络不可达"), false).unwrap();
+    }
+    g.resume().unwrap();
+    assert_eq!(g.consecutive_blocks, 0);
+    assert_eq!(g.block_reason, None);
+    for round in 0..2 {
+        g.record_turn(0, Some("网络不可达"), false).unwrap();
+        assert_eq!(g.status, GoalStatus::Active, "resumed audit round {round} must not re-block early");
     }
     g.record_turn(0, Some("网络不可达"), false).unwrap();
     assert_eq!(g.status, GoalStatus::Blocked);
@@ -88,6 +106,35 @@ fn budget_limited() {
 }
 
 #[test]
+fn turn_budget_rejects_values_that_do_not_fit_persisted_u32() {
+    assert_eq!(checked_turn_budget(Some(u32::MAX as u64)).unwrap(), Some(u32::MAX));
+    assert!(checked_turn_budget(Some(u32::MAX as u64 + 1)).is_err());
+}
+
+#[test]
+fn goal_ids_cannot_escape_the_goal_directory() {
+    let dir = std::env::temp_dir().join(format!("kxen-goal-id-{}", uuid::Uuid::new_v4()));
+    assert!(Goal::create(contract(), "../escape".into()).is_err());
+    assert!(Goal::load(&dir, "../escape").is_err());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut valid = Goal::create(contract(), "goal-valid".into()).unwrap();
+    valid.id = "../escape".into();
+    assert!(valid.save(&dir).is_err());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn goal_usage_counters_saturate_instead_of_wrapping() {
+    let mut g = Goal::create(GoalContract { budget: GoalBudget::default(), ..contract() }, "g-saturate".into()).unwrap();
+    g.activate().unwrap();
+    g.turns_used = u32::MAX;
+    g.tokens_used = u64::MAX;
+    g.record_turn(u64::MAX, Some("blocked"), false).unwrap();
+    assert_eq!(g.turns_used, u32::MAX);
+    assert_eq!(g.tokens_used, u64::MAX);
+}
+
+#[test]
 fn adjust_budget_and_resume() {
     // turns 预算 5 打满：adjust 后限额提到 2x 已用 = 10，状态回 Active，续跑不再立刻超限
     let mut g = Goal::create(contract(), "g4".into()).unwrap();
@@ -96,12 +143,51 @@ fn adjust_budget_and_resume() {
         g.record_turn(0, None, false).unwrap();
     }
     assert_eq!(g.status, GoalStatus::BudgetLimited);
+    assert!(g.resume().is_err(), "BudgetLimited 禁止普通 resume，必须先 adjust budget");
+    assert_eq!(g.status, GoalStatus::BudgetLimited);
     g.adjust_budget_and_resume().unwrap();
     assert_eq!(g.status, GoalStatus::Active);
     assert_eq!(g.contract.budget.turns, Some(10));
     assert_eq!(g.contract.budget.tokens, Some(1000)); // 未打满的维度不动
     g.record_turn(0, None, false).unwrap();
     assert_eq!(g.status, GoalStatus::Active, "提高后的额度内续跑不得再次超限");
+}
+
+#[tokio::test]
+async fn goal_tool_rejects_budget_limited_resume_and_accepts_adjust() {
+    use kxen_app::agent::agent_loop::execute_goal_tool;
+
+    let dir = goals_dir_isolation();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut goal = Goal::create(contract(), "goal-budget-tool".into()).unwrap();
+    goal.activate().unwrap();
+    for _ in 0..5 {
+        goal.record_turn(0, None, false).unwrap();
+    }
+    goal.save(&dir).unwrap();
+
+    let resume = execute_goal_tool(&serde_json::json!({"action": "resume", "id": goal.id}), None, None, None, None).await;
+    assert!(resume.is_err(), "tool resume must reject BudgetLimited");
+    assert_eq!(Goal::load(&dir, "goal-budget-tool").unwrap().status, GoalStatus::BudgetLimited);
+
+    execute_goal_tool(&serde_json::json!({"action": "adjust", "id": "goal-budget-tool"}), None, None, None, None).await.unwrap();
+    assert_eq!(Goal::load(&dir, "goal-budget-tool").unwrap().status, GoalStatus::Active);
+    let _ = std::fs::remove_file(dir.join("goal-budget-tool.json"));
+}
+
+#[test]
+fn adjust_acknowledges_unknown_usage_without_losing_audit_count() {
+    let mut g = Goal::create(contract(), "g-unknown".into()).unwrap();
+    g.activate().unwrap();
+    g.record_unmetered_call().unwrap();
+    assert_eq!(g.status, GoalStatus::BudgetLimited);
+
+    g.adjust_budget_and_resume().unwrap();
+
+    assert_eq!(g.status, GoalStatus::Active);
+    assert_eq!(g.unmetered_calls, 0);
+    assert_eq!(g.acknowledged_unmetered_calls, 1);
+    assert!(matches!(g.runtime_budget(kxen_app::core::shared::now_ms()), kxen_app::core::goal::RuntimeBudget::Unbounded));
 }
 
 #[test]
@@ -122,6 +208,23 @@ fn persist_roundtrip() {
     let loaded = Goal::load(&dir, "gx").unwrap();
     assert_eq!(loaded.status, GoalStatus::Active);
     assert!(Goal::list(&dir).iter().any(|x| x.id == "gx"));
+    assert!(!dir.join("gx.json.tmp").exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn save_refuses_to_replace_corrupt_goal() {
+    let dir = std::env::temp_dir().join(format!("kxen-goal-save-corrupt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gx-corrupt.json");
+    std::fs::write(&path, "{not json").unwrap();
+    let goal = Goal::create(contract(), "gx-corrupt".into()).unwrap();
+
+    let error = goal.save(&dir).expect_err("corrupt persisted goal must not be replaced");
+
+    assert!(error.to_string().contains("refuse to replace corrupt goal"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+    assert!(!dir.join("gx-corrupt.json.tmp").exists());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -142,6 +245,18 @@ fn focus_prefers_session_goal_over_global() {
     assert_eq!(Goal::focus_for(&dir, Some("s1")).unwrap().id, "g_s1");
     // 无归属/其它 session：回落全局
     assert_eq!(Goal::focus_for(&dir, Some("s2")).unwrap().id, "g_global");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn checked_focus_rejects_corrupt_goal_store() {
+    let dir = std::env::temp_dir().join(format!("kxen-goal-corrupt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("goal-bad.json"), "{not json").unwrap();
+
+    let error = Goal::focus_for_checked(&dir, Some("s1")).expect_err("corrupt goal state must block admission");
+    assert!(error.to_string().contains("goal-bad.json"));
+    assert_eq!(std::fs::read_to_string(dir.join("goal-bad.json")).unwrap(), "{not json");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -202,6 +317,23 @@ fn pause_resume_accumulates_paused_ms() {
 }
 
 #[test]
+fn late_provider_usage_is_audited_after_pause_or_cancel() {
+    let mut paused = Goal::create(contract(), "goal-late-paused".into()).unwrap();
+    paused.activate().unwrap();
+    paused.pause().unwrap();
+    paused.settle_tokens(23).unwrap();
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(paused.tokens_used, 23);
+
+    let mut canceled = Goal::create(contract(), "goal-late-canceled".into()).unwrap();
+    canceled.activate().unwrap();
+    canceled.cancel().unwrap();
+    canceled.settle_unmetered_call().unwrap();
+    assert_eq!(canceled.status, GoalStatus::Canceled);
+    assert_eq!(canceled.unmetered_calls, 1);
+}
+
+#[test]
 fn record_turn_wall_uses_active_time() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     // 真实跨度 10s 超 500ms 预算
@@ -227,8 +359,16 @@ fn goals_dir_isolation() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("kxen-goal-tool-{}", std::process::id()));
     ONCE.call_once(|| unsafe {
         std::env::set_var("KXEN_GOALS_DIR", &dir);
+        std::env::set_var("KXEN_SESSIONS_DIR", dir.join("sessions"));
     });
     dir
+}
+
+/// session 绑定的 goal 变更过 live Session admission（load_meta 查活），先落一个真实会话。
+fn create_bound_session() -> String {
+    let workspace = goals_dir_isolation().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    kxen_app::core::session::create(&kxen_app::core::paths::sessions_dir(), workspace.to_str().unwrap()).unwrap().id
 }
 
 #[tokio::test]
@@ -237,13 +377,15 @@ async fn goal_tool_publishes_goal_update_on_create_and_transit() {
     use kxen_app::core::event::{Event, EventBus};
 
     let dir = goals_dir_isolation();
+    let session_id = create_bound_session();
     let bus = EventBus::new(16);
     let mut rx = bus.subscribe();
 
     let out = execute_goal_tool(
         &serde_json::json!({"action": "create", "objective": "迁移完成", "completion_criteria": "测试全绿"}),
-        Some("sess-pub"),
+        Some(session_id.as_str()),
         Some(&bus),
+        None,
         None,
     )
     .await
@@ -259,7 +401,7 @@ async fn goal_tool_publishes_goal_update_on_create_and_transit() {
 
     for (action, want) in [("activate", "active"), ("cancel", "canceled")] {
         let args = serde_json::json!({"action": action, "id": id});
-        execute_goal_tool(&args, None, Some(&bus), None).await.unwrap();
+        execute_goal_tool(&args, None, Some(&bus), None, None).await.unwrap();
         match rx.try_recv().unwrap() {
             Event::GoalUpdate { id: got, status } => {
                 assert_eq!(got, id);
@@ -270,11 +412,53 @@ async fn goal_tool_publishes_goal_update_on_create_and_transit() {
     }
 
     // get 只读：无状态迁移不发事件
-    execute_goal_tool(&serde_json::json!({"action": "get", "id": id}), None, Some(&bus), None).await.unwrap();
+    execute_goal_tool(&serde_json::json!({"action": "get", "id": id}), None, Some(&bus), None, None).await.unwrap();
     assert!(rx.try_recv().is_err(), "get 不应发 GoalUpdate");
 
     // 无 bus（子代理无事件通道）不 panic，落盘照常
-    execute_goal_tool(&serde_json::json!({"action": "list"}), None, None, None).await.unwrap();
+    execute_goal_tool(&serde_json::json!({"action": "list"}), None, None, None, None).await.unwrap();
 
-    std::fs::remove_dir_all(&dir).ok();
+    // 隔离目录是进程内多测试共享的，只清自己的 goal 文件，不能整目录端掉
+    std::fs::remove_file(dir.join(format!("{id}.json"))).ok();
+}
+
+#[tokio::test]
+async fn goal_tool_cancel_stops_the_bound_run() {
+    use kxen_app::agent::agent_loop::execute_goal_tool;
+
+    let dir = goals_dir_isolation();
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_id = create_bound_session();
+    let mut goal = Goal::create(contract(), "goal-run-cancel".into()).unwrap();
+    goal.session_id = Some(session_id.clone());
+    goal.activate().unwrap();
+    goal.save(&dir).unwrap();
+    let cancel = kxen_app::agent::cancel::CancelToken::new();
+
+    execute_goal_tool(&serde_json::json!({"action": "cancel", "id": goal.id}), Some(session_id.as_str()), None, None, Some(&cancel))
+        .await
+        .unwrap();
+
+    assert!(cancel.is_cancelled(), "canceling the session goal must stop its in-flight run");
+    let _ = std::fs::remove_file(dir.join("goal-run-cancel.json"));
+}
+
+#[test]
+fn explicit_auxiliary_usage_charges_the_requested_goal() {
+    let dir = goals_dir_isolation();
+    std::fs::create_dir_all(&dir).unwrap();
+    let session_id = create_bound_session();
+    for id in ["goal-charge-a", "goal-charge-b"] {
+        let mut goal = Goal::create(contract(), id.into()).unwrap();
+        goal.session_id = Some(session_id.clone());
+        goal.activate().unwrap();
+        goal.save(&dir).unwrap();
+    }
+
+    kxen_app::agent::agent_loop::charge_goal_usage_for("goal-charge-a", Some(17), None).unwrap();
+
+    assert_eq!(Goal::load(&dir, "goal-charge-a").unwrap().tokens_used, 17);
+    assert_eq!(Goal::load(&dir, "goal-charge-b").unwrap().tokens_used, 0);
+    let _ = std::fs::remove_file(dir.join("goal-charge-a.json"));
+    let _ = std::fs::remove_file(dir.join("goal-charge-b.json"));
 }

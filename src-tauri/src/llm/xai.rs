@@ -1,7 +1,7 @@
 //! xAI provider（OpenAI 兼容薄实现：registry 全部 OpenAI 兼容厂商共用的 wire 层）。
 
 use crate::core::shared::SharedStr;
-use crate::llm::sse::SseFrame;
+use crate::llm::sse::{Projection, SseFrame};
 use crate::llm::tool::ToolDefinition;
 use crate::llm::types::{Delta, Message};
 use futures::StreamExt;
@@ -96,7 +96,8 @@ struct Usage {
 impl XaiProvider {
     /// OpenAI 兼容端点（providers registry / 自定义类型提供商：完整 chat URL + bearer）。
     pub fn custom(base_url: String, bearer: impl Into<String>) -> Self {
-        Self { url: base_url.into(), http: crate::llm::client::shared_http(), bearer: SharedStr::from(bearer.into()) }
+        let http = crate::llm::client::shared_http_for_url(&base_url);
+        Self { url: base_url.into(), http, bearer: SharedStr::from(bearer.into()) }
     }
 
     /// 流式调用：返回 Delta 的异步流（'static，不借 provider）。
@@ -108,6 +109,7 @@ impl XaiProvider {
     ) -> Pin<Box<dyn futures::Stream<Item = Delta> + Send>> {
         let tools_owned: Option<Vec<ToolDefinition>> = if tools.is_empty() { None } else { Some(tools.to_vec()) };
         let bearer = self.bearer.clone();
+        let error_bearer = bearer.clone();
         let model = model.to_string();
         let messages = messages.to_vec();
         let http = self.http.clone();
@@ -129,16 +131,24 @@ impl XaiProvider {
                 .await
         };
 
-        Box::pin(futures::stream::once(start).flat_map(|result| {
-            match result {
-                Ok(resp) if resp.status().is_success() => stream_sse(resp),
-                Ok(resp) => futures::stream::once(async move {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Delta::Error(crate::llm::client::format_http_error("xai", status, &body))
+        Box::pin(futures::stream::once(start).flat_map(move |result| match result {
+            Ok(resp) if resp.status().is_success() => stream_sse(resp),
+            Ok(resp) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(crate::llm::client::bounded_http_error("xai", resp, &[error_bearer.as_ref()]).await)
                 })
-                .boxed(),
-                Err(e) => futures::stream::once(async move { Delta::Error(format!("xai request failed: {e}")) }).boxed(),
+                .boxed()
+            }
+            Err(error) => {
+                let error_bearer = error_bearer.clone();
+                futures::stream::once(async move {
+                    Delta::Error(format!(
+                        "xai request failed: {}",
+                        crate::core::net_security::sanitize_authenticated_error(&error, &[error_bearer.as_ref()])
+                    ))
+                })
+                .boxed()
             }
         }))
     }
@@ -148,22 +158,32 @@ fn stream_sse(resp: reqwest::Response) -> Pin<Box<dyn futures::Stream<Item = Del
     crate::llm::sse::stream_deltas(resp, delta_of)
 }
 
-fn delta_of(frame: SseFrame) -> Option<Delta> {
+fn delta_of(frame: SseFrame) -> Projection {
     match frame {
-        SseFrame::Done => None,
+        SseFrame::Done => Projection::Complete(None),
+        SseFrame::Invalid(error) => Projection::Delta(Delta::Error(error)),
         SseFrame::Data(data) => {
-            let chunk: ChatChunk = serde_json::from_str(&data).ok()?;
-            if let Some(usage) = chunk.usage {
-                return Some(Delta::Usage { input: usage.prompt_tokens.unwrap_or(0), output: usage.completion_tokens.unwrap_or(0) });
+            if let Some(error) = crate::llm::sse::payload_error("xai", &data) {
+                return Projection::Delta(Delta::Error(error));
             }
-            let delta = chunk.choices.into_iter().next()?.delta;
+            let chunk: ChatChunk = match serde_json::from_str(&data) {
+                Ok(chunk) => chunk,
+                Err(error) => return Projection::Delta(Delta::Error(format!("xai invalid SSE payload: {error}"))),
+            };
+            if let Some(usage) = chunk.usage {
+                return match (usage.prompt_tokens, usage.completion_tokens) {
+                    (Some(input), Some(output)) => Projection::Delta(Delta::Usage { input, output }),
+                    _ => Projection::Ignore,
+                };
+            }
+            let Some(delta) = chunk.choices.into_iter().next().map(|choice| choice.delta) else { return Projection::Ignore };
             if !delta.tool_calls.is_empty() {
-                return Some(Delta::ToolFragments(delta.tool_calls));
+                return Projection::Delta(Delta::ToolFragments(delta.tool_calls));
             }
             if let Some(reasoning) = delta.reasoning_content {
-                return Some(Delta::Reasoning(reasoning));
+                return Projection::Delta(Delta::Reasoning(reasoning));
             }
-            delta.content.map(Delta::Text)
+            delta.content.map_or(Projection::Ignore, |text| Projection::Delta(Delta::Text(text)))
         }
     }
 }
@@ -176,14 +196,27 @@ mod tests {
     fn parses_chat_chunk() {
         let json = r#"{"choices":[{"delta":{"content":"pong"}}]}"#;
         let frame = SseFrame::Data(json.into());
-        assert!(matches!(delta_of(frame), Some(Delta::Text(t)) if t == "pong"));
+        assert!(matches!(delta_of(frame), Projection::Delta(Delta::Text(t)) if t == "pong"));
     }
 
     #[test]
     fn parses_usage() {
         let json = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#;
         let frame = SseFrame::Data(json.into());
-        assert!(matches!(delta_of(frame), Some(Delta::Usage { input: 10, output: 4 })));
+        assert!(matches!(delta_of(frame), Projection::Delta(Delta::Usage { input: 10, output: 4 })));
+    }
+
+    #[test]
+    fn malformed_and_application_error_frames_are_errors() {
+        assert!(matches!(delta_of(SseFrame::Data("{".into())), Projection::Delta(Delta::Error(error)) if error.contains("invalid SSE")));
+        let payload = r#"{"error":{"type":"invalid_request_error","message":"bad key"}}"#;
+        assert!(matches!(delta_of(SseFrame::Data(payload.into())), Projection::Delta(Delta::Error(error)) if error.contains("bad key")));
+    }
+
+    #[test]
+    fn incomplete_usage_is_not_reported_as_zero() {
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":10}}"#;
+        assert!(matches!(delta_of(SseFrame::Data(payload.into())), Projection::Ignore));
     }
 }
 

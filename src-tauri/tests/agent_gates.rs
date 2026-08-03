@@ -25,12 +25,17 @@ fn test_ctx() -> AgentContext {
         team: None,
         team_identity: Some(("s".into(), "worker".into())),
         session_id: Some("s".into()),
+        bound_goal_id: None,
+        goal_binding_frozen: false,
         agents: None,
         bus: None,
         approvals: None,
         mcp: None,
         lsp: None,
         notify: None,
+        persist_compaction: None,
+        auxiliary_usage: Arc::default(),
+        usage_reporter: None,
         on_event: Arc::new(|_| {}),
         stream_override: None,
     }
@@ -44,12 +49,12 @@ async fn team_tool_is_lead_only() {
     assert!(err.contains("lead-only"), "got: {err}");
 }
 
-/// task start 过 shell safety：Deny 档直接拒绝，不进 dev_server。
+/// task start 过 shell safety：永久删除由 F5 直接拒绝，不进 dev_server。
 #[tokio::test]
 async fn task_start_blocked_by_safety() {
     let ctx = test_ctx();
     let err = execute_task_tool(&json!({ "action": "start", "command": "rm -rf /" }), &ctx).await.unwrap_err();
-    assert!(err.contains("F1"), "got: {err}");
+    assert!(err.contains("F5"), "got: {err}");
 }
 
 /// task start 的 Ask 档无审批通道按拒绝处理（不静默放行）。
@@ -93,6 +98,6 @@ fn read_only_classification() {
         assert!(is_read_only_builtin(name), "{name} 应为只读");
     }
     for name in ["edit", "write", "delete", "exec", "task", "goal", "agent", "tool_search", "mcp__s__read_file"] {
-        assert!(!is_read_only_builtin(name), "{name} 不在内置只读集（MCP 只看 annotation）");
+        assert!(!is_read_only_builtin(name), "{name} 不在宿主可信的内置只读集");
     }
 }

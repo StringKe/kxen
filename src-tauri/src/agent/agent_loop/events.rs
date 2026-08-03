@@ -54,6 +54,8 @@ pub struct RunStats {
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub unmetered_calls: u64,
+    pub usage_complete: bool,
     /// 最近一次请求的 input tokens（ctx 当前水位；累计 input 不代表窗口占用）
     pub last_input_tokens: u64,
     pub tokens_per_sec: u64,
@@ -66,4 +68,6 @@ pub struct AgentOutcome {
     pub aborted: bool,
     pub stats: Option<RunStats>,
     pub terminal: AgentEvent,
+    /// 本 run 真正开始过请求的模型。本地预检、admission、no-op 失败保持 None。
+    pub provider_model: Option<crate::llm::ModelRef>,
 }

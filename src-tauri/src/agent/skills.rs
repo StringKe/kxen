@@ -138,7 +138,7 @@ mod tests {
     fn scan_flat_and_nested() {
         setup();
         let dir = fixture("scan");
-        crate::core::trust::trust(&dir); // 生产语义：未信任项目 skill 不进清单，夹具显式信任
+        crate::core::trust::trust(&dir).unwrap(); // 生产语义：未信任项目 skill 不进清单，夹具显式信任
         let skills = scan(&dir);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"commit"));
@@ -159,7 +159,7 @@ mod tests {
     fn arguments_expansion() {
         setup();
         let dir = fixture("args");
-        crate::core::trust::trust(&dir);
+        crate::core::trust::trust(&dir).unwrap();
         let skill = find(&dir, "commit").unwrap();
         let loaded = render_loaded(&skill, "fix login bug", "user", "");
         assert!(loaded.contains("请按规范提交：fix login bug"));
@@ -176,7 +176,7 @@ mod tests {
     fn missing_description_is_skipped() {
         setup();
         let dir = std::env::temp_dir().join(format!("kxen-skills-bad-{}", std::process::id()));
-        crate::core::trust::trust(&dir);
+        crate::core::trust::trust(&dir).unwrap();
         let flat = dir.join(".agents/skills");
         std::fs::create_dir_all(&flat).unwrap();
         std::fs::write(flat.join("nodesc.md"), "---\nname: nodesc\n---\nbody\n").unwrap();

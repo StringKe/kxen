@@ -103,7 +103,7 @@ fn checkpoint_label(messages: &[kxen_app::core::session::Message], idx: usize) -
     messages[..=idx].iter().rev().find(|m| m.role == kxen_app::core::session::Role::User).map(|m| m.id.as_str())
 }
 
-/// checkpoint commit 失败只 warn（barrier 不阻塞 run），rewind 才暴露缺失：归一类结构化 code，前端 rewindErrorText 按 code 上人话。
+/// 存量或损坏 shadow repo 仍可能缺 checkpoint：归一类结构化 code，前端按 code 展示。
 fn checkpoint_missing_wire(e: &str, label: &str) -> String {
     if e.contains("checkpoint not found") {
         let message = format!("消息 {label} 的代码检查点未保存成功，无法回退到此处");
@@ -119,7 +119,9 @@ pub(super) fn session_rewind(params: &Value, state: &crate::AppState) -> Result<
     let confirm = params.get("confirm").and_then(Value::as_bool).unwrap_or(false);
     let dir = kxen_app::core::paths::sessions_dir();
     let meta = kxen_app::core::session::load_meta(&dir, session_id).map_err(|e| e.to_string())?;
-    let messages = kxen_app::core::session::load_messages(&dir, session_id);
+    let messages = kxen_app::core::session::load_messages_checked(&dir, session_id)
+        .map_err(|error| format!("session history unavailable: {error}"))?;
+    let affected_sessions = workspace_session_ids(&dir, &meta.directory)?;
     let target = messages.iter().find(|m| m.id == message_id).map(|m| RewindTarget {
         id: m.id.clone(),
         role: role_name(m.role),
@@ -132,46 +134,130 @@ pub(super) fn session_rewind(params: &Value, state: &crate::AppState) -> Result<
         return Err(rewind_gate(true, 0, false, target).expect_err("active_run 分支必拒").to_wire());
     };
     // 同 workspace（按 session 归属目录判定）任何 session 有 active run 即拒绝
-    let active_in_workspace = kxen_app::core::shared::lock(&state.active_runs)
-        .keys()
-        .any(|sid| kxen_app::core::session::load_meta(&dir, sid).map(|m| m.directory == meta.directory).unwrap_or(false));
-    let dirty_count = kxen_app::tools::checkpoint::dirty_count(std::path::Path::new(&meta.directory));
+    let active_sessions: Vec<String> = kxen_app::core::shared::lock(&state.active_runs).keys().cloned().collect();
+    let mut active_in_workspace = false;
+    for active_id in active_sessions {
+        let active_meta = kxen_app::core::session::load_meta(&dir, &active_id)
+            .map_err(|error| format!("active session {active_id} metadata unavailable: {error}"))?;
+        active_in_workspace |= active_meta.directory == meta.directory;
+    }
+    let dirty_count = kxen_app::tools::checkpoint::dirty_count(std::path::Path::new(&meta.directory))
+        .map_err(|error| format!("checkpoint dirty-state check failed: {error}"))?;
     rewind_gate(active_in_workspace, dirty_count, confirm, target).map_err(|b| b.to_wire())?;
     let idx = messages.iter().position(|m| m.id == message_id).expect("rewind_gate 已确认消息存在");
     let label = checkpoint_label(&messages, idx).ok_or("no user checkpoint before this message")?;
-    let hash = kxen_app::tools::checkpoint::reset_to(std::path::Path::new(&meta.directory), label)
-        .map_err(|e| checkpoint_missing_wire(&e, label))?;
-    kxen_app::core::session::rewrite_messages(&dir, session_id, &messages[..=idx]).map_err(|e| e.to_string())?;
-    // 截断点之后的 agent 改动已被 reset_to 从磁盘抹掉：快照里对应条目（尤其被回滚的新建文件）
-    // 会变成 before/after 双 None 的「新增 +0 -0」幻影行，按磁盘现状清掉
-    if let Some(store) = kxen_app::core::shared::lock(&state.session_snapshots).get(session_id) {
-        store.prune_reverted();
+    let mut durability_warning = None;
+    let (hash, ()) = kxen_app::tools::checkpoint::rewind(std::path::Path::new(&meta.directory), label, || {
+        match kxen_app::core::session::rewrite_messages_durable(&dir, session_id, &messages[..=idx]) {
+            Ok(()) => Ok(()),
+            Err(error) if error.committed() => {
+                durability_warning = Some(error.to_string());
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    })
+    .map_err(|error| checkpoint_missing_wire(&error, label))?;
+    // rewind 改写了共享 workspace 的历史。任何同目录 Session 的内存快照都可能引用未来文件状态，
+    // 不能只 prune 当前 Session，否则其他 Session 的 diff 面板会继续展示失效基线。
+    invalidate_workspace_snapshots(&affected_sessions, session_id, &state.session_snapshots);
+    if let Some(error) = durability_warning {
+        return Err(RewindBlock {
+            code: "durability_indeterminate",
+            message: format!("rewind 已可见，但 session 目录同步失败；重启前已封锁后续变更: {error}"),
+            dirty_count: None,
+            target: None,
+        }
+        .to_wire());
     }
     Ok(json!({ "commit": hash, "truncated_to": idx + 1 }))
 }
 
+fn workspace_session_ids(sessions_dir: &std::path::Path, workspace: &str) -> Result<std::collections::HashSet<String>, String> {
+    Ok(kxen_app::core::session::list_checked(sessions_dir)
+        .map_err(|error| format!("session catalog unavailable: {error}"))?
+        .into_iter()
+        .filter(|session| session.directory == workspace)
+        .map(|session| session.id)
+        .collect())
+}
+
+fn invalidate_workspace_snapshots(
+    affected: &std::collections::HashSet<String>,
+    current_session: &str,
+    snapshots: &std::sync::Mutex<std::collections::HashMap<String, kxen_app::tools::snapshot::SnapshotStore>>,
+) -> usize {
+    let mut snapshots = kxen_app::core::shared::lock(snapshots);
+    let before = snapshots.len();
+    snapshots.retain(|session_id, _| session_id != current_session && !affected.contains(session_id));
+    before - snapshots.len()
+}
+
+fn session_model_override_at(sessions_dir: &std::path::Path, session_id: Option<&str>) -> Result<Option<kxen_app::llm::ModelRef>, String> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    kxen_app::core::session::load_meta(sessions_dir, session_id)
+        .map(|meta| meta.model)
+        .map_err(|error| format!("session {session_id} metadata unavailable for model routing: {error}"))
+}
+
 /// ws 内共用的生效模型解析：session 覆盖 > MRM "chat" 角色 > 硬编码兜底。
-pub(crate) async fn effective_session_model(session_id: Option<&str>, state: &crate::AppState) -> kxen_app::llm::ModelRef {
-    let session_override =
-        session_id.and_then(|id| kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), id).ok()).and_then(|m| m.model);
-    let default = chat_default_model(state).await;
-    kxen_app::core::session::effective_model(session_override.as_ref(), &default).clone()
+/// 指定 session 时 metadata 是路由契约，不得在缺失或损坏时静默退回全局模型。
+pub(crate) async fn effective_session_model(session_id: Option<&str>, state: &crate::AppState) -> Result<kxen_app::llm::ModelRef, String> {
+    let session_override = session_model_override_at(&kxen_app::core::paths::sessions_dir(), session_id)?;
+    let mrm = match session_id {
+        Some(session_id) => state.runtime_for_session(session_id)?.mrm(),
+        None => state.active_runtime()?.mrm(),
+    };
+    let default = chat_model_or_fallback(mrm.role("chat"));
+    Ok(kxen_app::core::session::effective_model(session_override.as_ref(), &default).clone())
 }
 
-/// 主会话全局默认模型：设置页「设为主会话模型」写 roles.chat（config.set_role），
-/// 经 MRM peek 解析（含凭证可用性与降级链；peek 不记派发历史，轮询路径不污染 mrm.stats）。
-pub(crate) async fn chat_default_model(state: &crate::AppState) -> kxen_app::llm::ModelRef {
-    let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
-    let mrm = kxen_app::core::shared::read(&state.mrm).clone();
-    chat_model_or_fallback(mrm.peek("chat", &store).await)
+/// 真正发起 Provider 请求时的模型路由：session 覆盖保持精确身份；未覆盖时由 MRM
+/// 解析 chat 的账号、容量、预算、熔断与 fallback。解析瞬间无候选时保留配置身份，
+/// 让统一 admission 返回明确错误，不静默改用硬编码 Provider。
+pub(crate) async fn routed_session_model(
+    session_id: Option<&str>,
+    state: &crate::AppState,
+    store: &kxen_app::auth::credential::AuthStore,
+) -> Result<kxen_app::llm::ModelRef, String> {
+    let session_override = session_model_override_at(&kxen_app::core::paths::sessions_dir(), session_id)?;
+    let mrm = match session_id {
+        Some(session_id) => state.runtime_for_session(session_id)?.mrm(),
+        None => state.active_runtime()?.mrm(),
+    };
+    Ok(routed_model_from_override(session_override, &mrm, store).await)
 }
 
-/// resolve 命中即用（含钉选账号）；None = 无任何可用凭证，回退硬编码默认兜底。
-fn chat_model_or_fallback(resolved: Option<kxen_app::llm::mrm::Resolved>) -> kxen_app::llm::ModelRef {
-    match resolved {
-        Some(r) => {
-            let mut m = kxen_app::llm::ModelRef::new(r.provider, r.model);
-            m.account = r.account;
+/// 已经通过 metadata admission 的流程使用同一份模型快照，避免二次读盘造成
+/// TOCTOU 或把读取失败误解释为「没有 session override」。
+pub(crate) async fn routed_model_from_override(
+    session_override: Option<kxen_app::llm::ModelRef>,
+    mrm: &kxen_app::llm::mrm::ModelResourceManager,
+    store: &kxen_app::auth::credential::AuthStore,
+) -> kxen_app::llm::ModelRef {
+    let mut model = if let Some(model) = session_override {
+        model
+    } else {
+        match mrm.resolve("chat", store).await {
+            Some(resolved) => {
+                let mut model = kxen_app::llm::ModelRef::new(resolved.provider, resolved.model);
+                model.account = resolved.account;
+                model
+            }
+            None => chat_model_or_fallback(mrm.role("chat")),
+        }
+    };
+    model.account = kxen_app::auth::credential::effective_account_name(store, &model.provider, model.account.as_deref());
+    model
+}
+
+fn chat_model_or_fallback(binding: Option<kxen_app::core::config::RoleBinding>) -> kxen_app::llm::ModelRef {
+    match binding {
+        Some(binding) => {
+            let mut m = kxen_app::llm::ModelRef::new(binding.provider, binding.model);
+            m.account = binding.account;
             m
         }
         None => kxen_app::llm::ModelRef::new("xai", "grok-build-0.1"),
@@ -191,7 +277,11 @@ fn parse_model_override(params: &Value) -> Result<Option<kxen_app::llm::ModelRef
     let provider = params.get("provider").and_then(Value::as_str);
     let model = params.get("model").and_then(Value::as_str);
     match (provider, model) {
-        (Some(p), Some(m)) => Ok(Some(kxen_app::llm::ModelRef::new(p, m))),
+        (Some(p), Some(m)) => {
+            kxen_app::auth::credential::validate_identity(p, "provider")?;
+            kxen_app::auth::credential::validate_identity(m, "model")?;
+            Ok(Some(kxen_app::llm::ModelRef::new(p, m)))
+        }
         (None, None) => Ok(None),
         _ => Err("provider 与 model 必须同给或同缺".into()),
     }
@@ -208,90 +298,12 @@ pub(super) fn session_update_meta(params: &Value) -> Result<Value, String> {
     Ok(json!(session))
 }
 
-/// approval.pending RPC：等待中审批快照（带 session_id 则按会话过滤）。
-/// 刷新/切会话后前端据此恢复等待中的审批卡（broker 300s 窗口内仍在等应答）。
+/// approval.pending RPC：带 session_id 返回该会话审批；省略时只返回全局审批。
+/// 两个恢复面互斥，避免同一 approval 同时出现在 Layout 与 Session。
 pub(super) fn approval_pending(params: &Value, state: &crate::AppState) -> Result<Value, String> {
     let sid = params.get("session_id").and_then(Value::as_str);
-    let all = state.approvals.list_pending();
-    let filtered: Vec<_> = match sid {
-        Some(sid) => all.into_iter().filter(|a| a.session_id == sid).collect(),
-        None => all,
-    };
-    Ok(json!(filtered))
+    Ok(json!(state.approvals.list_pending(sid)))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rewind_gate_matrix() {
-        let target = || Some(RewindTarget { id: "m1".into(), role: "user", preview: "hi".into() });
-        // 全绿组合放行
-        assert!(rewind_gate(false, 0, false, target()).is_ok());
-        assert!(rewind_gate(false, 2, true, target()).is_ok());
-        // 活跃 run：其余条件再好也拒绝
-        assert_eq!(rewind_gate(true, 0, false, target()).unwrap_err().code, "active_run");
-        // 消息不在本 session
-        assert_eq!(rewind_gate(false, 0, false, None).unwrap_err().code, "not_in_session");
-        // 脏且无确认拒绝；带确认放行
-        let b = rewind_gate(false, 3, false, target()).unwrap_err();
-        assert_eq!(b.code, "dirty");
-        assert!(rewind_gate(false, 3, true, target()).is_ok());
-        // 序列化即 RPC 载荷：code 归类 + message 人话 + 确认框上下文（文件数 / 目标摘要）同帧
-        let v = serde_json::to_value(&b).unwrap();
-        assert_eq!(v["code"], "dirty");
-        assert_eq!(v["dirty_count"], 3);
-        assert_eq!(v["target"]["id"], "m1");
-        assert!(v["message"].as_str().unwrap().contains("改动"));
-    }
-
-    #[test]
-    fn checkpoint_label_maps_to_nearest_user_message() {
-        use kxen_app::core::session::{Message, Part, Role};
-        let msg = |id: &str, role: Role| Message {
-            id: id.into(),
-            session_id: "s".into(),
-            role,
-            parts: vec![Part::Text { text: "t".into() }],
-            created_at: 0,
-        };
-        let msgs = vec![msg("u1", Role::User), msg("a1", Role::Assistant), msg("u2", Role::User), msg("a2", Role::Assistant)];
-        // user 消息：自身即 turn 起点
-        assert_eq!(checkpoint_label(&msgs, 2), Some("u2"));
-        // assistant 消息：映射到所属 turn 的 user 消息
-        assert_eq!(checkpoint_label(&msgs, 3), Some("u2"));
-        assert_eq!(checkpoint_label(&msgs, 1), Some("u1"));
-        // 首条即 assistant（之前无 user）：无检查点可映射
-        let orphan = vec![msg("a0", Role::Assistant)];
-        assert_eq!(checkpoint_label(&orphan, 0), None);
-    }
-
-    #[test]
-    fn parse_model_override_contract() {
-        // 同给 = 写覆盖
-        let over = parse_model_override(&json!({ "provider": "xai", "model": "grok" })).unwrap();
-        assert_eq!(over.map(|m| (m.provider, m.model)), Some(("xai".to_string(), "grok".to_string())));
-        // 同缺 = 清除覆盖（跟随全局默认）
-        assert!(parse_model_override(&json!({})).unwrap().is_none());
-        // 只给一个 = 调用方错误
-        assert!(parse_model_override(&json!({ "provider": "xai" })).is_err());
-        assert!(parse_model_override(&json!({ "model": "grok" })).is_err());
-    }
-
-    #[test]
-    fn chat_model_or_fallback_arms() {
-        // resolve 命中：provider/model/account 全保留
-        let resolved = kxen_app::llm::mrm::Resolved {
-            provider: "anthropic".into(),
-            model: "claude-sonnet-4-6".into(),
-            account: Some("work".into()),
-            degraded_from: None,
-        };
-        let m = chat_model_or_fallback(Some(resolved));
-        assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("anthropic", "claude-sonnet-4-6", Some("work")));
-        // 无可用凭证：回退硬编码默认兜底
-        let m = chat_model_or_fallback(None);
-        assert_eq!((m.provider.as_str(), m.model.as_str(), m.account.as_deref()), ("xai", "grok-build-0.1", None));
-    }
-}
+mod tests;

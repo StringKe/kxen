@@ -33,6 +33,7 @@ pub struct LspHealth {
 
 #[derive(Debug, Serialize)]
 pub struct SystemHealth {
+    pub mcp_ready: bool,
     pub mcp: Vec<kxen_app::mcp::ServerStatus>,
     pub lsp_root: String,
     pub lsp: Vec<LspHealth>,
@@ -45,6 +46,7 @@ pub struct SystemHealth {
 /// 子系统健康汇总：各 manager 现有 status/describe API 的只读拼装，不触发任何启动/连接动作。
 pub async fn system_health(state: &Arc<AppState>) -> Result<SystemHealth, String> {
     let runtime = state.active_runtime()?;
+    let mcp_ready = runtime.mcp_ready();
     let mcp = runtime.mcp().status();
     let (lsp_root, lsp) = {
         let lsp = runtime.lsp();
@@ -57,7 +59,7 @@ pub async fn system_health(state: &Arc<AppState>) -> Result<SystemHealth, String
         (mrm.describe().await, mrm.history().await.len())
     };
     let (bus_capacity, bus_receivers) = state.bus.stats();
-    Ok(SystemHealth { mcp, lsp_root, lsp, mrm_describe, mrm_dispatches, bus_capacity, bus_receivers })
+    Ok(SystemHealth { mcp_ready, mcp, lsp_root, lsp, mrm_describe, mrm_dispatches, bus_capacity, bus_receivers })
 }
 
 /// 渲染当前 store 状态。探测只发生在启动后台任务（keychain 可阻塞），RPC 路径绝不触发 keychain。
@@ -118,9 +120,9 @@ pub async fn reply_with_report(
     message_id: Option<&str>,
 ) -> Result<(), String> {
     use kxen_app::core::session as ses;
-    let store = state.auth_store.lock().map(|s| s.clone()).unwrap_or_default();
+    let store = kxen_app::core::shared::lock(&state.auth_store).clone();
     let mut report = doctor_report(&store);
-    report.system = system_health(state).await.ok();
+    report.system = Some(system_health(state).await?);
     let mut msg = ses::new_message(session_id, ses::Role::Assistant, vec![ses::Part::Text { text: format_markdown(&report) }]);
     if let Some(message_id) = message_id {
         msg.id = message_id.to_string();
@@ -146,7 +148,9 @@ pub fn format_markdown(report: &DoctorReport) -> String {
     }
     let Some(s) = &report.system else { return out };
     out.push_str("\n### MCP Servers\n\n");
-    if s.mcp.is_empty() {
+    if !s.mcp_ready {
+        out.push_str("（当前 Workspace 的 MCP runtime 尚未加载，状态 UNKNOWN）\n");
+    } else if s.mcp.is_empty() {
         out.push_str("（未配置）\n");
     } else {
         out.push_str("| Server | 状态 | Transport | 工具 | 资源 |\n| --- | --- | --- | --- | --- |\n");
@@ -193,6 +197,7 @@ mod tests {
                 DoctorEntry { provider: "anthropic".into(), display: "Anthropic".into(), status: "missing".into(), detail: String::new() },
             ],
             system: Some(SystemHealth {
+                mcp_ready: true,
                 mcp: vec![kxen_app::mcp::ServerStatus {
                     name: "fs".into(),
                     status: "running".into(),
@@ -247,6 +252,23 @@ mod tests {
         report.system.as_mut().unwrap().bus_receivers = 0;
         let md = format_markdown(&report);
         assert!(md.contains("活跃订阅：0（异常"), "0 订阅未标异常:\n{md}");
+    }
+
+    #[test]
+    fn markdown_distinguishes_unloaded_mcp_from_unconfigured() {
+        let mut report = report_with_system();
+        {
+            let system = report.system.as_mut().unwrap();
+            system.mcp_ready = false;
+            system.mcp.clear();
+        }
+        let md = format_markdown(&report);
+        assert!(md.contains("MCP runtime 尚未加载，状态 UNKNOWN"), "未标明 MCP runtime 尚未加载:\n{md}");
+        assert!(!md.contains("（未配置）"), "尚未加载不得误报未配置:\n{md}");
+
+        report.system.as_mut().unwrap().mcp_ready = true;
+        let md = format_markdown(&report);
+        assert!(md.contains("（未配置）"), "已加载空配置应报告未配置:\n{md}");
     }
 
     #[test]

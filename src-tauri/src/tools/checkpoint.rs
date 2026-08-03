@@ -62,7 +62,7 @@ fn repo_lock(workdir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
 
 /// commit 固定 -c 配置：user 身份 + 强制关签名。
 /// shadow repo 无需签名；全局开着 gpgsign（如本机 1Password op-ssh-sign）时测试环境没有可用签名程序，commit 会直接失败
-fn commit_args(label: &str) -> [&str; 12] {
+fn commit_args(label: &str) -> [&str; 13] {
     [
         "-c",
         "user.name=kxen",
@@ -71,6 +71,7 @@ fn commit_args(label: &str) -> [&str; 12] {
         "-c",
         "commit.gpgsign=false",
         "commit",
+        "--allow-empty",
         "--allow-empty-message",
         "--no-verify",
         "-q",
@@ -85,19 +86,22 @@ pub fn commit(workdir: &Path, label: &str) -> Result<(), String> {
     // 并发 add/commit 撞 index.lock。find/dirty_count 只读不锁
     let lock = repo_lock(workdir);
     let _guard = crate::core::shared::lock(&lock);
+    commit_locked(workdir, label)
+}
+
+fn commit_locked(workdir: &Path, label: &str) -> Result<(), String> {
     ensure_repo(workdir)?;
+    if has_head(workdir)? && find(workdir, label)?.is_some() {
+        return Ok(());
+    }
     let mut add_args = vec!["add", "-A", "--", "."];
     add_args.extend(EXCLUDES);
     let out = git(workdir, &add_args)?;
     if !out.status.success() {
         return Err(format!("git add: {}", String::from_utf8_lossy(&out.stderr)));
     }
-    // 无变更时跳过 commit：用 diff --cached 预判，而不是匹配 "nothing to commit" 文案
-    // （git 本地化输出下该文案在 stdout 且非英文，匹配不可靠）
-    let staged = git(workdir, &["diff", "--cached", "--quiet", "--exit-code"])?;
-    if staged.status.code() == Some(0) {
-        return Ok(());
-    }
+    // 每个 user message id 都是 rewind label。tree 未变化也必须生成 allow-empty commit；
+    // 同 label 的 queue/restart 重放由上面的 find 幂等收敛，不重复制造 checkpoint。
     let out = git(workdir, &commit_args(label))?;
     if !out.status.success() {
         return Err(format!("git commit: {}", String::from_utf8_lossy(&out.stderr)));
@@ -105,11 +109,20 @@ pub fn commit(workdir: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn has_head(workdir: &Path) -> Result<bool, String> {
+    let out = git(workdir, &["rev-parse", "--verify", "HEAD"])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(128) => Ok(false),
+        _ => Err(format!("git rev-parse HEAD: {}", String::from_utf8_lossy(&out.stderr))),
+    }
+}
+
 /// 按 label 找 commit hash。
 fn find(workdir: &Path, label: &str) -> Result<Option<String>, String> {
     let out = git(workdir, &["log", "--format=%H%x00%B%x00", "-z"])?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(format!("git log: {}", String::from_utf8_lossy(&out.stderr)));
     }
     // %x00 与 -z 各发一个 NUL：记录间是双 NUL，先滤空再两两成对
     let text = String::from_utf8_lossy(&out.stdout);
@@ -122,24 +135,118 @@ fn find(workdir: &Path, label: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-/// rewind 到 label 检查点（reset --hard + clean 未跟踪，调用方自行负责会话截断与提示）。
-pub fn reset_to(workdir: &Path, label: &str) -> Result<String, String> {
-    let Some(hash) = find(workdir, label)? else {
-        return Err(format!("checkpoint not found: {label}"));
-    };
-    // 与 commit 同一把锁：reset/clean 进行中不能有并发 add 改写 index
+fn head(workdir: &Path) -> Result<String, String> {
+    let out = git(workdir, &["rev-parse", "HEAD"])?;
+    if !out.status.success() {
+        return Err(format!("git rev-parse: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn reset_hard(workdir: &Path, hash: &str) -> Result<(), String> {
+    let out = git(workdir, &["reset", "--hard", hash])?;
+    if out.status.success() { Ok(()) } else { Err(format!("git reset: {}", String::from_utf8_lossy(&out.stderr))) }
+}
+
+fn clean(workdir: &Path) -> Result<(), String> {
+    let mut args = vec!["clean", "-fdq", "--", "."];
+    args.extend(EXCLUDES);
+    let out = git(workdir, &args)?;
+    if out.status.success() { Ok(()) } else { Err(format!("git clean: {}", String::from_utf8_lossy(&out.stderr))) }
+}
+
+struct EmptyDir {
+    path: PathBuf,
+    permissions: std::fs::Permissions,
+}
+
+fn empty_dirs(workdir: &Path) -> Result<Vec<EmptyDir>, String> {
+    fn walk(root: &Path, current: &Path, output: &mut Vec<EmptyDir>) -> Result<(), String> {
+        let entries: Vec<_> = std::fs::read_dir(current)
+            .map_err(|error| format!("read workspace directory {}: {error}", current.display()))?
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        if current != root {
+            let metadata = std::fs::metadata(current).map_err(|error| error.to_string())?;
+            output
+                .push(EmptyDir { path: current.strip_prefix(root).unwrap_or(current).to_path_buf(), permissions: metadata.permissions() });
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in entries {
+            let path = entry.path();
+            let name = entry.file_name();
+            if !path.is_dir() || [".git", "node_modules", "target"].iter().any(|skip| name == std::ffi::OsStr::new(skip)) {
+                continue;
+            }
+            if path.strip_prefix(root).is_ok_and(|relative| relative == Path::new(".kxen/worktrees")) {
+                continue;
+            }
+            walk(root, &path, output)?;
+        }
+        Ok(())
+    }
+    let mut output = Vec::new();
+    walk(workdir, workdir, &mut output)?;
+    Ok(output)
+}
+
+fn restore_empty_dirs(workdir: &Path, directories: &[EmptyDir]) -> Result<(), String> {
+    for directory in directories {
+        let path = workdir.join(&directory.path);
+        std::fs::create_dir_all(&path).map_err(|error| format!("restore empty directory {}: {error}", path.display()))?;
+        std::fs::set_permissions(&path, directory.permissions.clone())
+            .map_err(|error| format!("restore permissions {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn rollback(workdir: &Path, backup: &str, directories: &[EmptyDir], cause: String) -> String {
+    match reset_hard(workdir, backup).and_then(|()| clean(workdir)).and_then(|()| restore_empty_dirs(workdir, directories)) {
+        Ok(()) => cause,
+        Err(error) => format!("{cause}; workspace rollback failed: {error}"),
+    }
+}
+
+/// 原子 rewind：先把当前 workspace 状态提交为内部补偿点，再执行 reset + clean + 调用方持久化。
+/// 任一步失败都回到补偿点，避免 workspace 已回退而 transcript 仍停在未来状态。
+pub fn rewind<T>(workdir: &Path, label: &str, persist: impl FnOnce() -> Result<T, String>) -> Result<(String, T), String> {
+    rewind_with_clean(workdir, label, persist, clean)
+}
+
+fn rewind_with_clean<T>(
+    workdir: &Path,
+    label: &str,
+    persist: impl FnOnce() -> Result<T, String>,
+    clean_step: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(String, T), String> {
+    // 与 commit 同一把锁：补偿点、reset/clean 与 transcript 提交期间不能有并发 add 改写 index。
     let lock = repo_lock(workdir);
     let _guard = crate::core::shared::lock(&lock);
-    let out = git(workdir, &["reset", "--hard", &hash])?;
-    if !out.status.success() {
-        return Err(format!("git reset: {}", String::from_utf8_lossy(&out.stderr)));
+    let Some(target) = find(workdir, label)? else {
+        return Err(format!("checkpoint not found: {label}"));
+    };
+    let backup_label = format!("kxen-rewind-backup-{}-{}", std::process::id(), crate::core::shared::now_ms());
+    commit_locked(workdir, &backup_label)?;
+    let backup = head(workdir)?;
+    let directories = empty_dirs(workdir)?;
+
+    if let Err(error) = reset_hard(workdir, &target) {
+        return Err(rollback(workdir, &backup, &directories, error));
     }
-    // commit 的 add -A 已把检查点时刻全部未跟踪文件入库，故 reset 后仍是未跟踪的一定是
-    // 检查点之后新建的文件——确认框承诺「回退将丢弃」必须连它们一起清（gitignored 文件不动）。
-    let mut clean_args = vec!["clean", "-fdq", "--", "."];
-    clean_args.extend(EXCLUDES);
-    let out = git(workdir, &clean_args)?;
-    if out.status.success() { Ok(hash) } else { Err(format!("git clean: {}", String::from_utf8_lossy(&out.stderr))) }
+    if let Err(error) = clean_step(workdir) {
+        return Err(rollback(workdir, &backup, &directories, error));
+    }
+    match persist() {
+        Ok(value) => Ok((target, value)),
+        Err(error) => Err(rollback(workdir, &backup, &directories, error)),
+    }
+}
+
+/// 仅回退 workspace 的兼容入口。
+pub fn reset_to(workdir: &Path, label: &str) -> Result<String, String> {
+    rewind(workdir, label, || Ok(())).map(|(hash, ())| hash)
 }
 
 /// 会话是否有 rewind 历史可导（首条 checkpoint 是否存在）。
@@ -149,167 +256,31 @@ pub fn has_checkpoints(workdir: &Path) -> bool {
 
 /// shadow 仓库未进检查点的改动文件数（rewind 确认框展示「会丢弃几个文件」的数据源）。
 /// 与 commit 同一组排除（node_modules/target）：否则可再生目录会让判定永远为脏。
-pub fn dirty_count(workdir: &Path) -> usize {
+pub fn dirty_count(workdir: &Path) -> Result<usize, String> {
     if !has_checkpoints(workdir) {
-        return 0;
+        return Ok(0);
     }
+    let lock = repo_lock(workdir);
+    let _guard = crate::core::shared::lock(&lock);
     let mut args = vec!["status", "--porcelain", "--", "."];
     args.extend(EXCLUDES);
-    // porcelain 一文件一行，空仓库输出空串
-    git(workdir, &args).map(|out| String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count()).unwrap_or(0)
+    let out = git(workdir, &args)?;
+    if !out.status.success() {
+        return Err(format!("git status: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|line| !line.trim().is_empty()).count())
 }
 
 /// checkpoint 屏障：用户消息落盘后、run_turn 前等 shadow git commit 完成。
-/// 失败只 warn 不阻塞（checkpoint 是可再生优化，不能卡死主流程）。
-pub async fn checkpoint_barrier(workdir: &Path, label: &str) {
+/// 失败必须阻止 workspace mutation；否则 transcript 已接受消息却没有对应 rewind 真源。
+pub async fn checkpoint_barrier(workdir: &Path, label: &str) -> Result<(), String> {
     let dir = workdir.to_path_buf();
     let label = label.to_string();
     match tokio::task::spawn_blocking(move || commit(&dir, &label)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "checkpoint commit failed"),
-        Err(e) => tracing::warn!(error = %e, "checkpoint commit join failed"),
+        Ok(result) => result,
+        Err(error) => Err(format!("checkpoint commit join failed: {error}")),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_dir_stable_and_canonical() {
-        use sha2::Digest;
-        let base = std::env::temp_dir().join(format!("kxen-ckpt-hash-{}", std::process::id()));
-        std::fs::remove_dir_all(&base).ok();
-        let real = base.join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        // 同一路径多次调用哈希稳定，格式 = sha256 64 hex + .git
-        let dir = repo_dir(&real);
-        assert_eq!(dir, repo_dir(&real));
-        let expect = format!("{:x}", sha2::Sha256::digest(real.canonicalize().unwrap().to_string_lossy().as_bytes()));
-        assert!(dir.ends_with(format!("{expect}.git")), "寻址必须是 canonical 路径的 sha256: {}", dir.display());
-        // symlink 拼写分叉（link 与 real 指向同一目录）必须收敛到同一 shadow repo
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert_eq!(dir, repo_dir(&link));
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn commit_args_disable_gpgsign() {
-        let args = commit_args("x");
-        assert!(
-            args.windows(2).any(|w| w == ["-c", "commit.gpgsign=false"]),
-            "shadow commit 必须显式关 gpgsign（全局 1Password 签名会让 commit 失败）"
-        );
-    }
-
-    #[test]
-    fn commit_ignores_repo_level_gpgsign() {
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-sign-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        // repo 级强制签名 + 必然失败的签名程序：少了 -c commit.gpgsign=false 则这次 commit 必败
-        git(&dir, &["config", "commit.gpgsign", "true"]).unwrap();
-        git(&dir, &["config", "gpg.program", "/bin/false"]).unwrap();
-        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
-        commit(&dir, "msg_2").unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn dirty_count_tracks_uncheckpointed_files() {
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-dirty-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        assert_eq!(dirty_count(&dir), 0);
-        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
-        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
-        assert_eq!(dirty_count(&dir), 2);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn commit_and_rewind() {
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
-        commit(&dir, "msg_2").unwrap();
-        // rewind 到 msg_1：a.txt 回到 v1
-        reset_to(&dir, "msg_1").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
-        // 不存在的 label 报错
-        assert!(reset_to(&dir, "msg_404").is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn rewind_removes_files_created_after_checkpoint() {
-        // 与确认框承诺一致：检查点之后新建的文件（turn 内 agent 产物）在 rewind 后不复存在
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-clean-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        // turn 内：新建文件、新建子目录文件、改动既有文件
-        std::fs::write(dir.join("new.txt"), "agent new\n").unwrap();
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("sub/nested.txt"), "agent nested\n").unwrap();
-        std::fs::write(dir.join("a.txt"), "v2\n").unwrap();
-        reset_to(&dir, "msg_1").unwrap();
-        assert!(!dir.join("new.txt").exists(), "检查点后新建文件必须被清除");
-        assert!(!dir.join("sub").exists(), "检查点后新建目录必须被清除");
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn rewind_keeps_preexisting_untracked_files() {
-        // 检查点时刻已存在的未跟踪文件已被 add -A 入库：rewind 不得误删用户自己的文件
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-keep-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        commit(&dir, "msg_2").unwrap();
-        reset_to(&dir, "msg_1").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n", "检查点前已存在的文件必须保留");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn concurrent_commits_do_not_collide_on_index_lock() {
-        // 同 workspace 多会话并发 checkpoint：进程内互斥保证不撞 index.lock
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-conc-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        let mut handles = Vec::new();
-        for i in 0..4 {
-            let d = dir.clone();
-            handles.push(std::thread::spawn(move || commit(&d, &format!("msg_{i}"))));
-        }
-        for h in handles {
-            h.join().unwrap().unwrap();
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shadow_repo_dir_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("kxen-ckpt-perm-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
-        commit(&dir, "msg_1").unwrap();
-        let mode = std::fs::metadata(repo_dir(&dir)).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "shadow repo 目录必须 0700: {mode:o}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+mod tests;

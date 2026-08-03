@@ -6,8 +6,29 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod move_entry;
+
+pub use move_entry::move_entry;
+#[cfg(test)]
+use move_entry::move_entry_with_home;
+
 /// 写入或更新一条 note（同 slug = 同题，整体覆盖不追加）。返回文件路径。
 pub fn add(scope: Scope, workdir: &Path, slug: Option<&str>, note_type: &str, description: &str, content: &str) -> Result<String, String> {
+    let (path, warning) = add_observed(scope, workdir, slug, note_type, description, content)?;
+    match warning {
+        Some(error) => Err(format!("knowledge note is visible but durability is indeterminate: {error}")),
+        None => Ok(path),
+    }
+}
+
+pub(crate) fn add_observed(
+    scope: Scope,
+    workdir: &Path,
+    slug: Option<&str>,
+    note_type: &str,
+    description: &str,
+    content: &str,
+) -> Result<(String, Option<String>), String> {
     let note_type = if NOTE_TYPES.contains(&note_type) { note_type } else { "note" };
     let description = description.trim();
     if description.is_empty() {
@@ -18,8 +39,8 @@ pub fn add(scope: Scope, workdir: &Path, slug: Option<&str>, note_type: &str, de
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let body = format!("---\nnote-type: {note_type}\ndescription: {description}\ndate: {}\n---\n\n{}\n", today(), content.trim());
     let path = dir.join(format!("{slug}.md"));
-    write_atomic(&path, body.as_bytes())?;
-    Ok(path.to_string_lossy().into_owned())
+    let warning = write_atomic(&path, body.as_bytes())?;
+    Ok((path.to_string_lossy().into_owned(), warning))
 }
 
 /// 设置页与 knowledge 工具共用的全量列表（双 scope，scan 序 = 项目在前）。
@@ -86,16 +107,19 @@ pub fn set_enabled(scope: Scope, workdir: &Path, slug: &str, enabled: bool) -> R
         out.push_str(line);
         out.push('\n');
     }
-    write_atomic_locked(path, out.as_bytes())
+    match write_atomic_locked(path, out.as_bytes())? {
+        Some(error) => Err(format!("knowledge entry is visible but durability is indeterminate: {error}")),
+        None => Ok(()),
+    }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<Option<String>, String> {
     let lock = path_lock(path);
     let _guard = lock.lock().map_err(|error| error.to_string())?;
     write_atomic_locked(path, bytes)
 }
 
-fn write_atomic_locked(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_atomic_locked(path: &Path, bytes: &[u8]) -> Result<Option<String>, String> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| format!("path has no parent: {}", path.display()))?;
     std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
@@ -116,11 +140,26 @@ fn write_atomic_locked(path: &Path, bytes: &[u8]) -> Result<(), String> {
         std::fs::remove_file(&tmp).ok();
         format!("replace {}: {error}", path.display())
     })?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+    Ok(sync_note_directory(parent).err().map(|error| format!("sync {}: {error}", parent.display())))
+}
+
+#[cfg(unix)]
+fn sync_note_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_NOTE_DIRECTORY_SYNC.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other("injected knowledge note directory sync failure"));
+    }
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_note_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_NOTE_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn path_lock(path: &Path) -> Arc<Mutex<()>> {
@@ -129,53 +168,6 @@ fn path_lock(path: &Path) -> Arc<Mutex<()>> {
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
-}
-
-/// 跨 scope 晋升（personal -> project 唯一方向有意义，反向也允许）：保 kind 目录落位。
-pub fn move_entry(scope: Scope, workdir: &Path, slug: &str, to: Scope) -> Result<String, String> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/var/empty"));
-    move_entry_with_home(scope, workdir, &home, slug, to)
-}
-
-fn move_entry_with_home(scope: Scope, workdir: &Path, home: &Path, slug: &str, to: Scope) -> Result<String, String> {
-    if scope == to {
-        return Err("scope 相同".into());
-    }
-    let e = find_entry_with_home(scope, workdir, home, slug)?;
-    if e.is_agents_md {
-        return Err("root interoperability rule cannot move between scopes".into());
-    }
-    let source_root = scope_root_with_home(scope, workdir, home);
-    let destination_root = scope_root_with_home(to, workdir, home);
-    let source = if e.dir.is_empty() { PathBuf::from(&e.path) } else { PathBuf::from(&e.dir) };
-    let relative = source.strip_prefix(&source_root).map_err(|_| format!("source is outside scope root: {}", source.display()))?;
-    let dest = destination_root.join(relative);
-    if dest.exists() {
-        return Err(format!("destination already exists: {}", dest.display()));
-    }
-    let parent = dest.parent().ok_or_else(|| format!("destination has no parent: {}", dest.display()))?;
-    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    let source_lock = path_lock(&source);
-    let destination_lock = path_lock(&dest);
-    let (_source_guard, _destination_guard) = if source <= dest {
-        (source_lock.lock().map_err(|error| error.to_string())?, destination_lock.lock().map_err(|error| error.to_string())?)
-    } else {
-        let destination_guard = destination_lock.lock().map_err(|error| error.to_string())?;
-        let source_guard = source_lock.lock().map_err(|error| error.to_string())?;
-        (source_guard, destination_guard)
-    };
-    if dest.exists() {
-        return Err(format!("destination already exists: {}", dest.display()));
-    }
-    std::fs::rename(&source, &dest).map_err(|err| err.to_string())?;
-    Ok(dest.to_string_lossy().into_owned())
-}
-
-fn scope_root_with_home(scope: Scope, workdir: &Path, home: &Path) -> PathBuf {
-    match scope {
-        Scope::Project => workdir.join(".agents"),
-        Scope::Personal => home.join(".agents"),
-    }
 }
 
 #[cfg(test)]
@@ -198,6 +190,18 @@ mod tests {
         assert!(entries[0].content.contains("v2"));
         assert_eq!(entries[0].note_type.as_deref(), Some("correction"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn visible_note_commit_reports_directory_sync_warning() {
+        let dir = ws("sync-warning");
+        FAIL_NEXT_NOTE_DIRECTORY_SYNC.with(|flag| flag.set(true));
+
+        let (path, warning) = add_observed(Scope::Project, &dir, Some("durable"), "note", "durable note", "body").unwrap();
+
+        assert!(warning.as_deref().is_some_and(|message| message.contains("directory sync failure")));
+        assert!(Path::new(&path).is_file(), "visible commit must be observable to the caller");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -279,7 +283,7 @@ mod tests {
 
         let moved = move_entry_with_home(Scope::Project, &dir, &home, "review", Scope::Personal).unwrap();
         let destination = home.join(".agents/skills/review");
-        assert_eq!(PathBuf::from(moved), destination);
+        assert_eq!(PathBuf::from(moved).canonicalize().unwrap(), destination.canonicalize().unwrap());
         assert!(destination.join("SKILL.md").exists());
         assert!(destination.join("checklist.md").exists());
         assert!(!skill.exists());

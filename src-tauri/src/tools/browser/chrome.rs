@@ -2,6 +2,7 @@
 //! 单浏览器单页面：kxen browser 工具是 per-session 单实例语义，多页面并发不在 v1 范围。
 
 use super::driver::{BoxFuture, BrowserDriver, NavOutcome, RawAxNode};
+use super::proxy::BrowserProxy;
 use chromiumoxide::browser::BrowserConfig;
 use chromiumoxide::cdp::browser_protocol::accessibility::{AxValue, GetFullAxTreeParams};
 use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
@@ -9,6 +10,26 @@ use chromiumoxide::cdp::browser_protocol::page::{GetNavigationHistoryParams, Nav
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams, RemoteObjectId};
 use chromiumoxide::{Browser, Page};
 use std::path::PathBuf;
+
+fn browser_config(exe: PathBuf, proxy_url: &str) -> Result<BrowserConfig, String> {
+    BrowserConfig::builder()
+        .chrome_executable(exe)
+        // HeadlessMode 类型未公开导出（0.9 的 config 模块私有），new headless 只有这个具名 builder 口
+        .new_headless_mode()
+        .window_size(1280, 720)
+        // chromiumoxide 的 Arg API 接收不带 `--` 的 key；value 通过 tuple 传入。
+        .arg("no-first-run")
+        .arg("no-default-browser-check")
+        .arg("disable-background-networking")
+        // 固定单一 proxy 且移除 Chrome 对 loopback 的隐式绕过；proxy 不可用时连接失败，
+        // Chrome 没有 DIRECT fallback。QUIC/WebRTC UDP 也禁用，防止页面另走非代理通道。
+        .arg(("proxy-server", proxy_url))
+        .arg(("proxy-bypass-list", "<-loopback>"))
+        .arg("disable-quic")
+        .arg(("force-webrtc-ip-handling-policy", "disable_non_proxied_udp"))
+        .build()
+        .map_err(|error| format!("chrome config invalid: {error}"))
+}
 
 /// macOS 安装位候选（按优先级；探测不到在 detect_chrome 报可操作文案，不静默退化）。
 pub fn default_candidates() -> Vec<PathBuf> {
@@ -34,6 +55,8 @@ pub struct ChromeDriver {
     page: Page,
     /// CDP 事件泵：不跑则一切命令挂死；close 时 abort
     handler: tokio::task::JoinHandle<()>,
+    /// Chrome 的唯一出站 HTTP(S) 路径；drop/close 会停止 listener 与全部 tunnel。
+    proxy: BrowserProxy,
 }
 
 impl std::fmt::Debug for ChromeDriver {
@@ -45,16 +68,9 @@ impl std::fmt::Debug for ChromeDriver {
 impl ChromeDriver {
     pub async fn launch() -> Result<Self, String> {
         let exe = detect_chrome(&default_candidates())?;
-        let config = BrowserConfig::builder()
-            .chrome_executable(exe)
-            // HeadlessMode 类型未公开导出（0.9 的 config 模块私有），new headless 只有这个具名 builder 口
-            .new_headless_mode()
-            .window_size(1280, 720)
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-background-networking")
-            .build()
-            .map_err(|e| format!("chrome config invalid: {e}"))?;
+        let proxy = BrowserProxy::launch().await?;
+        let proxy_url = format!("http://{}", proxy.addr());
+        let config = browser_config(exe, &proxy_url)?;
         let (browser, mut handler) = Browser::launch(config).await.map_err(|e| format!("failed to launch chrome: {e}"))?;
         let handler = tokio::spawn(async move {
             use futures::StreamExt;
@@ -62,7 +78,7 @@ impl ChromeDriver {
             while handler.next().await.is_some() {}
         });
         let page = browser.new_page("about:blank").await.map_err(|e| format!("failed to open initial page: {e}"))?;
-        Ok(Self { browser, page, handler })
+        Ok(Self { browser, page, handler, proxy })
     }
 
     /// AX 节点 -> DOM 远端句柄。页面已变时 resolve 失败，统一译成「重新 snapshot」文案。
@@ -202,6 +218,8 @@ impl BrowserDriver for ChromeDriver {
 
     fn close<'a>(&'a mut self) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            // 先撤掉唯一出站路径，确保清理开始后页面不能继续发网络请求。
+            self.proxy.close().await;
             // 已退出的浏览器 close/kill 会报错，清理语义下吞掉（幂等）；进程兜底是 child 的 kill_on_drop
             let _ = self.browser.close().await;
             if let Some(res) = self.browser.kill().await {
@@ -236,5 +254,47 @@ mod tests {
         let err = detect_chrome(&candidates).unwrap_err();
         assert!(err.contains("install Google Chrome"), "{err}");
         assert!(err.contains("kxen-no-such-a") && err.contains("kxen-no-such-b"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chromiumoxide_receives_fail_closed_proxy_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("kxen-chrome-args-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("fake-chrome");
+        let output = dir.join("args.txt");
+        let escaped = output.display().to_string().replace('\'', "'\\''");
+        std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{escaped}'\n")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = browser_config(executable, "http://127.0.0.1:32123").unwrap();
+        let mut child = config.launch().unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let args = std::fs::read_to_string(output).unwrap();
+        for expected in [
+            "--proxy-server=http://127.0.0.1:32123",
+            "--proxy-bypass-list=<-loopback>",
+            "--disable-quic",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ] {
+            assert!(args.lines().any(|line| line == expected), "missing {expected} in {args}");
+        }
+        assert!(!args.lines().any(|line| line.starts_with("----")), "{args}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed system Chrome"]
+    async fn real_chrome_cannot_bypass_proxy_for_loopback_navigation() {
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}/private", origin.local_addr().unwrap());
+        let mut driver = ChromeDriver::launch().await.unwrap();
+        let _ = driver.navigate(&url).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), origin.accept()).await.is_err(),
+            "Chrome connected directly to a blocked loopback origin"
+        );
+        driver.close().await.unwrap();
     }
 }

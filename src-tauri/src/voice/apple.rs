@@ -84,12 +84,12 @@ pub struct MicSession {
     tap: objc::TapHandler,
     req_kept: Retained<AnyObject>,
     rx: std::sync::mpsc::Receiver<SessionEvent>,
-    samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    samples: std::sync::Arc<std::sync::Mutex<super::provider::SampleBuffer>>,
     sample_rate: u32,
 }
 
 /// 启动麦克风识别（PTT 按下）。tap 同时喂 Speech（本地流式）与 PCM 缓冲（云转写终稿用）。
-pub fn start_mic(locale: &str) -> Result<MicSession, String> {
+pub fn start_mic(locale: &str, capture_cloud: bool) -> Result<MicSession, String> {
     ensure_authorized()?;
     let recognizer = on_device_recognizer(locale)?;
     let request = objc::buffer_request().ok_or("无法创建缓冲识别请求")?;
@@ -107,19 +107,27 @@ pub fn start_mic(locale: &str) -> Result<MicSession, String> {
     // tap 线程经裸指针读 request：显式 retain 一份防悬垂，session 结束（removeTap 之后）随结构体回收
     let req_ptr = &*request as *const AnyObject as *mut AnyObject;
     let req_kept = unsafe { objc::retain_autoreleased(req_ptr) }.ok_or("request 持有失败")?;
-    let samples: std::sync::Arc<std::sync::Mutex<Vec<f32>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let samples: std::sync::Arc<std::sync::Mutex<super::provider::SampleBuffer>> =
+        std::sync::Arc::new(std::sync::Mutex::new(super::provider::SampleBuffer::default()));
     let sink = samples.clone();
+    let sample_limit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(super::provider::MAX_PCM_SAMPLES));
+    let callback_limit = sample_limit.clone();
     let (engine, rate, tap) = objc::start_mic_capture(move |_input| {
         objc::TapHandler::new(move |buffer: *mut AnyObject, _time: *mut AnyObject| {
             if !buffer.is_null() {
                 objc::append_buffer(unsafe { &*req_ptr }, buffer);
                 let chunk = unsafe { objc::pcm_samples(buffer) };
-                if !chunk.is_empty() {
-                    crate::core::shared::lock(&sink).extend_from_slice(&chunk);
+                if capture_cloud && !chunk.is_empty() {
+                    super::provider::append_samples(
+                        &mut crate::core::shared::lock(&sink),
+                        &chunk,
+                        callback_limit.load(std::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
         })
     })?;
+    sample_limit.store(super::provider::sample_limit(rate as u32), std::sync::atomic::Ordering::Relaxed);
     Ok(MicSession { task, engine, request, tap, req_kept, rx, samples, sample_rate: rate as u32 })
 }
 
@@ -135,7 +143,7 @@ impl MicSession {
 
     /// PTT 松开：停止采集 -> endAudio -> 等 final（3s 兜底）-> cancel。
     /// 返回 (本地终稿, 云转写用 WAV 路径)。
-    pub fn stop(self) -> (Option<String>, Option<String>) {
+    pub fn stop(self) -> (Option<String>, Result<Option<String>, String>) {
         objc::stop_mic_engine(&self.engine);
         // removeTap 之后回收 tap block 与 request retain（mem::forget 会每次 PTT 各泄漏一份）
         drop(self.tap);
@@ -160,11 +168,15 @@ impl MicSession {
         objc::cancel_task(&self.task);
         let wav = {
             let samples = crate::core::shared::lock(&self.samples);
-            if samples.is_empty() {
-                None
+            if samples.exceeded {
+                Err(format!("cloud voice capture exceeded {} seconds or the absolute PCM limit", super::provider::MAX_AUDIO_SECONDS))
+            } else if samples.samples.is_empty() {
+                Ok(None)
             } else {
                 let path = super::provider::temp_wav_path();
-                super::provider::write_wav_pub(&path, &samples, self.sample_rate).ok().map(|_| path.to_string_lossy().into_owned())
+                super::provider::write_wav_pub(&path, &samples.samples, self.sample_rate)
+                    .map(|_| Some(path.to_string_lossy().into_owned()))
+                    .map_err(|error| format!("cloud voice WAV persistence failed: {error}"))
             }
         };
         (last, wav)

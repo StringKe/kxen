@@ -6,7 +6,7 @@ use crate::auth::credential::AuthStore;
 use crate::core::config::SearchConfig;
 
 pub fn search<'a>(query: &'a str, _store: &'a AuthStore, _cfg: &'a SearchConfig) -> TryFuture<'a> {
-    Box::pin(async move { Some(fetch(query).await.map(|h| EngineResult { hits: h, answer: None })) })
+    Box::pin(async move { Some(fetch(query).await.map(|h| EngineResult { hits: h, answer: None, usage: None })) })
 }
 
 async fn fetch(query: &str) -> Result<Vec<SearchHit>, String> {

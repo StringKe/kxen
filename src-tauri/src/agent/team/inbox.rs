@@ -1,73 +1,241 @@
-// ---------------- inbox ----------------
-
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::session::now_ms;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+const MAILBOX_VERSION: u8 = 1;
+pub(super) const INBOX_TEXT_CAP: usize = 4000;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct InboxEntry {
     pub(super) from: String,
     pub(super) text: String,
-    /// lead transcript 使用稳定 ID。JSONL 已提交但 meta 更新失败时，同一 mailbox 记录重放不会重复追加。
     #[serde(default)]
     pub(super) transcript_id: String,
     #[serde(default)]
     pub(super) at: u64,
+    /// Explicit delivery IDs may be retried after an ack while a second durable store finalizes.
+    /// Generated one-shot messages do not need an ack tombstone and must not grow the mailbox.
+    #[serde(default)]
+    retain_ack: bool,
 }
 
-/// 按 inbox 文件路径分桶的写锁：append 与 drain 必须互斥，
-/// 否则 drain 的「读 -> 清空」窗口会吞掉并发 append（读旧文 -> append 写入 -> 清空覆盖）。
+#[derive(Clone, Debug)]
+pub(super) struct InboxDelivery {
+    pub(super) entries: Vec<InboxEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct InboxAck {
+    from: String,
+    text: String,
+    transcript_id: String,
+}
+
+impl InboxDelivery {
+    pub(super) fn messages(&self) -> Vec<(String, String)> {
+        self.entries.iter().map(|entry| (entry.from.clone(), entry.text.clone())).collect()
+    }
+
+    fn ids(&self) -> Vec<&str> {
+        self.entries.iter().map(|entry| entry.transcript_id.as_str()).collect()
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Mailbox {
+    #[serde(default)]
+    version: u8,
+    #[serde(default)]
+    queued: Vec<InboxEntry>,
+    #[serde(default)]
+    in_flight: Vec<InboxEntry>,
+    #[serde(default)]
+    acked: VecDeque<InboxAck>,
+}
+
 static INBOX_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static INBOX_BLOCKED: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 
 fn lock_for(path: &Path) -> Arc<Mutex<()>> {
-    // shared::lock 容错取锁（P2-7）：持锁线程 panic 毒化不代表数据损坏，expect 会把整个 team 收件通道打死
     crate::core::shared::lock(INBOX_LOCKS.get_or_init(|| Mutex::new(HashMap::new())))
         .entry(path.to_path_buf())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
 }
 
-/// Team Session 生命周期终点：该目录不会再接收 inbox 写入后回收路径锁。
 pub(super) fn drop_session_locks(session_dir: &Path) {
     if let Some(locks) = INBOX_LOCKS.get() {
-        crate::core::shared::lock(&locks).retain(|path, _| !path.starts_with(session_dir));
+        crate::core::shared::lock(locks).retain(|path, _| !path.starts_with(session_dir));
+    }
+    if let Some(blocked) = INBOX_BLOCKED.get() {
+        crate::core::shared::lock(blocked).retain(|path, _| !path.starts_with(session_dir));
     }
 }
 
-/// 单条文本上限：inbox 是落盘 mailbox，无 cap 时失控/恶意写入可让单条无限膨胀
-///（drain 后整条进 LLM 历史，超限文本还会爆上下文）。截断保留前缀并标注原始长度。
-/// append 侧不做文件总量 cap：inbox 读后即焚（drain 即清空），总量已被消费节奏自然限制。
-pub(super) const INBOX_TEXT_CAP: usize = 4000;
-
 pub(super) fn append_inbox(dir: &Path, to: &str, from: &str, text: &str) -> Result<(), String> {
-    append_entry(
-        dir,
-        to,
-        &InboxEntry { from: from.to_string(), text: cap_text(text), transcript_id: crate::core::ids::new_id("msg"), at: now_ms() },
-    )
+    append_inbox_entry(dir, to, from, text, &crate::core::ids::new_id("msg"), false)
 }
 
-pub(super) fn restore_inbox(dir: &Path, to: &str, entry: &InboxEntry) -> Result<(), String> {
-    append_entry(dir, to, entry)
+pub(super) fn append_inbox_with_id(dir: &Path, to: &str, from: &str, text: &str, delivery_id: &str) -> Result<(), String> {
+    append_inbox_entry(dir, to, from, text, delivery_id, true)
 }
 
-fn append_entry(dir: &Path, to: &str, entry: &InboxEntry) -> Result<(), String> {
-    use std::io::Write;
+fn append_inbox_entry(dir: &Path, to: &str, from: &str, text: &str, delivery_id: &str, retain_ack: bool) -> Result<(), String> {
     crate::core::ids::validate_id(to)?;
-    crate::core::ids::validate_id(&entry.from)?;
-    let path = dir.join("inboxes").join(format!("{to}.json"));
-    let lock = lock_for(&path);
-    let _guard = lock.lock().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(path.parent().expect("inbox path has a parent")).map_err(|error| error.to_string())?;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
-    writeln!(file, "{}", serde_json::to_string(entry).map_err(|error| error.to_string())?).map_err(|e| e.to_string())?;
-    file.sync_data().map_err(|error| error.to_string())
+    crate::core::ids::validate_id(from)?;
+    crate::core::ids::validate_id(delivery_id)?;
+    let path = inbox_path(dir, to);
+    with_mailbox(&path, |mailbox| {
+        let text = cap_text(text);
+        if let Some(existing) = mailbox.acked.iter().find(|entry| entry.transcript_id == delivery_id) {
+            if existing.from == from && existing.text == text {
+                return Ok(false);
+            }
+            return Err(format!("inbox delivery id collision: {delivery_id}"));
+        }
+        if let Some(existing) = mailbox.queued.iter().chain(mailbox.in_flight.iter()).find(|entry| entry.transcript_id == delivery_id) {
+            if existing.from == from && existing.text == text && existing.retain_ack == retain_ack {
+                return Ok(false);
+            }
+            return Err(format!("inbox delivery id collision: {delivery_id}"));
+        }
+        mailbox.queued.push(InboxEntry { from: from.to_string(), text, transcript_id: delivery_id.to_string(), at: now_ms(), retain_ack });
+        Ok(true)
+    })
 }
 
-/// 按 char 计数截断（不劈 UTF-8 边界），超限标注原始长度让收信方知道看的是残篇
+pub(super) fn claim_inbox_entries(dir: &Path, name: &str) -> Result<InboxDelivery, String> {
+    crate::core::ids::validate_id(name)?;
+    let path = inbox_path(dir, name);
+    let lock = lock_for(&path);
+    let _guard = crate::core::shared::lock(&lock);
+    ensure_available(&path)?;
+    let mut mailbox = load_mailbox(&path)?;
+    if mailbox.in_flight.is_empty() && !mailbox.queued.is_empty() {
+        mailbox.in_flight = std::mem::take(&mut mailbox.queued);
+        persist_mailbox(&path, &mailbox)?;
+    }
+    Ok(InboxDelivery { entries: mailbox.in_flight })
+}
+
+pub(super) fn ack_inbox_entries(dir: &Path, name: &str, delivery: &InboxDelivery) -> Result<(), String> {
+    crate::core::ids::validate_id(name)?;
+    if delivery.entries.is_empty() {
+        return Ok(());
+    }
+    let path = inbox_path(dir, name);
+    let lock = lock_for(&path);
+    let _guard = crate::core::shared::lock(&lock);
+    ensure_available(&path)?;
+    let mut mailbox = load_mailbox(&path)?;
+    let actual: Vec<&str> = mailbox.in_flight.iter().map(|entry| entry.transcript_id.as_str()).collect();
+    if actual != delivery.ids() {
+        return Err(format!("inbox delivery changed before ack: {}", path.display()));
+    }
+    for entry in mailbox.in_flight.drain(..) {
+        if entry.retain_ack {
+            mailbox.acked.push_back(InboxAck { from: entry.from, text: entry.text, transcript_id: entry.transcript_id });
+        }
+    }
+    persist_mailbox(&path, &mailbox)
+}
+
+#[cfg(test)]
+pub(super) fn drain_inbox(dir: &Path, name: &str) -> Result<Vec<(String, String)>, String> {
+    let delivery = claim_inbox_entries(dir, name)?;
+    let messages = delivery.messages();
+    ack_inbox_entries(dir, name, &delivery)?;
+    Ok(messages)
+}
+
+fn with_mailbox(path: &Path, mutate: impl FnOnce(&mut Mailbox) -> Result<bool, String>) -> Result<(), String> {
+    let lock = lock_for(path);
+    let _guard = crate::core::shared::lock(&lock);
+    ensure_available(path)?;
+    let mut mailbox = load_mailbox(path)?;
+    if mutate(&mut mailbox)? {
+        persist_mailbox(path, &mailbox)?;
+    }
+    Ok(())
+}
+
+fn inbox_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join("inboxes").join(format!("{name}.json"))
+}
+
+fn load_mailbox(path: &Path) -> Result<Mailbox, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Mailbox { version: MAILBOX_VERSION, ..Default::default() });
+        }
+        Err(error) => return Err(format!("read inbox {}: {error}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(Mailbox { version: MAILBOX_VERSION, ..Default::default() });
+    }
+    if let Ok(mailbox) = serde_json::from_str::<Mailbox>(&text) {
+        if mailbox.version != MAILBOX_VERSION {
+            return Err(format!("unsupported inbox version {}: {}", mailbox.version, path.display()));
+        }
+        validate_mailbox(path, &mailbox)?;
+        return Ok(mailbox);
+    }
+    let mut mailbox = Mailbox { version: MAILBOX_VERSION, ..Default::default() };
+    for (index, line) in text.lines().enumerate() {
+        let mut entry = serde_json::from_str::<InboxEntry>(line)
+            .map_err(|error| format!("parse inbox {} line {}: {error}", path.display(), index + 1))?;
+        if entry.transcript_id.is_empty() {
+            entry.transcript_id = crate::core::ids::new_id("msg");
+        }
+        mailbox.queued.push(entry);
+    }
+    validate_mailbox(path, &mailbox)?;
+    Ok(mailbox)
+}
+
+fn validate_mailbox(path: &Path, mailbox: &Mailbox) -> Result<(), String> {
+    let mut ids = HashSet::new();
+    for entry in mailbox.queued.iter().chain(mailbox.in_flight.iter()) {
+        crate::core::ids::validate_id(&entry.from)?;
+        crate::core::ids::validate_id(&entry.transcript_id)?;
+        if !ids.insert(entry.transcript_id.as_str()) {
+            return Err(format!("duplicate inbox delivery {}: {}", entry.transcript_id, path.display()));
+        }
+    }
+    for entry in &mailbox.acked {
+        crate::core::ids::validate_id(&entry.from)?;
+        crate::core::ids::validate_id(&entry.transcript_id)?;
+        if !ids.insert(entry.transcript_id.as_str()) {
+            return Err(format!("duplicate inbox ack {}: {}", entry.transcript_id, path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn persist_mailbox(path: &Path, mailbox: &Mailbox) -> Result<(), String> {
+    match super::storage::write_json_atomic(path, mailbox) {
+        Ok(()) => Ok(()),
+        Err(error) if error.committed() => {
+            let message = format!("inbox durability is indeterminate after visible commit: {}", error.into_message());
+            crate::core::shared::lock(INBOX_BLOCKED.get_or_init(|| Mutex::new(HashMap::new()))).insert(path.to_path_buf(), message.clone());
+            Err(message)
+        }
+        Err(error) => Err(error.into_message()),
+    }
+}
+
+fn ensure_available(path: &Path) -> Result<(), String> {
+    match INBOX_BLOCKED.get().and_then(|blocked| crate::core::shared::lock(blocked).get(path).cloned()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn cap_text(text: &str) -> String {
     let total = text.chars().count();
     if total <= INBOX_TEXT_CAP {
@@ -77,160 +245,6 @@ fn cap_text(text: &str) -> String {
     format!("{kept}...[truncated, original {total} chars]")
 }
 
-/// 读 + 校验 + 清空。任一坏行使整批 fail closed，原文件保持不变，避免清空时永久丢失损坏行。
-/// 临界区覆盖完整「读-校验-清空」：append 不会落在读取与清空的间隙里。
-pub(super) fn drain_inbox(dir: &Path, name: &str) -> Result<Vec<(String, String)>, String> {
-    drain_inbox_entries(dir, name).map(|entries| entries.into_iter().map(|entry| (entry.from, entry.text)).collect())
-}
-
-pub(super) fn drain_inbox_entries(dir: &Path, name: &str) -> Result<Vec<InboxEntry>, String> {
-    crate::core::ids::validate_id(name)?;
-    let path = dir.join("inboxes").join(format!("{name}.json"));
-    let lock = lock_for(&path);
-    let _guard = lock.lock().map_err(|error| format!("lock inbox {name}: {error}"))?;
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("read inbox {}: {error}", path.display())),
-    };
-    let mut out = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let mut entry = serde_json::from_str::<InboxEntry>(line)
-            .map_err(|error| format!("parse inbox {} line {}: {error}", path.display(), index + 1))?;
-        if entry.transcript_id.is_empty() {
-            entry.transcript_id = crate::core::ids::new_id("msg");
-        }
-        out.push(entry);
-    }
-    // 未提交清空时不得交付，否则下一次 drain 会重复注入同一批消息。
-    clear_atomic(&path)?;
-    Ok(out)
-}
-
-fn clear_atomic(path: &Path) -> Result<(), String> {
-    use std::io::Write;
-    let tmp = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)
-        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
-    file.write_all(b"").map_err(|error| format!("write {}: {error}", tmp.display()))?;
-    file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
-    drop(file);
-    std::fs::rename(&tmp, path).map_err(|error| {
-        std::fs::remove_file(&tmp).ok();
-        format!("replace {}: {error}", path.display())
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 单条 cap：超限截断并标注原始长度，未超限原样通过
-    #[test]
-    fn append_caps_oversized_text() {
-        let dir = std::env::temp_dir().join(format!("kxen-inbox-cap-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("inboxes")).unwrap();
-        let big = "x".repeat(9000);
-        append_inbox(&dir, "a", "w", &big).unwrap();
-        append_inbox(&dir, "a", "w", "short").unwrap();
-        let got = drain_inbox(&dir, "a").unwrap();
-        assert_eq!(got.len(), 2);
-        assert!(got[0].1.len() < INBOX_TEXT_CAP + 64, "截断后必须贴近 cap: {}", got[0].1.len());
-        assert!(got[0].1.ends_with("original 9000 chars]"), "截断必须标注原始长度");
-        assert!(got[0].1.starts_with(&"x".repeat(100)), "前缀内容必须保留");
-        assert_eq!(got[1].1, "short", "未超限文本原样通过");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// 并发 append/drain 零丢失零重复：每条消息恰好被 drain 到一次。
-    #[test]
-    fn concurrent_append_and_drain_lose_nothing() {
-        let dir = std::env::temp_dir().join(format!("kxen-inbox-race-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("inboxes")).unwrap();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let drained = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let mut writers = Vec::new();
-        for t in 0..4 {
-            let dir = dir.clone();
-            writers.push(std::thread::spawn(move || {
-                for i in 0..25 {
-                    append_inbox(&dir, "a", "w", &format!("t{t}-m{i}")).unwrap();
-                }
-            }));
-        }
-        let drainer = {
-            let dir = dir.clone();
-            let stop = stop.clone();
-            let drained = drained.clone();
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    for (_, text) in drain_inbox(&dir, "a").unwrap() {
-                        drained.lock().unwrap().push(text);
-                    }
-                    std::thread::yield_now();
-                }
-            })
-        };
-        for w in writers {
-            w.join().unwrap();
-        }
-        // 写入全部完成后收尾排空，再停 drainer
-        for (_, text) in drain_inbox(&dir, "a").unwrap() {
-            drained.lock().unwrap().push(text);
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drainer.join().unwrap();
-        // join 后可能还有最后一轮 drain 遗漏：再收一次尾
-        for (_, text) in drain_inbox(&dir, "a").unwrap() {
-            drained.lock().unwrap().push(text);
-        }
-
-        let got = drained.lock().unwrap();
-        assert_eq!(got.len(), 100, "零丢失零重复：4 x 25 条必须恰好各到一次");
-        let mut sorted = got.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 100, "重复投递检测");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn session_lock_entries_are_reclaimable() {
-        let base = std::env::temp_dir().join(format!("kxen-inbox-lifecycle-{}", std::process::id()));
-        let first = base.join("first");
-        let second = base.join("second");
-        std::fs::create_dir_all(first.join("inboxes")).unwrap();
-        std::fs::create_dir_all(second.join("inboxes")).unwrap();
-        append_inbox(&first, "lead", "worker", "one").unwrap();
-        append_inbox(&second, "lead", "worker", "two").unwrap();
-
-        drop_session_locks(&first);
-        let locks = crate::core::shared::lock(INBOX_LOCKS.get().unwrap());
-        assert!(!locks.keys().any(|path| path.starts_with(&first)));
-        assert!(locks.keys().any(|path| path.starts_with(&second)));
-        drop(locks);
-
-        drop_session_locks(&second);
-        std::fs::remove_dir_all(base).ok();
-    }
-
-    /// P2-7 poison 容错回归：锁表被持锁 panic 毒化后，lock_for 不得 panic（expect 版会把
-    /// team 收件通道永久打死）。本测试把全局锁表毒化留在进程内：其余触及该表的路径必须全部
-    /// 走 shared::lock（drop_session_locks 与上方回收测试同口径），否则并发下会被本测试拖挂。
-    #[test]
-    fn poisoned_locks_map_still_usable() {
-        let locks = INBOX_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = crate::core::shared::lock(locks);
-            panic!("poison inbox locks map");
-        }));
-        assert!(locks.is_poisoned(), "前置：锁表必须已毒化");
-        let lock = lock_for(Path::new("/tmp/kxen-inbox-poison-test.json"));
-        let _guard = crate::core::shared::lock(&lock);
-    }
-}
+#[path = "inbox/tests.rs"]
+mod tests;

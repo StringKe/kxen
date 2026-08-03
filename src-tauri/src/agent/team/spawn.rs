@@ -10,7 +10,7 @@ use super::TeamState;
 use super::manager::TeamManager;
 use super::member_loop::teammate_loop;
 use super::member_wake::{PLAN_VERDICT_APPROVED, PLAN_VERDICT_REJECTED};
-use super::types::{Member, MemberStatus};
+use super::types::{Member, MemberStatus, PendingPlanVerdict};
 
 struct ActiveLoopGuard(Arc<TeamState>);
 
@@ -22,7 +22,22 @@ impl Drop for ActiveLoopGuard {
     }
 }
 
+#[cfg(test)]
+#[path = "spawn/tests.rs"]
+mod tests;
+
 impl TeamManager {
+    pub(super) async fn resolve_member_model(&self, state: &TeamState, role: &str) -> Result<ModelRef, String> {
+        let mrm = state.deps.runtimes.runtime(&state.workdir)?.mrm();
+        // 凭证取操作点实时快照（先克隆再 await）：冻结副本看不到探测/刷新后的新凭证。
+        let store = lock(&state.deps.store).clone();
+        let resolved = mrm.resolve(role, &store).await.ok_or_else(|| format!("no available model for role {role}"))?;
+        Ok(match resolved.account {
+            Some(account) => ModelRef::with_account(resolved.provider, resolved.model, account),
+            None => ModelRef::new(resolved.provider, resolved.model),
+        })
+    }
+
     pub(super) fn spawn(
         &self,
         state: &Arc<TeamState>,
@@ -32,6 +47,8 @@ impl TeamManager {
         model_ref: ModelRef,
         plan_approval: bool,
     ) -> Result<String, String> {
+        super::types::ensure_available(state)?;
+        super::types::validate_member_name(&name)?;
         let _lifecycle = lock(&state.lifecycle_lock);
         if state.quiescing.load(std::sync::atomic::Ordering::Acquire) {
             return Err(format!("session deletion in progress: {}", state.session_id));
@@ -42,6 +59,7 @@ impl TeamManager {
             if members.iter().any(|m| m.name == name) {
                 return Err(format!("teammate already exists: {name}"));
             }
+            let original = members.clone();
             members.push(Member {
                 name: name.clone(),
                 role: role.clone(),
@@ -50,11 +68,10 @@ impl TeamManager {
                 plan_approval,
                 prompt: prompt.clone(),
                 approved: !plan_approval,
+                pending_verdict: None,
+                applied_verdict_id: None,
             });
-            if let Err(error) = super::types::persist_config_locked(state, &members) {
-                members.pop();
-                return Err(error);
-            }
+            super::types::commit_members(state, &mut members, original)?;
         }
         Self::start_member_loop(state, name, role, prompt, model_ref, !plan_approval);
         Ok(format!("teammate spawned (model {model_name})"))
@@ -89,53 +106,113 @@ impl TeamManager {
     }
 
     pub(super) fn plan_verdict(&self, state: &Arc<TeamState>, name: &str, approve: bool, feedback: &str) -> Result<String, String> {
-        {
+        super::types::ensure_available(state)?;
+        let verdict = {
             let mut members = lock(&state.members);
             let Some(member) = members.iter_mut().find(|m| m.name == name) else {
                 return Err(format!("teammate not found: {name}"));
             };
-            if member.status != MemberStatus::AwaitingPlanApproval {
-                return Err(format!("{name} is not awaiting plan approval (status: {:?})", member.status));
+            if let Some(pending) = &member.pending_verdict {
+                if pending.approved != approve || pending.feedback != feedback {
+                    return Err(format!("{name} has a different pending plan verdict"));
+                }
+                pending.clone()
+            } else {
+                if member.status != MemberStatus::AwaitingPlanApproval {
+                    return Err(format!("{name} is not awaiting plan approval (status: {:?})", member.status));
+                }
+                let original = members.clone();
+                let verdict =
+                    PendingPlanVerdict { delivery_id: crate::core::ids::new_id("msg"), approved: approve, feedback: feedback.to_string() };
+                members.iter_mut().find(|member| member.name == name).expect("member remains present").pending_verdict =
+                    Some(verdict.clone());
+                super::types::commit_members(state, &mut members, original)?;
+                verdict
             }
-            let previous = (member.status, member.approved);
-            member.status = MemberStatus::Working;
-            // 审批结果落盘：崩溃重启后 restore 按 approved 初值续跑，不要求重批
-            member.approved = approve;
-            if let Err(error) = super::types::persist_config_locked(state, &members) {
-                let member = members.iter_mut().find(|member| member.name == name).expect("member remains present");
-                (member.status, member.approved) = previous;
-                return Err(error);
-            }
-        }
-        // 结构化前缀替代旧子串语义：member_loop 只认 starts_with 精确匹配，
-        // lead 手写/转述 "Plan approved" 不再误批；from=lead + 前缀双条件，正文不再内嵌 [lead]
+        };
         let text = if approve {
             format!("{PLAN_VERDICT_APPROVED} Plan approved. Proceed with implementation.")
         } else {
             format!("{PLAN_VERDICT_REJECTED} Plan rejected. Revise and resubmit. Feedback: {feedback}")
         };
-        self.send(state, "lead", name, &text)?;
+        super::inbox::append_inbox_with_id(&state.dir, name, "lead", &text, &verdict.delivery_id)?;
+        let applied = {
+            let mut members = lock(&state.members);
+            let Some(member) = members.iter().find(|member| member.name == name) else {
+                return Err(format!("teammate disappeared while applying plan verdict: {name}"));
+            };
+            if member.applied_verdict_id.as_deref() == Some(&verdict.delivery_id) {
+                false
+            } else {
+                if member.pending_verdict.as_ref() != Some(&verdict) {
+                    return Err(format!("{name} plan verdict intent changed before apply"));
+                }
+                let original = members.clone();
+                let member = members.iter_mut().find(|member| member.name == name).expect("member remains present");
+                member.status = MemberStatus::Working;
+                member.approved = approve;
+                member.pending_verdict = None;
+                member.applied_verdict_id = Some(verdict.delivery_id.clone());
+                super::types::commit_members(state, &mut members, original)?;
+                true
+            }
+        };
+        if applied {
+            state.deps.agents.push_transcript(
+                &state.session_id,
+                name,
+                serde_json::json!({ "kind": "user", "text": format!("[lead] {text}"), "agent": name, "session_id": state.session_id }),
+            );
+            if let Some(notify) = lock(&state.notifies).get(name) {
+                notify.notify_one();
+            }
+            self.fanout_observers(state, "lead", name, &text);
+        }
         Ok(if approve { format!("approved {name}") } else { format!("rejected {name} with feedback") })
     }
 
-    pub(super) fn shutdown(&self, state: &Arc<TeamState>, name: &str) -> Result<String, String> {
-        let token = lock(&state.cancels).get(name).cloned();
-        let Some(token) = token else {
-            return Err(format!("teammate not found: {name}"));
-        };
-        {
+    pub(super) fn resume_member(&self, state: &Arc<TeamState>, name: &str, recovery_prompt: &str) -> Result<String, String> {
+        super::types::ensure_available(state)?;
+        let recovery_prompt = recovery_prompt.trim();
+        if recovery_prompt.is_empty() {
+            return Err("resume requires a non-empty recovery prompt".into());
+        }
+        let member = {
             let mut members = lock(&state.members);
-            let Some(member) = members.iter_mut().find(|member| member.name == name) else {
+            let Some(current) = members.iter().find(|member| member.name == name) else {
                 return Err(format!("teammate not found: {name}"));
             };
-            let previous = member.status;
-            member.status = MemberStatus::Shutdown;
-            if let Err(error) = super::types::persist_config_locked(state, &members) {
-                members.iter_mut().find(|member| member.name == name).expect("member remains present").status = previous;
-                return Err(error);
+            if current.status != MemberStatus::Blocked {
+                return Err(format!("{name} is not blocked (status: {:?})", current.status));
             }
+            let original = members.clone();
+            let current = members.iter_mut().find(|member| member.name == name).expect("member remains present");
+            current.status = MemberStatus::Working;
+            current.prompt = recovery_prompt.to_string();
+            let resumed = current.clone();
+            super::types::commit_members(state, &mut members, original)?;
+            resumed
+        };
+        Self::start_member_loop(state, member.name.clone(), member.role, member.prompt, member.model, member.approved);
+        Ok(format!("resumed {} with explicit recovery prompt", member.name))
+    }
+
+    pub(super) fn shutdown(&self, state: &Arc<TeamState>, name: &str) -> Result<String, String> {
+        super::types::ensure_available(state)?;
+        let token = lock(&state.cancels).get(name).cloned();
+        {
+            let mut members = lock(&state.members);
+            if !members.iter().any(|member| member.name == name) {
+                return Err(format!("teammate not found: {name}"));
+            }
+            let original = members.clone();
+            let member = members.iter_mut().find(|member| member.name == name).expect("member remains present");
+            member.status = MemberStatus::Shutdown;
+            super::types::commit_members(state, &mut members, original)?;
         }
-        token.cancel();
+        if let Some(token) = token {
+            token.cancel();
+        }
         Ok(format!("shutdown requested: {name}"))
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::core::event::EventBus;
 use crate::core::pending_queue::PendingQueues;
-use crate::core::shared::{lock, read};
+use crate::core::shared::lock;
 use crate::llm::ModelRef;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ pub struct TeamManager {
     sessions: std::sync::Mutex<HashMap<String, Arc<TeamState>>>,
     /// 启动恢复失败的 Session 必须保持 fail-closed，直到原文件被修复并显式恢复。
     restore_blocked: std::sync::Mutex<HashMap<String, String>>,
+    /// 启动时遇到 deletion tombstone 的 Team：等待 deletion recovery barrier 后显式恢复。
+    restore_paused: std::sync::Mutex<std::collections::HashSet<String>>,
     registry_lock: std::sync::Mutex<()>,
     deps: SpawnDeps,
     bus: EventBus,
@@ -42,6 +44,7 @@ impl TeamManager {
             root,
             sessions: std::sync::Mutex::new(HashMap::new()),
             restore_blocked: std::sync::Mutex::new(HashMap::new()),
+            restore_paused: std::sync::Mutex::new(std::collections::HashSet::new()),
             registry_lock: std::sync::Mutex::new(()),
             deps,
             bus,
@@ -73,11 +76,15 @@ impl TeamManager {
     pub(super) fn state_for(self: &Arc<Self>, session_id: &str) -> Result<Arc<TeamState>, String> {
         crate::core::ids::validate_id(session_id)?;
         self.ensure_session_available(session_id)?;
+        if lock(&self.restore_paused).contains(session_id) {
+            return Err(format!("team session {session_id} restore is paused until deletion recovery completes"));
+        }
         let _registry = lock(&self.registry_lock);
         if let Some(error) = lock(&self.restore_blocked).get(session_id).cloned() {
             return Err(format!("team session {session_id} recovery blocked: {error}"));
         }
         if let Some(state) = lock(&self.sessions).get(session_id).cloned() {
+            super::types::ensure_available(&state)?;
             return Ok(state);
         }
         let workdir = self.session_workdir(session_id)?;
@@ -101,6 +108,7 @@ impl TeamManager {
                     loops_idle: tokio::sync::Notify::new(),
                     tasks: std::sync::Mutex::new(Vec::new()),
                     next_task_id: std::sync::atomic::AtomicU64::new(1),
+                    blocked: std::sync::Mutex::new(None),
                     deps: self.deps.clone(),
                     bus: self.bus.clone(),
                 })
@@ -135,23 +143,13 @@ impl TeamManager {
                         let (provider, model) = m.split_once('/').ok_or("model must be provider/model")?;
                         ModelRef::new(provider, model)
                     }
-                    None => {
-                        // 共享句柄读当前 MRM：set_role 热换后 teammate 派发也走新路由
-                        let mrm = read(&state.deps.mrm).clone();
-                        // 凭证取操作点实时快照（先克隆再 await）：冻结副本看不到探测/刷新后的新凭证
-                        let store = lock(&state.deps.store).clone();
-                        let resolved = mrm.resolve(&role, &store).await.ok_or_else(|| format!("no available model for role {role}"))?;
-                        match resolved.account {
-                            Some(acc) => ModelRef::with_account(resolved.provider, resolved.model, acc),
-                            None => ModelRef::new(resolved.provider, resolved.model),
-                        }
-                    }
+                    None => self.resolve_member_model(&state, &role).await?,
                 };
                 self.spawn(&state, name, role, prompt, model_ref, plan_approval)
             }
             "message" => {
                 let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?;
-                crate::core::ids::validate_id(name)?;
+                super::types::validate_member_name(name)?;
                 let text = args.get("text").and_then(Value::as_str).ok_or("missing text")?;
                 self.send(&state, "lead", name, text)?;
                 Ok(format!("sent to {name}"))
@@ -167,6 +165,12 @@ impl TeamManager {
                 let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?;
                 crate::core::ids::validate_id(name)?;
                 self.shutdown(&state, name)
+            }
+            "resume" => {
+                let name = args.get("name").and_then(Value::as_str).ok_or("missing name")?;
+                crate::core::ids::validate_id(name)?;
+                let prompt = args.get("prompt").and_then(Value::as_str).ok_or("missing recovery prompt")?;
+                self.resume_member(&state, name, prompt)
             }
             "list" => Ok(super::types::render_list(&state)),
             "task_create" => {
@@ -197,6 +201,11 @@ impl TeamManager {
                 }
                 super::tasks::reassign_task(&state, id, to)
             }
+            "task_resolve" => {
+                let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")?;
+                let resolution = args.get("resolution").and_then(Value::as_str).ok_or("missing resolution")?;
+                super::tasks::resolve_blocked_task(&state, id, resolution)
+            }
             other => Err(format!("unknown team action: {other}")),
         }
     }
@@ -206,7 +215,7 @@ impl TeamManager {
     /// 合走 lead_action 则模型可在工具参数里自选 from 冒充用户（或用户流量被伪装成 lead）。
     pub fn user_message(self: &Arc<Self>, session_id: &str, name: &str, text: &str) -> Result<String, String> {
         crate::core::ids::validate_id(session_id)?;
-        crate::core::ids::validate_id(name)?;
+        super::types::validate_member_name(name)?;
         self.ensure_session_available(session_id)?;
         let state = self.state_for(session_id)?;
         self.send(&state, "user", name, text)?;
@@ -228,8 +237,12 @@ impl TeamManager {
             self.fanout_observers(state, from, "lead", text);
             return Ok(());
         }
-        if !lock(&state.members).iter().any(|m| m.name == to) {
+        let recipient = lock(&state.members).iter().find(|member| member.name == to).cloned();
+        let Some(recipient) = recipient else {
             return Err(format!("teammate not found: {to}"));
+        };
+        if !super::types::can_receive(&recipient) {
+            return Err(format!("teammate {to} cannot receive messages while {:?}", recipient.status));
         }
         append_inbox(&state.dir, to, from, text)?;
         // user/lead 直发即时落收件人转录（kind=user，[from] 前缀与 peer 消息格式一致）：等 wake drain
@@ -250,10 +263,10 @@ impl TeamManager {
     }
 
     /// role=observer 的成员抄送全部团队信件（from=feed，避免被误判为 lead 直发）。
-    fn fanout_observers(&self, state: &Arc<TeamState>, from: &str, to: &str, text: &str) {
+    pub(super) fn fanout_observers(&self, state: &Arc<TeamState>, from: &str, to: &str, text: &str) {
         let observers: Vec<String> = lock(&state.members)
             .iter()
-            .filter(|m| m.role == "observer" && m.name != from && m.name != to)
+            .filter(|m| m.role == "observer" && m.name != from && m.name != to && super::types::can_receive(m))
             .map(|m| m.name.clone())
             .collect();
         for name in observers {
@@ -280,7 +293,18 @@ impl TeamManager {
         crate::core::ids::validate_id(from)?;
         self.ensure_session_available(session_id)?;
         let state = self.state_for(session_id)?;
-        match args.get("action").and_then(Value::as_str).ok_or("missing action")? {
+        let sender = lock(&state.members).iter().find(|member| member.name == from).cloned();
+        let Some(sender) = sender else {
+            return Err(format!("teammate not found: {from}"));
+        };
+        if !super::types::can_act(&sender) {
+            return Err(format!("teammate {from} cannot act while {:?}", sender.status));
+        }
+        let action = args.get("action").and_then(Value::as_str).ok_or("missing action")?;
+        if !sender.approved && !matches!(action, "send" | "list") {
+            return Err(format!("teammate {from} is plan-only until its durable plan verdict is approved"));
+        }
+        match action {
             "send" => {
                 let to = args.get("to").and_then(Value::as_str).ok_or("missing to")?;
                 crate::core::ids::validate_id(to)?;

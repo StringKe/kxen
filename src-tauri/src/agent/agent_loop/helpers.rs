@@ -19,6 +19,15 @@ pub fn resolve_authorized_path(input: &str, ctx: &super::context::AgentContext) 
     crate::tools::path_policy::resolve(input, &ctx.workdir, &ctx.path_grants)
 }
 
+pub fn parse_tool_arguments(name: &str, arguments: &str) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments for tool {name}: {error}"))?;
+    if !value.is_object() {
+        return Err(format!("invalid arguments for tool {name}: expected a JSON object"));
+    }
+    Ok(value)
+}
+
 /// 工具调用一行摘要：按工具提取关键参数（exec=command、fs=path、glob/grep=pattern），
 /// 不落原始 JSON——UI 执行行只展示这一条（Claude Code `⏺ Bash(ls -la)` 同款形态）。
 pub fn summarize_args(name: &str, arguments: &str) -> String {
@@ -72,26 +81,18 @@ pub fn is_read_only_builtin(name: &str) -> bool {
     READ_ONLY.contains(&name)
 }
 
-/// 只读判定 = 内置只读集 ∪ MCP 显式 read_only 标注；未标注一律视为写（宁严勿宽，同 mcp restricted 口径）。
-pub fn is_read_only_tool(name: &str, ctx: &super::context::AgentContext) -> bool {
-    if is_read_only_builtin(name) {
-        return true;
-    }
-    if let Some((server, tool)) = crate::mcp::tools::split_prefixed(name) {
-        return ctx.mcp.as_ref().is_some_and(|m| m.all_tools().iter().any(|t| t.server == server && t.name == tool && t.read_only));
-    }
-    false
+/// 只信任宿主内置的只读分类。MCP annotations 由远端 server 自报，不能用于权限提升或并行副作用判断。
+pub fn is_read_only_tool(name: &str, _ctx: &super::context::AgentContext) -> bool {
+    is_read_only_builtin(name)
 }
 
 /// 执行侧白名单（与 run.rs 展示侧过滤同口径）：展示过滤只决定模型「看到什么」，
-/// 模型伪造/幻觉 tool_call 名可直接抵达 dispatch，必须在这里复验，否则 readonly 角色一句
-/// 「调用 exec」就越权（P0-08 只挡了展示侧）。内置/deferred 严格按白名单；MCP 只读工具对
-/// restricted 角色可见（tool_defs_for 口径），执行侧同口径放行。
-/// mcp_read_only 由调用方经 is_read_only_tool 算好传入，保持本函数纯（测试不用拼 AgentContext）。
-pub fn tool_permitted(name: &str, allowed: Option<&[&str]>, mcp_read_only: bool) -> bool {
+/// 模型伪造/幻觉 tool_call 名可直接抵达 dispatch，必须在这里复验。restricted 角色只允许本地白名单精确命中，
+/// 远端 MCP metadata 不能扩大 capability set。
+pub fn tool_permitted(name: &str, allowed: Option<&[&str]>) -> bool {
     match allowed {
         None => true,
-        Some(a) => a.contains(&name) || (name.starts_with("mcp__") && mcp_read_only),
+        Some(allowed) => allowed.contains(&name),
     }
 }
 
@@ -110,17 +111,26 @@ mod tests {
     }
 
     #[test]
+    fn execution_arguments_fail_closed_before_dispatch() {
+        assert!(parse_tool_arguments("mcp__danger__act", r#"{"confirmed":true}"#).unwrap().is_object());
+        for invalid in ["{", "null", "[]", "true", "\"text\""] {
+            let error = parse_tool_arguments("mcp__danger__act", invalid).unwrap_err();
+            assert!(error.contains("mcp__danger__act"), "{error}");
+        }
+    }
+
+    #[test]
     fn tool_permitted_mirrors_visibility() {
         // 无白名单（主会话 / full 角色）：全放行
-        assert!(tool_permitted("exec", None, false));
+        assert!(tool_permitted("exec", None));
         // readonly 白名单：单内放行，写工具拒绝（模型伪造名过不了执行侧）
-        assert!(tool_permitted("read", Some(&["read", "glob", "grep"]), false));
-        assert!(!tool_permitted("exec", Some(&["read", "glob", "grep"]), false));
+        assert!(tool_permitted("read", Some(&["read", "glob", "grep"])));
+        assert!(!tool_permitted("exec", Some(&["read", "glob", "grep"])));
         // 内置只读但不在白名单（如 lsp）：展示侧不可见，执行侧同拒
-        assert!(!tool_permitted("lsp", Some(&["read", "glob", "grep"]), true));
-        // MCP 只读对 restricted 可见（P0-08）：放行；MCP 写工具拒绝
-        assert!(tool_permitted("mcp__fs__read_file", Some(&["read"]), true));
-        assert!(!tool_permitted("mcp__fs__write_file", Some(&["read"]), false));
+        assert!(!tool_permitted("lsp", Some(&["read", "glob", "grep"])));
+        // Server 自报 readOnlyHint 不能提升 restricted 权限。
+        assert!(!tool_permitted("mcp__fs__read_file", Some(&["read"])));
+        assert!(!tool_permitted("mcp__fs__write_file", Some(&["read"])));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use kxen_app::tools::exec::{ExecOutcome, ExecParams, exec};
 use kxen_app::tools::shell::ShellKind;
-use kxen_app::tools::task::TaskRegistry;
+use kxen_app::tools::task::{TaskOwner, TaskRegistry};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -10,6 +10,7 @@ async fn main() {
     let registry = Arc::new(TaskRegistry::new());
     let cwd = std::env::temp_dir().join(format!("kxen-exec-demo-{}", std::process::id()));
     std::fs::create_dir_all(&cwd).unwrap();
+    let owner = TaskOwner::new("tools-exec-demo", &cwd).unwrap();
     println!("cwd: {}", cwd.display());
 
     // 1. 快命令前台
@@ -23,6 +24,7 @@ async fn main() {
         },
         &registry,
         &cwd.display().to_string(),
+        &owner,
         None,
     )
     .await
@@ -34,6 +36,7 @@ async fn main() {
         ExecParams { shell_type: ShellKind::Zsh, path: "/".into(), command: "rm -rf /".into(), timeout_ms: None, background: false },
         &registry,
         &cwd.display().to_string(),
+        &owner,
         None,
     )
     .await;
@@ -52,6 +55,7 @@ async fn main() {
         },
         &registry,
         &cwd.display().to_string(),
+        &owner,
         None,
     )
     .await
@@ -69,6 +73,7 @@ async fn main() {
         },
         &registry,
         &cwd.display().to_string(),
+        &owner,
         None,
     )
     .await
@@ -76,9 +81,9 @@ async fn main() {
     match &out {
         ExecOutcome::Background { task_id } => {
             println!("[auto-bg] task_id = {task_id}");
-            let info = registry.get(task_id).unwrap();
+            let info = registry.get(&owner, task_id).unwrap();
             println!("[auto-bg] status = {:?}, command = {}", info.status(), info.command);
-            registry.kill(task_id).await;
+            registry.kill(&owner, task_id).await;
         }
         other => println!("[auto-bg] UNEXPECTED: {other:?}"),
     }

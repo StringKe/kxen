@@ -48,6 +48,7 @@ fn deps(fallback: &Path, store: Arc<Mutex<AuthStore>>) -> SpawnDeps {
         extras: Arc::new(kxen_app::agent::agent_loop::SessionExtrasRegistry::default()),
         agents: Arc::new(kxen_app::agent::activity::AgentRegistry::default()),
         approvals: None,
+        session_usage: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -58,21 +59,21 @@ fn workdir_binds_session_workspace_and_never_drifts_on_switch() {
     let sa = kxen_app::core::session::create(&f.sessions, f.ws_a.to_str().unwrap()).unwrap();
     let store = Arc::new(Mutex::new(AuthStore::default()));
     let mgr = TeamManager::new(f.base.join("teams"), deps(&f.fallback, store), EventBus::default(), f.sessions.clone(), None);
-    assert_eq!(&*mgr.session_workdir(&sa.id), f.ws_a.as_path());
+    assert_eq!(&*mgr.session_workdir(&sa.id).unwrap(), f.ws_a.as_path());
 
     // 时刻 2：switch 到 B（AppState 只改 active_workspace；lib 侧真相源是 session metadata）
     // switch 后在 B 下建新会话 sb
     let sb = kxen_app::core::session::create(&f.sessions, f.ws_b.to_str().unwrap()).unwrap();
 
     // A 的 team 不漂移：list_json 触发真实 state_for 建 TeamState 后仍绑 A
-    let _ = mgr.list_json(&sa.id);
-    assert_eq!(&*mgr.session_workdir(&sa.id), f.ws_a.as_path(), "switch 后 A 会话的 team 必须继续用 A");
+    mgr.list_json(&sa.id).unwrap();
+    assert_eq!(&*mgr.session_workdir(&sa.id).unwrap(), f.ws_a.as_path(), "switch 后 A 会话的 team 必须继续用 A");
     // 新 spawn 到 B 会话的 team 用 B
-    let _ = mgr.list_json(&sb.id);
-    assert_eq!(&*mgr.session_workdir(&sb.id), f.ws_b.as_path(), "B 会话的 team 必须用 B");
+    mgr.list_json(&sb.id).unwrap();
+    assert_eq!(&*mgr.session_workdir(&sb.id).unwrap(), f.ws_b.as_path(), "B 会话的 team 必须用 B");
 
-    // metadata 缺失（会话已删）回退启动目录
-    assert_eq!(&*mgr.session_workdir("ses_missing"), f.fallback.as_path());
+    // metadata 缺失（会话已删）必须 fail-closed，禁止在启动 workspace 错误恢复 teammate。
+    assert!(mgr.session_workdir("ses_missing").is_err());
 }
 
 #[test]

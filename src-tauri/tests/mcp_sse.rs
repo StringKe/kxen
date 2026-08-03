@@ -1,7 +1,7 @@
 // MCP remote（legacy SSE）端到端：GET 长连接收 endpoint 事件 + POST 回写（202），
 // 响应经 SSE 流按 id 路由。mock 用 std TcpListener + 每连接一线程，channel 投递待发帧。
 use kxen_app::mcp::client::McpClient;
-use kxen_app::mcp::config::{RemoteConfig, RemoteKind, ServerConfig};
+use kxen_app::mcp::config::{ConfigScope, RemoteConfig, RemoteKind, ServerConfig};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,11 +17,16 @@ fn route_response(v: &Value) -> Option<Value> {
     let method = v.get("method").and_then(|m| m.as_str())?;
     let id = v.get("id").cloned()?;
     let result = match method {
-        "initialize" => json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "mock-sse", "version": "0.1" }
-        }),
+        "initialize" => {
+            if v.pointer("/params/capabilities/roots").is_some() {
+                return Some(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "remote roots forbidden" } }));
+            }
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "mock-sse", "version": "0.1" }
+            })
+        }
         "tools/list" => json!({ "tools": [ {
             "name": "echo",
             "description": "echo back text",
@@ -121,6 +126,7 @@ fn sse_config(url: &str) -> ServerConfig {
         transport: RemoteKind::Sse,
         headers: HashMap::new(),
         oauth: None,
+        scope: ConfigScope::Personal,
     })
 }
 

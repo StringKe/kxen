@@ -2,10 +2,11 @@
 //! 威胁模型：agent 会被页面内容诱导抓取攻击者构造的 URL；只拦 scheme 时，
 //! loopback、内网 RFC1918、云 metadata（169.254.169.254）都会被读进 prompt。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// 重定向跳数上限：防 301 环，也给逐跳 DNS 检查封顶。
 const MAX_REDIRECT_HOPS: u32 = 5;
+const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 单个 IP 是否命中拒绝段。
 /// v4：loopback / RFC1918 / CGNAT（100.64.0.0/10，运营商内网与 Tailscale 网段）/ link-local（169.254.0.0/16，含云 metadata）/ 0.0.0.0
@@ -45,9 +46,67 @@ fn is_blocked_ip_with(ip: &IpAddr, allow_loopback: bool) -> bool {
     }
 }
 
+/// reqwest 连接器使用的 DNS resolver。校验发生在连接实际采用的解析结果上，
+/// 因此预检之后发生 DNS rebinding 也不能把连接切到私网地址。
+#[derive(Clone, Copy)]
+pub(crate) struct GuardedResolver {
+    allow_loopback: bool,
+}
+
+impl GuardedResolver {
+    pub(crate) const fn strict() -> Self {
+        Self { allow_loopback: false }
+    }
+
+    pub(crate) const fn allowing_loopback() -> Self {
+        Self { allow_loopback: true }
+    }
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            let resolved = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host.as_str(), 0)))
+                .await
+                .map_err(|_| resolver_error(format!("dns resolve timed out for {host}")))?
+                .map_err(|error| resolver_error(format!("dns resolve failed for {host}: {error}")))?
+                .collect::<Vec<_>>();
+            validate_resolved(&host, &resolved, allow_loopback).map_err(resolver_error)?;
+            let addrs: reqwest::dns::Addrs = Box::new(resolved.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+fn resolver_error(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::other(message))
+}
+
+fn validate_resolved(host: &str, addrs: &[SocketAddr], allow_loopback: bool) -> Result<(), String> {
+    if addrs.is_empty() {
+        return Err(format!("dns resolve failed for {host}: no address"));
+    }
+    if let Some(bad) = addrs.iter().map(SocketAddr::ip).find(|ip| is_blocked_ip_with(ip, allow_loopback)) {
+        return Err(format!("{host} resolves to blocked address {bad}"));
+    }
+    Ok(())
+}
+
+/// SSRF-sensitive clients must not delegate target DNS to an environment proxy,
+/// otherwise the proxy could resolve an attacker-controlled host to a private address.
+pub(crate) fn guarded_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy().dns_resolver(GuardedResolver::strict())
+}
+
+/// Only for endpoints already proven to be an explicit localhost/loopback user setting.
+pub(crate) fn loopback_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy().dns_resolver(GuardedResolver::allowing_loopback())
+}
+
 /// 解析 URL host 并 DNS 解析，全部返回 IP 都必须不在拒绝段；scheme 也在此收口。
-/// 残余风险：检查与连接是两次解析，对抗性 DNS 可在间隔内换 IP；彻底钉住需要
-/// 把解析结果 resolve override 到连接上，桌面 agent 场景暂接受该风险。
+/// 调用方还必须使用 guarded_client_builder，让连接器对实际采用的 DNS 结果再次校验。
 pub async fn check_url(url: &str) -> Result<(), String> {
     check_url_inner(url, false).await
 }
@@ -74,15 +133,12 @@ async fn check_url_inner(url: &str, allow_loopback: bool) -> Result<(), String> 
         return if is_blocked_ip_with(&ip, allow_loopback) { Err(format!("{host} is a blocked address")) } else { Ok(()) };
     }
     // 域名返回全部 A/AAAA 记录，任一命中拒绝段即拒
-    let addrs: Vec<IpAddr> =
-        tokio::net::lookup_host((host, port)).await.map_err(|e| format!("dns resolve failed for {host}: {e}"))?.map(|sa| sa.ip()).collect();
-    if addrs.is_empty() {
-        return Err(format!("dns resolve failed for {host}: no address"));
-    }
-    if let Some(bad) = addrs.iter().find(|ip| is_blocked_ip_with(ip, allow_loopback)) {
-        return Err(format!("{host} resolves to blocked address {bad}"));
-    }
-    Ok(())
+    let lookup = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| format!("dns resolve timed out for {host}"))?
+        .map_err(|e| format!("dns resolve failed for {host}: {e}"))?;
+    let addrs: Vec<SocketAddr> = lookup.collect();
+    validate_resolved(host, &addrs, allow_loopback)
 }
 
 /// 手动跟随重定向的 GET，每跳重新 check_url。
@@ -192,5 +248,35 @@ mod tests {
             let err = rt.block_on(check_url_allow_loopback(url)).unwrap_err();
             assert!(err.contains("blocked"), "{url} -> {err}");
         }
+    }
+
+    #[test]
+    fn connector_resolver_rejects_rebound_private_address() {
+        let public = SocketAddr::from(([1, 1, 1, 1], 0));
+        let private = SocketAddr::from(([127, 0, 0, 1], 0));
+        assert!(validate_resolved("swap.example", &[public], false).is_ok());
+        let error = validate_resolved("swap.example", &[private], false).unwrap_err();
+        assert!(error.contains("blocked address 127.0.0.1"), "{error}");
+    }
+
+    #[test]
+    fn connector_resolver_loopback_exception_is_narrow() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
+        let private = SocketAddr::from(([192, 168, 1, 2], 0));
+        assert!(validate_resolved("localhost", &[loopback], true).is_ok());
+        assert!(validate_resolved("internal.example", &[private], true).is_err());
+    }
+
+    #[tokio::test]
+    async fn connector_resolver_validates_the_dns_result_used_for_connection() {
+        use reqwest::dns::Resolve;
+
+        let strict = match GuardedResolver::strict().resolve("localhost".parse().unwrap()).await {
+            Err(error) => error,
+            Ok(_) => panic!("strict connector resolver must reject localhost"),
+        };
+        assert!(strict.to_string().contains("blocked address"), "{strict}");
+        let allowed = GuardedResolver::allowing_loopback().resolve("localhost".parse().unwrap()).await.unwrap();
+        assert!(allowed.collect::<Vec<_>>().iter().all(|address| address.ip().is_loopback()));
     }
 }

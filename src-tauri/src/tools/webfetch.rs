@@ -8,7 +8,7 @@ pub(crate) fn guarded_client() -> reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            crate::tools::net_guard::guarded_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(TIMEOUT)
                 .user_agent("kxen/0.1 (+https://kxen.ai)")

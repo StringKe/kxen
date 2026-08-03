@@ -69,16 +69,14 @@ fn session_lifecycle() {
 fn update_meta_does_not_bump_updated_at() {
     let dir = tmp_dir("meta");
     let s = ses::create(&dir, "/tmp/work").unwrap();
-    // 拨回 updated_at 作为探针：meta 变更（重命名/置顶/拖拽排序）不得碰它，否则列表该行跳「刚刚」顶到最前
-    let mut meta = ses::load_meta(&dir, &s.id).unwrap();
-    meta.updated_at = 1;
-    ses::save_meta(&dir, &meta).unwrap();
+    // meta 变更（重命名/置顶/拖拽排序）不得碰活动时间，否则列表该行跳「刚刚」顶到最前。
+    // save_meta 会拒绝 stale caller 把活动时间倒退，所以直接使用创建时间作为探针。
     let s2 = ses::update_meta(&dir, &s.id, Some("改名"), Some(true), Some(Some(3))).unwrap();
-    assert_eq!(s2.updated_at, 1, "重命名/置顶/排序不得 bump updated_at");
+    assert_eq!(s2.updated_at, s.updated_at, "重命名/置顶/排序不得 bump updated_at");
     // 真活动（消息落盘）仍 bump
     let m = ses::new_message(&s.id, Role::User, vec![Part::Text { text: "hi".into() }]);
     let s3 = ses::append_message(&dir, &m).unwrap();
-    assert!(s3.updated_at > 1, "append_message 仍 bump updated_at");
+    assert!(s3.updated_at > s.updated_at, "append_message 仍 bump updated_at");
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -1,12 +1,18 @@
-//! goal 工具：目标生命周期管理（list/create/get/activate/pause/resume/cancel/complete）。
+//! goal 工具：目标生命周期管理（list/create/get/activate/pause/resume/adjust/cancel/complete）。
 //! 状态迁移成功后 publish GoalUpdate。
 
 use serde_json::Value;
 
+mod completion;
+
 /// complete 的逐条验证评审（score-based）：judge 由调用方择型注入，store 借用不重拷。
 pub struct GoalJudge<'a> {
+    pub mrm: &'a crate::llm::mrm::ModelResourceManager,
     pub model: crate::llm::ModelRef,
     pub store: &'a crate::auth::credential::AuthStore,
+    pub cancel: Option<&'a crate::agent::cancel::CancelToken>,
+    pub auxiliary_usage: &'a super::usage::AuxiliaryUsage,
+    pub usage_reporter: Option<&'a super::usage::UsageReporter>,
 }
 
 /// 状态串与 GoalUpdate 事件同一收口（GoalStatus::as_str，snake_case）：
@@ -30,15 +36,18 @@ pub async fn execute_goal_tool(
     session_id: Option<&str>,
     bus: Option<&crate::core::event::EventBus>,
     judge: Option<&GoalJudge<'_>>,
+    run_cancel: Option<&crate::agent::cancel::CancelToken>,
 ) -> Result<String, String> {
     let action = args.get("action").and_then(Value::as_str).ok_or("missing action")?;
     let dir = crate::core::paths::goals_dir();
     match action {
         "list" => {
-            let goals = crate::core::goal::Goal::list(&dir);
+            let goals = crate::core::goal::Goal::list_checked(&dir).map_err(|error| error.to_string())?;
             Ok(if goals.is_empty() { "no goals".into() } else { goals.iter().map(show_goal).collect::<Vec<_>>().join("\n---\n") })
         }
         "create" => {
+            let _lifecycle =
+                session_id.map(|id| crate::core::session_lifecycle::admit_mutation(&crate::core::paths::sessions_dir(), id)).transpose()?;
             let contract = crate::core::goal::GoalContract {
                 objective: args.get("objective").and_then(Value::as_str).ok_or("missing objective")?.to_string(),
                 completion_criteria: args
@@ -49,7 +58,8 @@ pub async fn execute_goal_tool(
                 constraints: args.get("constraints").and_then(Value::as_str).map(String::from),
                 budget: crate::core::goal::GoalBudget {
                     tokens: args.pointer("/budget/tokens").and_then(Value::as_u64),
-                    turns: args.pointer("/budget/turns").and_then(Value::as_u64).map(|n| n as u32),
+                    turns: crate::core::goal::checked_turn_budget(args.pointer("/budget/turns").and_then(Value::as_u64))
+                        .map_err(|error| error.to_string())?,
                     wall_clock_ms: args.pointer("/budget/wall_clock_ms").and_then(Value::as_u64),
                 },
             };
@@ -62,51 +72,36 @@ pub async fn execute_goal_tool(
         }
         other => {
             let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
-            // complete 的逐条评审是 await 段：先无锁读合同做评审（std 锁不得跨 await），
-            // 再进锁重读落迁移。评审调用失败按可重试错误返回，不降级放行。
-            if other == "complete"
-                && let Some(j) = judge
-            {
+            crate::core::ids::validate_id(id)?;
+            if other == "complete" {
+                let j = judge.ok_or("completion verification requires MRM")?;
                 let evidence = args.get("evidence").and_then(Value::as_str).ok_or("missing evidence")?;
-                let goal = crate::core::goal::Goal::load(&dir, id).map_err(|e| e.to_string())?;
-                let scores = crate::agent::goal_verify::score_completion(
-                    &j.model,
-                    j.store,
-                    &goal.contract.objective,
-                    &goal.contract.completion_criteria,
-                    evidence,
-                )
-                .await?;
-                let failed: Vec<_> = scores.iter().filter(|s| !s.pass).collect();
-                if !failed.is_empty() {
-                    let detail = failed.iter().map(|s| format!("- {}: {}", s.criterion, s.reason)).collect::<Vec<_>>().join("\n");
-                    return Err(format!(
-                        "completion verification failed ({} criterion/criteria unmet):\n{detail}\n\
-                         Provide evidence that actually satisfies every criterion, or adjust the goal contract.",
-                        failed.len()
-                    ));
-                }
+                return completion::complete_goal(&dir, id, evidence, session_id, bus, j).await;
             }
+            if other == "get" {
+                let goal = crate::core::goal::Goal::load(&dir, id).map_err(|e| e.to_string())?;
+                return Ok(show_goal(&goal));
+            }
+            let _lifecycle = crate::core::session_lifecycle::admit_goal_mutation(&dir, id)?;
             // 与记账共用 per-id 锁（P2-2）：锁内重读的 load-modify-save 串行化，并发 charge 不互相覆盖
             let lock = crate::core::goal::write_lock(id);
             let _guard = crate::core::shared::lock(&lock);
             let mut goal = crate::core::goal::Goal::load(&dir, id).map_err(|e| e.to_string())?;
             match other {
-                "get" => {}
                 "activate" => goal.activate().map_err(|e| e.to_string())?,
                 "pause" => goal.pause().map_err(|e| e.to_string())?,
                 "resume" => goal.resume().map_err(|e| e.to_string())?,
+                "adjust" => goal.adjust_budget_and_resume().map_err(|e| e.to_string())?,
                 "cancel" => goal.cancel().map_err(|e| e.to_string())?,
-                "complete" => {
-                    let evidence = args.get("evidence").and_then(Value::as_str).ok_or("missing evidence")?;
-                    goal.complete(evidence).map_err(|e| e.to_string())?;
-                }
                 unknown => return Err(format!("unknown goal action: {unknown}")),
             }
             goal.save(&dir).map_err(|e| e.to_string())?;
-            // get 只读无状态迁移，不发事件
-            if other != "get" {
-                publish(bus, &goal);
+            publish(bus, &goal);
+            if other == "cancel"
+                && (goal.session_id.is_none() || goal.session_id.as_deref() == session_id)
+                && let Some(cancel) = run_cancel
+            {
+                cancel.cancel();
             }
             Ok(show_goal(&goal))
         }

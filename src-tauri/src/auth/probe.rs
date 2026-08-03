@@ -54,17 +54,6 @@ pub const RULES: &[ProbeRule] = &[
     },
 ];
 
-/// 单规则探测带 5s 超时：keychain ACL 弹窗会无限阻塞调用线程（macOS 未签名二进制），
-/// 超时视为不可得，保住其余规则的导入与 app 启动。
-fn probe_with_timeout(rule: &ProbeRule) -> Option<CredentialKind> {
-    let probe = rule.probe;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(probe());
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(5)).ok().flatten()
-}
-
 const TEN_YEARS_MS: u64 = 10 * 365 * 24 * 3600 * 1000;
 
 /// 荒诞远期 expires（单位 bug 产物）按已过期处理，让 store 在下轮探测自修复。
@@ -94,19 +83,8 @@ pub fn probe_all(store: &mut AuthStore, allow_keychain: bool) -> Vec<(&'static s
                 tracing::info!(provider = rule.provider, "credential probe skipped: first-read not approved");
                 return (rule.provider, ProbeOutcome::NeedsApproval, rule.display);
             }
-            let imported = from_env.or_else(|| {
-                if rule.provider == "anthropic" && !allow_keychain {
-                    probe_with_timeout(&ProbeRule {
-                        provider: rule.provider,
-                        display: rule.display,
-                        probe: probe_claude_file_only,
-                        source: rule.source,
-                        env_override: None,
-                    })
-                } else {
-                    probe_with_timeout(rule)
-                }
-            });
+            let imported = from_env
+                .or_else(|| if rule.provider == "anthropic" && !allow_keychain { probe_claude_file_only() } else { (rule.probe)() });
             let outcome = match imported {
                 None => {
                     if store.contains_key(rule.provider) {

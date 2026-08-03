@@ -69,7 +69,8 @@ pub fn start(
 ) -> Result<String, String> {
     let mut errors: Vec<String> = Vec::new();
     for engine in std::iter::once(config.engine.as_str()).chain(config.fallback.iter().map(String::as_str)) {
-        match start_one(engine, store, locale, &bus, session_id) {
+        let capture_cloud = engine == "apple" && cloud_capture_enabled(config, store);
+        match start_one(engine, store, locale, &bus, session_id, capture_cloud) {
             Ok(started) => return Ok(started),
             Err(e) => errors.push(format!("{engine}: {e}")),
         }
@@ -83,6 +84,7 @@ fn start_one(
     locale: &str,
     bus: &crate::core::event::EventBus,
     session_id: &str,
+    capture_cloud: bool,
 ) -> Result<String, String> {
     // 同 session 重复 start = 替换：旧槽先移出（旧泵 ptr_eq 不过随即退出）
     let previous = { crate::core::shared::lock(&ACTIVE).remove(session_id) };
@@ -91,7 +93,7 @@ fn start_one(
     }
     match engine {
         "apple" => {
-            let session = apple::start_mic(locale)?;
+            let session = apple::start_mic(locale, capture_cloud)?;
             let token = std::sync::Arc::new(());
             let token_pump = token.clone();
             crate::core::shared::lock(&ACTIVE).insert(session_id.to_string(), Active::Apple { session: SendWrap(session), token });
@@ -156,6 +158,8 @@ pub async fn stop(
     config: &crate::core::config::Config,
     store: &crate::auth::credential::AuthStore,
     session_id: &str,
+    mrm: &crate::llm::mrm::ModelResourceManager,
+    usage_reporter: &crate::agent::agent_loop::UsageReporter,
 ) -> Result<Option<String>, String> {
     // 先取槽再 match：guard 临时量若写在 scrutinee 里会活过 arm 内的 await（非 Send）
     let slot = crate::core::shared::lock(&ACTIVE).remove(session_id);
@@ -163,13 +167,20 @@ pub async fn stop(
         None => Ok(None),
         Some(Active::Apple { session, .. }) => {
             let (local, wav) = session.0.stop();
+            let wav = match wav {
+                Ok(wav) => wav,
+                Err(error) => return Err(apple_fallback_error(error, local.as_deref())),
+            };
             // 云转写终稿：fallback 链里第一个有 key 的 provider（含 audio 自定义）
             if let Some(path) = wav {
                 let cloud = match first_ready_cloud(config, store) {
                     Some(engine) => {
-                        let r = provider::transcribe_file(config, store, &engine, &path).await.ok();
+                        let result = provider::transcribe_file(config, store, &engine, &path, mrm, usage_reporter).await;
                         let _ = std::fs::remove_file(&path);
-                        r
+                        match result {
+                            Ok(text) => Some(text),
+                            Err(error) => return Err(apple_fallback_error(error, local.as_deref())),
+                        }
                     }
                     None => {
                         let _ = std::fs::remove_file(&path);
@@ -182,12 +193,19 @@ pub async fn stop(
         }
         Some(Active::Record { session, provider }) => {
             let (path, _dur) = session.0.stop()?;
-            let text = provider::transcribe_file(config, store, &provider, &path).await;
+            let text = provider::transcribe_file(config, store, &provider, &path, mrm, usage_reporter).await;
             let _ = std::fs::remove_file(&path);
             text.map(Some)
         }
         #[cfg(test)]
         Some(Active::Dummy(_)) => Ok(None),
+    }
+}
+
+fn apple_fallback_error(error: String, local: Option<&str>) -> String {
+    match local {
+        Some(local) if !local.is_empty() => format!("Apple cloud fallback failed: {error}\nLocal transcript preserved: {local}"),
+        _ => format!("Apple cloud fallback failed: {error}"),
     }
 }
 
@@ -199,19 +217,21 @@ pub fn drop_session(session_id: &str) {
     }
 }
 
-/// 云终稿引擎选择：fallback 链优先，其次 openai/xai/自定义 audio 里第一个有 key 的。
+/// Apple 本地终稿只有显式 fallback 才允许上传。存在任意 Provider 凭证本身
+/// 不构成外发授权，避免本地模式静默改变隐私边界。
 fn first_ready_cloud(config: &crate::core::config::Config, store: &crate::auth::credential::AuthStore) -> Option<String> {
-    let mut candidates: Vec<String> = config.voice.fallback.clone();
-    candidates.extend(["openai", "xai"].map(String::from));
-    candidates.extend(
-        config.custom_providers.iter().filter(|(_, d)| d.capabilities.iter().any(|c| c == "audio")).map(|(n, _)| format!("custom:{n}")),
-    );
-    candidates.into_iter().find(|id| provider::configured(store, id))
+    config.voice.fallback.iter().find(|id| provider::configured(store, id)).cloned()
+}
+
+fn cloud_capture_enabled(config: &crate::core::config::VoiceConfig, store: &crate::auth::credential::AuthStore) -> bool {
+    config.fallback.iter().any(|candidate| provider::configured(store, candidate))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn dummy_config() -> crate::core::config::VoiceConfig {
         crate::core::config::VoiceConfig { engine: "dummy".into(), ..Default::default() }
@@ -224,8 +244,17 @@ mod tests {
         }
     }
 
+    fn reporter() -> crate::agent::agent_loop::UsageReporter {
+        crate::agent::agent_loop::UsageReporter::new_unscoped(
+            "system_voice_test",
+            std::sync::Arc::default(),
+            crate::core::event::EventBus::default(),
+        )
+    }
+
     #[tokio::test]
     async fn session_slots_are_independent() {
+        let _test = TEST_LOCK.lock().await;
         let store = crate::auth::credential::AuthStore::new();
         let bus = crate::core::event::EventBus::default();
         start(&dummy_config(), &store, "zh-CN", bus.clone(), "slot-a").expect("start a");
@@ -236,18 +265,20 @@ mod tests {
         assert_ne!(before, dummy_slot("slot-a"), "同 session 重复 start 应替换旧槽");
         assert!(dummy_slot("slot-b").is_some(), "别的 session 槽位不得受影响");
         // stop 只 remove 自己槽
-        let text = stop(&crate::core::config::Config::default(), &store, "slot-a").await.expect("stop a");
+        let mrm = crate::llm::mrm::ModelResourceManager::new(Default::default());
+        let text = stop(&crate::core::config::Config::default(), &store, "slot-a", &mrm, &reporter()).await.expect("stop a");
         assert_eq!(text, None);
         assert!(dummy_slot("slot-a").is_none());
         assert!(dummy_slot("slot-b").is_some(), "stop 别的 session 不得受影响");
         // 未知 session 无操作
-        let text = stop(&crate::core::config::Config::default(), &store, "slot-unknown").await.expect("stop unknown");
+        let text = stop(&crate::core::config::Config::default(), &store, "slot-unknown", &mrm, &reporter()).await.expect("stop unknown");
         assert_eq!(text, None);
         crate::core::shared::lock(&ACTIVE).clear();
     }
 
-    #[test]
-    fn drop_session_reclaims_active_slot() {
+    #[tokio::test]
+    async fn drop_session_reclaims_active_slot() {
+        let _test = TEST_LOCK.lock().await;
         let store = crate::auth::credential::AuthStore::new();
         start(&dummy_config(), &store, "zh-CN", crate::core::event::EventBus::default(), "voice-delete").unwrap();
         assert!(dummy_slot("voice-delete").is_some());
@@ -255,8 +286,9 @@ mod tests {
         assert!(dummy_slot("voice-delete").is_none());
     }
 
-    #[test]
-    fn event_payload_carries_session_id() {
+    #[tokio::test]
+    async fn event_payload_carries_session_id() {
+        let _test = TEST_LOCK.lock().await;
         let p = event_payload(apple::SessionEvent::Partial("你好".into()), "s1").unwrap();
         assert_eq!(p["kind"], "voice.partial");
         assert_eq!(p["session_id"], "s1");
@@ -267,5 +299,18 @@ mod tests {
         assert!(p.get("session_id").is_none());
         // Final 不出帧（终稿经 voice.stop RPC 返回）
         assert!(event_payload(apple::SessionEvent::Final("完".into()), "s1").is_none());
+    }
+
+    #[test]
+    fn apple_cloud_upgrade_requires_explicit_fallback() {
+        let mut store = crate::auth::credential::AuthStore::new();
+        store.insert("voice:openai".into(), crate::auth::credential::CredentialKind::Api { key: "configured".into(), region: None });
+        let mut config = crate::core::config::Config::default();
+        config.voice.engine = "apple".into();
+        assert_eq!(first_ready_cloud(&config, &store), None, "凭证存在不能隐式授权本地录音外发");
+        assert!(!cloud_capture_enabled(&config.voice, &store), "纯本地模式不应缓冲云上传用 PCM");
+        config.voice.fallback = vec!["xai".into(), "openai".into()];
+        assert_eq!(first_ready_cloud(&config, &store).as_deref(), Some("openai"));
+        assert!(cloud_capture_enabled(&config.voice, &store));
     }
 }

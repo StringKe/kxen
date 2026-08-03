@@ -195,17 +195,20 @@ async fn request_approval_keeps_session_id_when_present() {
 fn list_pending_returns_snapshot_and_clears_on_consume() {
     let broker = ApprovalBroker::new();
     let (id, _rx) = broker.register("s1", "rm -rf x", "危险命令");
-    let (_id2, _rx2) = broker.register("", "workspace-cmd", "信任门");
-    let list = broker.list_pending();
-    assert_eq!(list.len(), 2);
-    let first = list.iter().find(|a| a.id == id).expect("按 id 找回快照");
+    let (global_id, _rx2) = broker.register("", "workspace-cmd", "信任门");
+    let list = broker.list_pending(Some("s1"));
+    assert_eq!(list.len(), 1);
+    let first = list.iter().find(|a| a.id == id).expect("按 id 找回会话快照");
     assert_eq!(first.command, "rm -rf x");
     assert_eq!(first.reason, "危险命令");
     assert_eq!(first.session_id, "s1");
+    let global = broker.list_pending(None);
+    assert_eq!(global.len(), 1, "省略 session filter 只恢复全局审批，不能复制 Session 卡片");
+    assert_eq!(global[0].id, global_id);
+    assert_eq!(global[0].session_id, "");
     assert!(broker.respond(&id, true));
-    let rest = broker.list_pending();
-    assert_eq!(rest.len(), 1, "应答后不再是 pending");
-    assert_eq!(rest[0].session_id, "", "空归属审批照常入快照（过滤在 RPC 层做）");
+    assert!(broker.list_pending(Some("s1")).is_empty(), "应答后不再是 pending");
+    assert_eq!(broker.list_pending(None).len(), 1, "会话应答不影响全局审批");
 }
 
 // ---------------- 决定落盘（Part::Approval） ----------------

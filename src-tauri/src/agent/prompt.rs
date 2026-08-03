@@ -13,6 +13,17 @@ pub use super::prompt_text::CODING_RULES;
 /// openai-compat 原样发送（服务端自动前缀缓存，稳定前缀即命中）。
 pub const CACHE_BOUNDARY: &str = "<!-- kxen:context-boundary -->";
 
+pub(crate) struct SystemPromptContext<'a> {
+    pub workdir: &'a std::path::Path,
+    pub involved: &'a [std::path::PathBuf],
+    pub session_id: Option<&'a str>,
+    pub coding_rules: bool,
+    pub mrm: Option<&'a crate::llm::mrm::ModelResourceManager>,
+    pub bound_goal_id: Option<&'a str>,
+    pub goal_binding_frozen: bool,
+    pub embedding_runtime: Option<&'a crate::knowledge::embedding::EmbeddingRuntime>,
+}
+
 /// Full system prompt for a turn. `workdir` is rendered into the environment line.
 /// `involved` = 本会话涉及文件（OKF globs 动态激活与多层就近的输入）。
 /// `session_id` = goal 按 session 粒度注入（多会话并发各见各的 goal）。
@@ -25,6 +36,22 @@ pub async fn system_prompt(
     coding_rules: bool,
     mrm: Option<&crate::llm::mrm::ModelResourceManager>,
 ) -> String {
+    system_prompt_with_embedding(SystemPromptContext {
+        workdir,
+        involved,
+        session_id,
+        coding_rules,
+        mrm,
+        bound_goal_id: None,
+        goal_binding_frozen: false,
+        embedding_runtime: None,
+    })
+    .await
+}
+
+pub(crate) async fn system_prompt_with_embedding(context: SystemPromptContext<'_>) -> String {
+    let SystemPromptContext { workdir, involved, session_id, coding_rules, mrm, bound_goal_id, goal_binding_frozen, embedding_runtime } =
+        context;
     // frozen 段：跨轮逐字节稳定（workdir 会话内不变），provider 前缀缓存的命中区
     let mut out = String::with_capacity(2048);
     out.push_str(IDENTITY);
@@ -50,10 +77,10 @@ pub async fn system_prompt(
     out.push_str("\n\n");
     out.push_str(CACHE_BOUNDARY);
     // dynamic 段：knowledge 随涉及文件变、goal usage 逐轮变，全部压在边界之后
-    if let Some(block) = crate::knowledge::render(workdir, involved) {
+    if let Some(block) = crate::knowledge::render_with_runtime(workdir, involved, embedding_runtime) {
         out.push_str(&block);
     }
-    if let Some(block) = goal_block(session_id) {
+    if let Some(block) = goal_block(session_id, bound_goal_id, goal_binding_frozen) {
         out.push_str("\n\n");
         out.push_str(&block);
     }
@@ -63,6 +90,17 @@ pub async fn system_prompt(
         out.push_str(&mrm_block(mrm).await);
     }
     out
+}
+
+pub(crate) fn embedding_runtime(ctx: &crate::agent::agent_loop::AgentContext) -> Option<crate::knowledge::embedding::EmbeddingRuntime> {
+    Some(crate::knowledge::embedding::EmbeddingRuntime {
+        mrm: ctx.mrm.clone()?,
+        cancel: ctx.cancel.clone(),
+        goal_id: ctx.bound_goal_id.clone(),
+        bus: ctx.bus.clone(),
+        session_id: ctx.session_id.clone(),
+        usage_reporter: ctx.usage_reporter.clone(),
+    })
 }
 
 /// Subagent prompt: lean identity + role brief + the same tool policy (no write-goal playbook).
@@ -76,8 +114,9 @@ pub fn subagent_prompt(role: &str, role_brief: &str, coding_rules: bool) -> Stri
 }
 
 /// Active goal injection: renders the focus goal so the model always sees the contract it is driving.
-fn goal_block(session_id: Option<&str>) -> Option<String> {
-    let goal = Goal::focus_for(&crate::core::paths::goals_dir(), session_id)?;
+fn goal_block(session_id: Option<&str>, bound_goal_id: Option<&str>, binding_frozen: bool) -> Option<String> {
+    let goals_dir = crate::core::paths::goals_dir();
+    let goal = if binding_frozen { Goal::load(&goals_dir, bound_goal_id?).ok()? } else { Goal::focus_for(&goals_dir, session_id)? };
     let mut out = String::with_capacity(512);
     let _ = write!(
         out,

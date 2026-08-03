@@ -25,14 +25,15 @@ pub struct Endpoint {
     pub key: Option<String>,
     pub model: String,
     pub protocol: Protocol,
-    /// ollama 只监听 loopback，走 net_guard 的显式例外（端点来自用户 config，非页面诱导）
+    /// 明确的 localhost/loopback endpoint 走 net_guard 例外（来源是已验证的用户 config）。
     pub allow_loopback: bool,
 }
 
 /// 端点解析（纯函数，可测）：缺省 provider 或未知 provider -> None（= 功能关闭）。
-/// openai/openrouter 的自定义 base_url 不给 loopback 例外：本地 OpenAI 兼容服务请用 ollama 档。
+/// 自定义 base_url 已在 Config load 阶段限制为远程 HTTPS 或显式 loopback HTTP。
 pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option<Endpoint> {
     let custom_base = cfg.base_url.trim().trim_end_matches('/');
+    let custom_loopback = !custom_base.is_empty() && crate::core::config::endpoint_is_explicit_loopback(custom_base);
     match cfg.provider.as_str() {
         "" => None,
         "openai" => {
@@ -40,11 +41,11 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
             Some(Endpoint {
                 provider: "openai",
                 account: crate::auth::credential::effective_account_name(store, "openai", None),
-                url: format!("{base}/embeddings"),
+                url: crate::core::net_security::join_base_endpoint(base, "embeddings").ok()?,
                 key: Some(api_key_of(store, "openai")?),
                 model: model_or(cfg, "text-embedding-3-small"),
                 protocol: Protocol::OpenAi,
-                allow_loopback: false,
+                allow_loopback: custom_loopback,
             })
         }
         "openrouter" => {
@@ -52,12 +53,12 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
             Some(Endpoint {
                 provider: "openrouter",
                 account: crate::auth::credential::effective_account_name(store, "openrouter", None),
-                url: format!("{base}/embeddings"),
+                url: crate::core::net_security::join_base_endpoint(base, "embeddings").ok()?,
                 key: Some(api_key_of(store, "openrouter")?),
                 // OpenRouter 的模型 id 带 provider 前缀
                 model: model_or(cfg, "openai/text-embedding-3-small"),
                 protocol: Protocol::OpenAi,
-                allow_loopback: false,
+                allow_loopback: custom_loopback,
             })
         }
         "ollama" => {
@@ -65,11 +66,11 @@ pub fn resolve_endpoint_with(cfg: &EmbeddingConfig, store: &AuthStore) -> Option
             Some(Endpoint {
                 provider: "ollama",
                 account: None,
-                url: format!("{base}/api/embed"),
+                url: crate::core::net_security::join_base_endpoint(base, "api/embed").ok()?,
                 key: None,
                 model: model_or(cfg, "nomic-embed-text"),
                 protocol: Protocol::Ollama,
-                allow_loopback: true,
+                allow_loopback: custom_base.is_empty() || custom_loopback,
             })
         }
         // 配置写错 provider 名按关闭处理：检索不能因配置笔误挂掉

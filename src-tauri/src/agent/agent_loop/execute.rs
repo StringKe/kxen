@@ -1,16 +1,13 @@
 //! 工具执行入口与路由（goal 工具单独在 goal_tool.rs，task 工具在 task_tool.rs）。
-
-use crate::tools::exec::{ExecOutcome, ExecParams, exec};
-use crate::tools::fs_tool::{EditSpec, delete_resolved, edit_resolved, read_resolved, write_resolved};
-use serde_json::{Value, json};
-use std::sync::Arc;
-
 use super::context::AgentContext;
 use super::goal_tool::execute_goal_tool;
 use super::helpers::{parse_shell, resolve_authorized_path, resolve_path};
 use super::knowledge_tool::execute_knowledge_tool;
 use super::task_tool::execute_task_tool;
-
+use crate::tools::exec::{ExecOutcome, ExecParams, exec};
+use crate::tools::fs_tool::{EditSpec, delete_resolved, edit_resolved, read_resolved, write_resolved};
+use serde_json::{Value, json};
+use std::sync::Arc;
 /// Ask 档审批通道（broker+bus 齐备才为 Some；hooks 与 exec 共用）。
 fn approval_ctx<'a>(ctx: &'a AgentContext) -> Option<crate::tools::exec::ApprovalCtx<'a>> {
     crate::tools::exec::ApprovalCtx::new(ctx.approvals.as_deref(), ctx.bus.as_ref(), ctx.cancel.as_ref(), ctx.session_id.as_deref())
@@ -18,10 +15,10 @@ fn approval_ctx<'a>(ctx: &'a AgentContext) -> Option<crate::tools::exec::Approva
 
 pub async fn execute_tool(name: &str, arguments: &str, ctx: &AgentContext) -> Result<String, String> {
     // 执行侧白名单复验：run.rs 只在展示侧过滤工具单，伪造的 tool_call 名可直接抵达这里
-    if !super::helpers::tool_permitted(name, ctx.allowed_tools, super::helpers::is_read_only_tool(name, ctx)) {
+    if !super::helpers::tool_permitted(name, ctx.allowed_tools) {
         return Err(format!("tool not allowed in this role: {name}"));
     }
-    let args: Value = serde_json::from_str(arguments).unwrap_or_else(|_| json!({}));
+    let args = super::helpers::parse_tool_arguments(name, arguments)?;
     let cwd = ctx.workdir.to_string_lossy().to_string();
 
     // hooks：pre_tool_use 任一失败即阻断；post_tool_use 仅记录（Ask 档 hook 命令走审批）。
@@ -141,13 +138,15 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                 let cron = args.get("cron").and_then(Value::as_str).ok_or("missing cron")?;
                 let prompt = args.get("prompt").and_then(Value::as_str).ok_or("missing prompt")?;
                 let once = args.get("once").and_then(Value::as_bool).unwrap_or(false);
-                let session_id = ctx.session_id.clone().unwrap_or_else(|| "default".into());
-                let job = crate::core::schedule::add(cron, prompt, &session_id, once)?;
+                let session_id = ctx.session_id.as_deref().ok_or("schedule mutation requires a durable session")?;
+                let _lifecycle = crate::core::session_lifecycle::admit_mutation(&crate::core::paths::sessions_dir(), session_id)?;
+                let job = crate::core::schedule::add(cron, prompt, session_id, once)?;
                 Ok(format!("scheduled {} (next fire at {})", job.id, job.next_fire))
             }
             "list" => serde_json::to_string_pretty(&crate::core::schedule::list()?).map_err(|error| error.to_string()),
             "remove" => {
                 let id = args.get("id").and_then(Value::as_str).ok_or("missing id")?;
+                let _lifecycle = crate::core::session_lifecycle::admit_schedule_mutation(id)?;
                 Ok(if crate::core::schedule::remove(id)? { format!("removed {id}") } else { format!("not found: {id}") })
             }
             other => Err(format!("unknown schedule action: {other}")),
@@ -165,6 +164,7 @@ pub async fn dispatch_tool<'a>(name: &'a str, args: &'a Value, cwd: &'a str, ctx
                         store: &ctx.store,
                         cancel: ctx.cancel.as_ref(),
                         auxiliary_usage: &ctx.auxiliary_usage,
+                        usage_reporter: ctx.usage_reporter.as_ref(),
                     })
                 }
                 _ => None,

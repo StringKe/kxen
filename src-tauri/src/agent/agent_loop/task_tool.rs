@@ -10,6 +10,8 @@ use super::helpers::{parse_shell, resolve_path};
 pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<String, String> {
     let action = args.get("action").and_then(Value::as_str).ok_or("missing action")?;
     let cwd = ctx.workdir.to_string_lossy().to_string();
+    let session_id = ctx.session_id.as_deref().ok_or("task operation requires a session context")?;
+    let owner = crate::tools::task::TaskOwner::new(session_id, &ctx.workdir)?;
     match action {
         "start" => {
             let params = DevServerParams {
@@ -30,12 +32,12 @@ pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<Strin
                 ctx.session_id.as_deref(),
             );
             crate::tools::exec::safety_gate(&params.command, &params.workdir, appr.as_ref()).await.map_err(|e| e.to_string())?;
-            dev_server(params, &ctx.registry)
+            dev_server(params, &ctx.registry, &owner)
                 .await
                 .map(|s| {
                     // dev server 崩溃感知：进程自己退出时通知主 loop（主动 kill/restart 不通知）
                     if let Some(router) = ctx.notify.clone() {
-                        crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &s.task_id, router);
+                        crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &owner, &s.task_id, router);
                     }
                     format!("ready: {} (task {})", s.url.unwrap_or_else(|| "(no url)".into()), s.task_id)
                 })
@@ -44,21 +46,21 @@ pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<Strin
         "output" => {
             let id = args.get("task_id").and_then(Value::as_str).ok_or("missing task_id")?;
             ctx.registry
-                .output(id)
+                .output(&owner, id)
                 .map(|(output, truncated, status)| format!("status: {status:?}{}\n{output}", if truncated { " (truncated)" } else { "" }))
                 .ok_or_else(|| format!("task not found: {id}"))
         }
         "kill" => {
             let id = args.get("task_id").and_then(Value::as_str).ok_or("missing task_id")?;
-            Ok(if ctx.registry.kill(id).await { format!("killed {id}") } else { format!("task not found: {id}") })
+            Ok(if ctx.registry.kill(&owner, id).await { format!("killed {id}") } else { format!("task not found: {id}") })
         }
         "list" => {
-            let list = ctx.registry.list();
+            let list = ctx.registry.list(&owner);
             Ok(if list.is_empty() { "no tasks".into() } else { serde_json::to_string_pretty(&list).unwrap_or_default() })
         }
         "restart" => {
             let id = args.get("task_id").and_then(Value::as_str).ok_or("missing task_id")?;
-            let task = ctx.registry.get(id).ok_or_else(|| format!("task not found: {id}"))?;
+            let task = ctx.registry.get(&owner, id).ok_or_else(|| format!("task not found: {id}"))?;
             let command = task.command.to_string();
             let workdir = resolve_path(&task.workdir, ctx)?.to_string_lossy().into_owned();
             let appr = crate::tools::exec::ApprovalCtx::new(
@@ -68,12 +70,12 @@ pub async fn execute_task_tool(args: &Value, ctx: &AgentContext) -> Result<Strin
                 ctx.session_id.as_deref(),
             );
             crate::tools::exec::safety_gate(&command, &workdir, appr.as_ref()).await.map_err(|e| e.to_string())?;
-            restart_task(id, &ctx.registry)
+            restart_task(id, &owner, &ctx.registry)
                 .await
                 .map(|id| {
                     // 新进程重新挂崩溃通知（旧进程被 kill 标记，旧 watcher 不会误报）
                     if let Some(router) = ctx.notify.clone() {
-                        crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &id, router);
+                        crate::agent::background::notify_on_task_exit(ctx.registry.clone(), &owner, &id, router);
                     }
                     format!("restarted {id}")
                 })

@@ -251,6 +251,10 @@ fn endpoint_openai_openrouter_ollama() {
     let ep = embedding::resolve_endpoint_with(&custom, &AuthStore::new()).unwrap();
     assert_eq!(ep.url, "http://127.0.0.1:9999/api/embed", "尾斜杠归一");
     assert_eq!(ep.model, "mxbai");
+
+    let local_openai = EmbeddingConfig { provider: "openai".into(), model: String::new(), base_url: "http://[::1]:8080/v1".into() };
+    let ep = embedding::resolve_endpoint_with(&local_openai, &store_with_key("openai")).unwrap();
+    assert!(ep.allow_loopback, "显式 loopback OpenAI 兼容 endpoint 必须走受限例外");
 }
 
 // ---------- embedding：请求构造与响应解析（纯函数） ----------
@@ -291,22 +295,23 @@ fn cache_roundtrip_and_hash_key() {
     assert_eq!(h.len(), 64, "sha256 hex");
     assert_eq!(h, embedding::content_hash("hello"), "同文同键");
     assert_ne!(h, embedding::content_hash("hellp"), "异文异键");
-    let mut c = EmbeddingCache::load(&path);
+    let mut c = EmbeddingCache::load(&path).unwrap();
     assert!(c.get(&h).is_none());
     c.insert(h.clone(), vec![1.0, 2.0]);
     c.save().unwrap();
-    let mut c2 = EmbeddingCache::load(&path);
+    let mut c2 = EmbeddingCache::load(&path).unwrap();
     assert_eq!(c2.get(&h).unwrap(), &vec![1.0f32, 2.0]);
-    // 坏文件按空缓存起步（缓存永远可重建）
+    // 坏文件拒绝加载且保持原文，不能在下一次预热时被静默覆盖。
     std::fs::write(&path, "{{{bad json").unwrap();
-    assert_eq!(EmbeddingCache::load(&path).len(), 0);
+    assert!(EmbeddingCache::load(&path).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{{{bad json");
     std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }
 
 #[test]
 fn cache_lru_evicts_oldest_when_full() {
     let path = cache_fixture("lru");
-    let mut c = EmbeddingCache::load(&path);
+    let mut c = EmbeddingCache::load(&path).unwrap();
     c.insert("oldest".into(), vec![0.0]);
     std::thread::sleep(std::time::Duration::from_millis(5)); // 保证 last_used 严格更旧
     for i in 0..CACHE_MAX {

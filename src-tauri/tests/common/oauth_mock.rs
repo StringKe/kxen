@@ -93,11 +93,19 @@ fn route(st: &Arc<Mutex<State>>, port: u16, request_line: &str, headers: &str, b
             };
             let id = v.get("id").cloned().unwrap_or(Value::Null);
             let result = match v.get("method").and_then(|m| m.as_str()).unwrap_or("") {
-                "initialize" => json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "mock", "version": "0.1" }
-                }),
+                "initialize" => {
+                    if v.pointer("/params/protocolVersion").and_then(Value::as_str) != Some("2025-03-26") {
+                        return http_response("400 Bad Request", "{}");
+                    }
+                    if v.pointer("/params/capabilities/roots").is_some() {
+                        return http_response("400 Bad Request", "{}");
+                    }
+                    json!({
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "mock", "version": "0.1" }
+                    })
+                }
                 "tools/list" => json!({ "tools": [ {
                     "name": "echo", "description": "echo",
                     "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } } }

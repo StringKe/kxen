@@ -1,12 +1,13 @@
 // workflow 引擎集成测试。
 // 覆盖：纯 JS 能力、meta 捕获三态、parallel 容错/限流/顺序、agent 双签名、phase 索引匹配与容错、完成信封。
-// 不触网：dispatch 在空凭证下仍 resolve（子 loop 把 LLM 错误吞成返回文本，mrm 对未绑定 role 也有兜底），
+// 不触网：stream_override 返回固定成功流，真实覆盖每次 child request 的 MRM admission，
 // 唯一确定性失败源是派发预算封顶（32）——失败统计与信封 failures 段用它验证。
 
 use kxen_app::agent::subagent::SubagentDeps;
 use kxen_app::agent::workflow::{PhaseMsg, run_script};
 use kxen_app::core::config::{Config, Limits, ProviderLimit, RoleBinding};
 use kxen_app::llm::mrm::ModelResourceManager;
+use kxen_app::llm::{Delta, StreamFn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +45,13 @@ fn test_deps() -> SubagentDeps {
         approvals: None,
         mcp: None,
         lsp: None,
+        stream_override: Some(success_stream()),
+        usage_reporter: None,
     }
+}
+
+fn success_stream() -> StreamFn {
+    Arc::new(|_, _, _, _| Box::pin(futures::stream::iter(vec![Delta::Text("ok".into()), Delta::Done])))
 }
 
 async fn run(script: &str) -> Result<String, String> {
@@ -228,7 +235,7 @@ async fn parallel_respects_concurrency_limit() {
 #[tokio::test]
 async fn agent_dual_signature_prompt_opts() {
     // 第二参数是对象 => 第一参数当 prompt、role 取 opts.agentType（判别错的实现会把 prompt 当 role 派发失败）。
-    // execution 已绑定：空凭证下子 loop 仍 resolve（LLM 错误吞成返回文本），故成功即证明判别正确
+    // execution 已绑定且 fake stream 成功，故成功即证明双签名判别与派发正确。
     let script = "const ok = await agent('do the thing', { agentType: 'execution', label: 'A' });\nconst dflt = await agent('y', {});\nreturn JSON.stringify([typeof ok === 'string', typeof dflt === 'string'])";
     let out = run_ok(script).await;
     assert!(out.starts_with("[true,true]"), "{out}");

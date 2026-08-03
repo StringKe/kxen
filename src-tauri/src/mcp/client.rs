@@ -1,4 +1,5 @@
-//! MCP client：initialize 握手 + tools/list + tools/call + resources/prompts 清单（协议版本 2024-11-05）。
+//! MCP client：initialize 握手 + 分页目录 + tools/call + resources/prompts 协议桥。
+//! stdio / legacy SSE 使用 2024-11-05，streamable HTTP 使用 2025-03-26。
 //! 与传输解耦（Arc<dyn Transport>）：stdio / streamable http / legacy sse 走同一套协议机。
 
 use super::config::{RemoteKind, ServerConfig};
@@ -6,10 +7,29 @@ use super::transport::{StdioTransport, Transport};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
+#[path = "client/catalog.rs"]
+mod catalog;
+#[path = "client/render.rs"]
+mod render;
+
+use render::{resource_result as render_resource_result, tool_result as render_tool_result};
+
+pub(crate) const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+pub(crate) const STREAMABLE_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// 伪工具 read_resource 描述里的资源清单上限：描述太长会白吃每轮 context。
-const RESOURCE_LIST_CAP: usize = 20;
+const TRANSPORT_FAILURE: &str = "MCP_TRANSPORT_FAILURE";
+
+fn mark_transport_failure(error: String) -> String {
+    if super::oauth::is_auth_required(&error) || error.starts_with("MCP OAuth refresh degraded:") {
+        error
+    } else {
+        format!("{TRANSPORT_FAILURE}: {error}")
+    }
+}
+
+pub(crate) fn transport_failure_detail(error: &str) -> Option<&str> {
+    error.strip_prefix(TRANSPORT_FAILURE)?.strip_prefix(": ")
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpTool {
@@ -17,7 +37,7 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub schema: Value,
-    /// annotations.readOnlyHint；缺省 false = 视为写工具（restricted 角色过滤宁严勿宽）
+    /// annotations.readOnlyHint，仅作展示元数据；权限与并行执行不得信任远端自报值。
     pub read_only: bool,
 }
 
@@ -32,20 +52,97 @@ pub struct ResourceInfo {
 pub struct PromptInfo {
     pub name: String,
     pub description: String,
+    pub arguments: Vec<PromptArgument>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PromptArgument {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+
+#[derive(Default)]
+struct ProtocolTools {
+    read_resource: Option<String>,
+    list_resources: Option<String>,
+    get_prompt: Option<String>,
+    list_prompts: Option<String>,
 }
 
 pub struct McpClient {
     transport: Arc<dyn Transport>,
-    /// 注入了伪工具 read_resource（call 路由到 resources/read 而非 tools/call）
-    read_resource_injected: bool,
+    /// 注入的协议桥工具名；call 据此路由到 resources/prompts 方法而非 tools/call。
+    protocol_tools: ProtocolTools,
     pub tools: Vec<McpTool>,
     pub resources: Vec<ResourceInfo>,
     pub prompts: Vec<PromptInfo>,
 }
 
-/// roots capability 的值形态：[{uri, name}]（roots/list 反向请求应答用）。
-fn roots_value(roots: &[String]) -> Value {
-    Value::Array(roots.iter().map(|r| json!({ "uri": format!("file://{r}"), "name": r })).collect())
+/// connect 尚未把 transport 交给 McpClient 前若 future 被取消，异步 close 仍须执行。
+/// stdio 另有 kill_on_drop 兜底；remote close 会终止 SSE/GET reader 与 server session。
+struct ConnectTransportGuard {
+    transport: Option<Arc<dyn Transport>>,
+}
+
+impl ConnectTransportGuard {
+    fn new(transport: Arc<dyn Transport>) -> Self {
+        Self { transport: Some(transport) }
+    }
+
+    async fn close(&mut self) {
+        if let Some(transport) = self.transport.take() {
+            transport.close().await;
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.transport = None;
+    }
+}
+
+impl Drop for ConnectTransportGuard {
+    fn drop(&mut self) {
+        let Some(transport) = self.transport.take() else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        runtime.spawn(async move { transport.close().await });
+    }
+}
+
+fn proposed_protocol_version(config: &ServerConfig) -> &'static str {
+    match config {
+        ServerConfig::Remote(remote) if remote.transport == RemoteKind::Http => STREAMABLE_HTTP_PROTOCOL_VERSION,
+        ServerConfig::Stdio(_) | ServerConfig::Remote(_) => LEGACY_PROTOCOL_VERSION,
+    }
+}
+
+pub(crate) fn validate_protocol_version(init: &Value, expected: &str) -> Result<(), String> {
+    match init.pointer("/result/protocolVersion").and_then(Value::as_str) {
+        Some(version) if version == expected => Ok(()),
+        Some(version) => Err(format!("initialize returned unsupported protocolVersion {version}; expected {expected}")),
+        None => Err(format!("initialize response missing protocolVersion; expected {expected}")),
+    }
+}
+
+async fn validate_initialize_protocol(init: &Value, expected: &str, cleanup: &mut ConnectTransportGuard) -> Result<(), String> {
+    if let Err(error) = validate_protocol_version(init, expected) {
+        cleanup.close().await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 仅 local stdio 可获得 roots。URL 由 file URL 构造器生成，避免空格/#/?/Unicode 改变 URI 语义。
+fn roots_value(roots: &[String]) -> Result<Value, String> {
+    roots
+        .iter()
+        .map(|root| {
+            let uri = reqwest::Url::from_file_path(std::path::Path::new(root))
+                .map_err(|_| format!("workspace root must be an absolute file path: {root}"))?;
+            Ok(json!({ "uri": uri.as_str(), "name": root }))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
 }
 
 impl McpClient {
@@ -61,16 +158,23 @@ impl McpClient {
 
     /// spawn/建连 + initialize + initialized + tools/list + resources/prompts 清单全握手。
     async fn connect_inner(server: &str, config: &ServerConfig, roots: &[String], guard: super::remote::Guard) -> Result<Self, String> {
-        let roots = roots_value(roots);
+        super::config::validate_server_key(config.name())?;
+        if server != config.name() {
+            return Err("MCP lifecycle server key does not match its configuration".into());
+        }
+        let proposed_protocol = proposed_protocol_version(config);
+        let local_stdio = matches!(config, ServerConfig::Stdio(_));
+        let roots = if local_stdio { roots_value(roots)? } else { json!([]) };
+        let capabilities = if local_stdio { json!({ "roots": { "listChanged": false } }) } else { json!({}) };
         let transport: Arc<dyn Transport> = match config {
-            ServerConfig::Stdio(c) => StdioTransport::spawn(&c.command, &c.args, &c.env, roots)?,
+            ServerConfig::Stdio(c) => StdioTransport::spawn(&c.command, &c.args, &c.env, &c.cwd, roots)?,
             ServerConfig::Remote(c) => {
                 // config 显式配了 Authorization 就不挂 OAuth（显式配置优先，被拒只报失败）
                 let explicit_auth = c.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization"));
                 let auth = if explicit_auth {
                     None
                 } else {
-                    super::oauth_store::BearerAuth::from_store(&c.name, &super::oauth_store::store_path(), guard)
+                    super::oauth_store::BearerAuth::from_store(&c.name, &c.scope, &c.url, &super::oauth_store::store_path(), guard)?
                 };
                 match c.transport {
                     RemoteKind::Http => super::remote::StreamableHttpTransport::connect(&c.url, &c.headers, roots, guard, auth).await?,
@@ -78,51 +182,70 @@ impl McpClient {
                 }
             }
         };
+        let mut cleanup = ConnectTransportGuard::new(transport.clone());
         // 子进程启动需要时间（npx 冷启动尤其长），initialize 独立放宽到 60s
-        let init = transport
+        let init = match transport
             .request(
                 "initialize",
                 json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    // roots capability：server 可反向 roots/list 问 workspace 根
-                    "capabilities": { "roots": { "listChanged": false } },
+                    "protocolVersion": proposed_protocol,
+                    "capabilities": capabilities,
                     "clientInfo": { "name": "kxen", "version": "0.1.0" },
                 }),
                 std::time::Duration::from_secs(60),
             )
-            .await?;
+            .await
+        {
+            Ok(init) => init,
+            Err(error) => {
+                cleanup.close().await;
+                return Err(error);
+            }
+        };
         if init.get("error").is_some() {
-            transport.close().await;
+            cleanup.close().await;
             return Err(format!("initialize rejected: {}", init["error"]));
         }
-        transport.notify("notifications/initialized", json!({})).await?;
+        validate_initialize_protocol(&init, proposed_protocol, &mut cleanup).await?;
+        transport.set_protocol_version(proposed_protocol);
+        if let Err(error) = transport.notify("notifications/initialized", json!({})).await {
+            cleanup.close().await;
+            return Err(error);
+        }
         let caps = init.pointer("/result/capabilities").cloned().unwrap_or(json!({}));
 
         // 按 server 声明的 capabilities 拉清单；未声明的请求会吃 -32601，不发
         let mut tools = Vec::new();
         if caps.get("tools").is_some() {
-            match transport.request("tools/list", json!({}), REQUEST_TIMEOUT).await {
-                Ok(listed) => tools = parse_tools(server, &listed),
-                Err(e) => tracing::warn!(server, error = %e, "mcp tools/list failed"),
+            let listed = catalog::fetch_all(transport.as_ref(), "tools/list", "tools", "name").await;
+            if let Some(error) = listed.warning {
+                tracing::warn!(server, error = %error, "mcp tools/list stopped early");
             }
+            let parsed = catalog::parse_tools(server, &listed.items);
+            for diagnostic in parsed.diagnostics {
+                tracing::warn!(server, diagnostic, "invalid MCP tool catalog item");
+            }
+            tools = parsed.tools;
         }
         let mut resources = Vec::new();
         if caps.get("resources").is_some() {
-            match transport.request("resources/list", json!({}), REQUEST_TIMEOUT).await {
-                Ok(listed) => resources = parse_resources(&listed),
-                // 清单拉取失败只 warn：tools 已可用，不该整台记 down
-                Err(e) => tracing::warn!(server, error = %e, "mcp resources/list failed"),
+            let listed = catalog::fetch_all(transport.as_ref(), "resources/list", "resources", "uri").await;
+            if let Some(error) = listed.warning {
+                tracing::warn!(server, error = %error, "mcp resources/list stopped early");
             }
+            resources = catalog::parse_resources(&listed.items);
         }
         let mut prompts = Vec::new();
         if caps.get("prompts").is_some() {
-            match transport.request("prompts/list", json!({}), REQUEST_TIMEOUT).await {
-                Ok(listed) => prompts = parse_prompts(&listed),
-                Err(e) => tracing::warn!(server, error = %e, "mcp prompts/list failed"),
+            let listed = catalog::fetch_all(transport.as_ref(), "prompts/list", "prompts", "name").await;
+            if let Some(error) = listed.warning {
+                tracing::warn!(server, error = %error, "mcp prompts/list stopped early");
             }
+            prompts = catalog::parse_prompts(&listed.items);
         }
-        let read_resource_injected = inject_read_resource(server, &mut tools, &resources);
-        Ok(Self { transport, read_resource_injected, tools, resources, prompts })
+        let protocol_tools = catalog::inject_protocol_tools(server, &mut tools, &resources, &prompts);
+        cleanup.disarm();
+        Ok(Self { transport, protocol_tools, tools, resources, prompts })
     }
 
     pub fn transport_kind(&self) -> &'static str {
@@ -135,140 +258,69 @@ impl McpClient {
     }
 
     /// tools/call：result.content[] 拼文本（text 类型为主，其它类型 JSON 化）。
-    /// 伪工具 read_resource 路由到 resources/read。
+    /// 协议桥工具在本地分页或路由到 resources/read、prompts/get。
     pub async fn call(&self, tool: &str, args: &Value) -> Result<String, String> {
-        if tool == "read_resource" && self.read_resource_injected {
+        if self.protocol_tools.read_resource.as_deref() == Some(tool) {
             let uri = args.get("uri").and_then(|u| u.as_str()).ok_or("missing uri")?;
             return self.read_resource(uri).await;
         }
-        let resp = self.transport.request("tools/call", json!({ "name": tool, "arguments": args }), REQUEST_TIMEOUT).await?;
+        if self.protocol_tools.list_resources.as_deref() == Some(tool) {
+            return catalog::list_resources(&self.resources, args);
+        }
+        if self.protocol_tools.list_prompts.as_deref() == Some(tool) {
+            return catalog::list_prompts(&self.prompts, args);
+        }
+        if self.protocol_tools.get_prompt.as_deref() == Some(tool) {
+            return self.get_prompt(args).await;
+        }
+        let resp = self
+            .transport
+            .request("tools/call", json!({ "name": tool, "arguments": args }), REQUEST_TIMEOUT)
+            .await
+            .map_err(mark_transport_failure)?;
         if let Some(err) = resp.get("error") {
             return Err(format!("tools/call error: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")));
         }
-        let content = resp
-            .get("result")
-            .and_then(|r| r.get("content"))
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| match c.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => c.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string(),
-                        _ => serde_json::to_string(c).unwrap_or_default(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        Ok(if content.is_empty() { "(empty result)".into() } else { content })
+        render_tool_result(&resp)
     }
 
     /// resources/read：文本直拼；blob（base64）只占位——解码进 prompt 会炸 context。
     async fn read_resource(&self, uri: &str) -> Result<String, String> {
-        let resp = self.transport.request("resources/read", json!({ "uri": uri }), REQUEST_TIMEOUT).await?;
+        let resp =
+            self.transport.request("resources/read", json!({ "uri": uri }), REQUEST_TIMEOUT).await.map_err(mark_transport_failure)?;
         if let Some(err) = resp.get("error") {
             return Err(format!("resources/read error: {}", err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")));
         }
-        let text = resp
-            .pointer("/result/contents")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|c| {
-                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                            t.to_string()
-                        } else if c.get("blob").is_some() {
-                            "[binary resource content omitted]".to_string()
-                        } else {
-                            serde_json::to_string(c).unwrap_or_default()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        Ok(if text.is_empty() { "(empty resource)".into() } else { text })
+        render_resource_result(&resp)
     }
-}
 
-fn parse_tools(server: &str, listed: &Value) -> Vec<McpTool> {
-    listed
-        .get("result")
-        .and_then(|r| r.get("tools"))
-        .and_then(|t| t.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|t| McpTool {
-                    server: server.to_string(),
-                    name: t.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
-                    description: t.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_string(),
-                    schema: t.get("inputSchema").cloned().unwrap_or_else(|| json!({ "type": "object" })),
-                    read_only: t.pointer("/annotations/readOnlyHint").and_then(|v| v.as_bool()).unwrap_or(false),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_resources(listed: &Value) -> Vec<ResourceInfo> {
-    listed
-        .get("result")
-        .and_then(|r| r.get("resources"))
-        .and_then(|r| r.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|r| ResourceInfo {
-                    uri: r.get("uri").and_then(|u| u.as_str()).unwrap_or_default().to_string(),
-                    name: r.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
-                    description: r.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_prompts(listed: &Value) -> Vec<PromptInfo> {
-    listed
-        .get("result")
-        .and_then(|r| r.get("prompts"))
-        .and_then(|p| p.as_array())
-        .map(|arr| {
-            arr.iter()
-                .map(|p| PromptInfo {
-                    name: p.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
-                    description: p.get("description").and_then(|d| d.as_str()).unwrap_or_default().to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// 声明 resources 的 server 注入伪工具 read_resource（read_only=true），资源清单进描述。
-/// 与真工具同名时放弃注入：server 自己的实现优先，伪工具不抢名。
-fn inject_read_resource(server: &str, tools: &mut Vec<McpTool>, resources: &[ResourceInfo]) -> bool {
-    if resources.is_empty() || tools.iter().any(|t| t.name == "read_resource") {
-        return false;
-    }
-    let mut desc = String::from("Read an MCP resource by uri. Available resources:\n");
-    for r in resources.iter().take(RESOURCE_LIST_CAP) {
-        desc.push_str(&format!("- {}", r.uri));
-        if !r.name.is_empty() {
-            desc.push_str(&format!(" ({})", r.name));
+    /// prompts/get：按 prompts/list 保留的 arguments schema 做本地必填和类型校验。
+    async fn get_prompt(&self, args: &Value) -> Result<String, String> {
+        let name = args.get("name").and_then(Value::as_str).ok_or("missing prompt name")?;
+        let prompt = self.prompts.iter().find(|prompt| prompt.name == name).ok_or_else(|| format!("unknown prompt: {name}"))?;
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+        let object = arguments.as_object().ok_or("prompt arguments must be an object")?;
+        for argument in &prompt.arguments {
+            if argument.required && !object.contains_key(&argument.name) {
+                return Err(format!("prompt argument '{}' is required", argument.name));
+            }
         }
-        if !r.description.is_empty() {
-            desc.push_str(&format!(": {}", r.description));
+        if let Some((key, _)) = object.iter().find(|(_, value)| !value.is_string()) {
+            return Err(format!("prompt argument '{key}' must be a string"));
         }
-        desc.push('\n');
+        let resp = self
+            .transport
+            .request("prompts/get", json!({ "name": name, "arguments": arguments }), REQUEST_TIMEOUT)
+            .await
+            .map_err(mark_transport_failure)?;
+        if let Some(err) = resp.get("error") {
+            return Err(format!("prompts/get error: {}", err.get("message").and_then(Value::as_str).unwrap_or("unknown")));
+        }
+        let result = resp.get("result").ok_or("prompts/get response missing result")?;
+        serde_json::to_string(result).map_err(|error| format!("serialize prompts/get result: {error}"))
     }
-    tools.push(McpTool {
-        server: server.to_string(),
-        name: "read_resource".to_string(),
-        description: desc,
-        schema: json!({
-            "type": "object",
-            "properties": { "uri": { "type": "string" } },
-            "required": ["uri"]
-        }),
-        read_only: true,
-    });
-    true
 }
+
+#[cfg(test)]
+#[path = "client/tests.rs"]
+mod tests;

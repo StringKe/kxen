@@ -3,7 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-
+mod custom_provider;
+pub use custom_provider::{CustomProviderDef, validate_custom_provider_auth, validate_custom_provider_endpoint};
+pub(crate) use custom_provider::{custom_provider_def_checked, endpoint_is_explicit_loopback, validate_custom_provider_definition};
+#[path = "config/document.rs"]
+mod document;
+mod load;
+pub use document::{merge_voice_engine, validate_user_document};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -24,7 +30,6 @@ pub struct Config {
     /// 涉及外发内容或扩大宿主机能力面的实验功能，全部缺省关闭。
     pub experimental: ExperimentalConfig,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExperimentalConfig {
@@ -58,25 +63,8 @@ pub struct EmbeddingConfig {
     pub provider: String,
     /// 模型覆盖：缺省 openai/openrouter = text-embedding-3-small，ollama = nomic-embed-text
     pub model: String,
-    /// base URL 覆盖（ollama 非默认端口、自建 OpenAI 兼容网关）；缺省按 provider 给官方端点
+    /// base URL 覆盖；远程必须 HTTPS，HTTP 仅允许 localhost/loopback；缺省使用 Provider 官方端点。
     pub base_url: String,
-}
-
-/// 自定义类型提供商：base_url + 模型清单 + 协议（openai|anthropic）+ 能力标记（text/vision/audio）。
-/// api key 存 auth.json（custom:<name>）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CustomProviderDef {
-    pub base_url: String,
-    pub models: Vec<String>,
-    pub protocol: String,
-    pub capabilities: Vec<String>,
-}
-
-impl Default for CustomProviderDef {
-    fn default() -> Self {
-        Self { base_url: String::new(), models: vec![], protocol: "openai".into(), capabilities: vec!["text".into()] }
-    }
 }
 
 /// 语音输入：引擎选择 + 降级链 + locale（API key 不落 config，走 auth.json）。
@@ -146,7 +134,8 @@ impl Default for StatuslineConfig {
 #[serde(default)]
 pub struct Limits {
     pub global_concurrent: u32,
-    /// 全部模型调用的每日 token 硬上限；None = 不限制。
+    /// 已结算 chat/completion usage 的每日 admission 阈值；达到后拒绝后续请求。
+    /// 单次、并发在途请求或 Provider 未报告 usage 时可能越过该值。
     pub daily_token_budget: Option<u64>,
     pub providers: HashMap<String, ProviderLimit>,
 }
@@ -162,9 +151,10 @@ impl Default for Limits {
 pub struct ProviderLimit {
     pub concurrent: Option<u32>,
     pub rpm: Option<u32>,
-    /// 用户提供的真实计价口径；订阅或未知价格留空，不做虚假金额估算。
+    /// 用户提供的 Provider-level blended 计价口径；订阅或未知价格留空，不做虚假金额估算。
     pub input_usd_per_million: Option<f64>,
     pub output_usd_per_million: Option<f64>,
+    /// 基于已结算 chat/completion usage 估算的 admission 阈值，不是账单硬上限。
     pub daily_cost_budget_usd: Option<f64>,
     /// 连续失败熔断；0 = 关闭，None 使用默认值 3。
     pub circuit_failure_threshold: Option<u32>,
@@ -173,21 +163,64 @@ pub struct ProviderLimit {
 }
 
 impl Config {
-    pub fn load(user: &Path, project: Option<&Path>) -> crate::core::Result<Self> {
-        let mut config = Config::default();
-        for path in [Some(user.to_path_buf()), project.map(|p| p.to_path_buf())].into_iter().flatten() {
-            if !path.exists() {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)?;
-            let parsed: Config = toml::from_str(&text)?;
-            config.merge(parsed);
+    fn validate(&self, source: &str) -> crate::core::Result<()> {
+        if !self.send_when_running.is_empty() && !matches!(self.send_when_running.as_str(), "queue" | "interrupt") {
+            return Err(crate::core::Error::Custom(format!("config validate {source}: send_when_running must be queue or interrupt")));
         }
-        config.seed_default_roles();
-        Ok(config)
+        for (role, binding) in &self.roles {
+            crate::auth::credential::validate_identity(role, "role")
+                .and_then(|_| crate::auth::credential::validate_identity(&binding.provider, "provider"))
+                .and_then(|_| crate::auth::credential::validate_identity(&binding.model, "model"))
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: roles.{role} {error}")))?;
+            if let Some(fallback) = binding.fallback.as_deref() {
+                crate::auth::credential::validate_identity(fallback, "fallback role")
+                    .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: roles.{role}.fallback {error}")))?;
+                if !self.roles.contains_key(fallback) {
+                    return Err(crate::core::Error::Custom(format!(
+                        "config validate {source}: roles.{role}.fallback references unknown role {fallback}"
+                    )));
+                }
+            }
+            if let Some(account) = binding.account.as_deref() {
+                crate::auth::credential::validate_named_account(account)
+                    .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: roles.{role}.account {error}")))?;
+            }
+        }
+        for (provider, limit) in &self.limits.providers {
+            crate::auth::credential::validate_identity(provider, "provider")
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: limits.providers.{provider} {error}")))?;
+            for (field, value) in [
+                ("input_usd_per_million", limit.input_usd_per_million),
+                ("output_usd_per_million", limit.output_usd_per_million),
+                ("daily_cost_budget_usd", limit.daily_cost_budget_usd),
+            ] {
+                if value.is_some_and(|number| !number.is_finite() || number < 0.0) {
+                    return Err(crate::core::Error::Custom(format!(
+                        "config validate {source}: limits.providers.{provider}.{field} must be finite and non-negative"
+                    )));
+                }
+            }
+        }
+        let embedding_base_url = self.embedding.base_url.trim();
+        if !embedding_base_url.is_empty() {
+            validate_custom_provider_endpoint(embedding_base_url)
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: embedding.base_url {error}")))?;
+        }
+        let searxng_url = self.search.searxng_url.trim();
+        if !searxng_url.is_empty() {
+            validate_custom_provider_endpoint(searxng_url)
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: search.searxng_url {error}")))?;
+        }
+        for (name, def) in &self.custom_providers {
+            crate::auth::credential::validate_custom_name(name)
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: custom_providers.{name} {error}")))?;
+            validate_custom_provider_definition(def)
+                .map_err(|error| crate::core::Error::Custom(format!("config validate {source}: custom_providers.{name}.{error}")))?;
+        }
+        Ok(())
     }
 
-    /// 六角色默认绑定：只补缺位（用户 config 逐项覆盖）。面向四订阅持有者择型：
+    /// 六角色默认绑定：只补缺位（用户 config 逐项覆盖）。
     /// 思考/评审走 claude（评审需独立产出质量），主会话/执行走 grok-build（命令调度快），
     /// 研究走 grok-4.5（长上下文检索），规划走 kimi-for-coding 的 k3（1M 上下文推理型；
     /// provider key 必须对齐订阅探测导入键，否则探测到的凭证不会被该角色命中）。
@@ -211,44 +244,78 @@ impl Config {
             self.roles.entry(role.to_string()).or_insert(b);
         }
     }
+}
 
-    fn merge(&mut self, other: Config) {
-        self.roles.extend(other.roles);
-        if other.limits.global_concurrent != 0 {
-            self.limits.global_concurrent = other.limits.global_concurrent;
+fn validate_project_keys(document: &toml::Value, path: &Path) -> crate::core::Result<()> {
+    // Custom endpoint definitions stay user-owned. Letting a project replace the endpoint
+    // behind an existing custom:<name> would redirect the user's stored API key and prompts.
+    const ALLOWED: &[&str] = &["roles", "limits", "hooks"];
+    let table = document
+        .as_table()
+        .ok_or_else(|| crate::core::Error::Custom(format!("config validate {}: project config must be a TOML table", path.display())))?;
+    for key in table.keys() {
+        if !ALLOWED.contains(&key.as_str()) {
+            return Err(crate::core::Error::Custom(format!(
+                "config validate {}: project config key {key:?} is user-only; allowed keys are {}",
+                path.display(),
+                ALLOWED.join(", ")
+            )));
         }
-        if other.limits.daily_token_budget.is_some() {
-            self.limits.daily_token_budget = other.limits.daily_token_budget;
+    }
+    Ok(())
+}
+
+/// Presence-aware overlay：table 逐键递归合并，scalar/array 由后加载来源完整替换。
+/// 因此项目未写的键保留用户值，显式 `false`、`0`、空字符串或空数组仍能覆盖。
+fn merge_config_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(current) if key == "hooks" => merge_hook_tables(current, value),
+                    Some(current) => merge_toml(current, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
         }
-        self.limits.providers.extend(other.limits.providers);
-        for (event, defs) in other.hooks {
-            self.hooks.entry(event).or_default().extend(defs);
-        }
-        if !other.statusline.items.is_empty() {
-            self.statusline = other.statusline;
-        }
-        if other.voice != VoiceConfig::default() {
-            self.voice = other.voice;
-        }
-        self.custom_providers.extend(other.custom_providers);
-        if other.embedding != EmbeddingConfig::default() {
-            self.embedding = other.embedding;
-        }
-        if other.search != SearchConfig::default() {
-            self.search = other.search;
-        }
-        if other.coding_rules != CodingRulesConfig::default() {
-            self.coding_rules = other.coding_rules;
-        }
-        if other.experimental != ExperimentalConfig::default() {
-            self.experimental = other.experimental;
-        }
+        (base, overlay) => *base = overlay,
     }
 }
 
-/// custom provider 路由的端点定义（llm/client.rs 每次 LLM 请求都取，走 mtime 缓存）。
-pub(crate) fn custom_provider_def(name: &str) -> Option<CustomProviderDef> {
-    super::config_cache::cached_user_config()?.custom_providers.get(name).cloned()
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(current) => merge_toml(current, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+/// Hooks 的既有合同是 user -> project 按事件追加，而不是替换整个数组。
+fn merge_hook_tables(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (event, definitions) in overlay {
+                match (base.get_mut(&event), definitions) {
+                    (Some(toml::Value::Array(current)), toml::Value::Array(mut next)) => current.append(&mut next),
+                    (Some(current), next) => *current = next,
+                    (None, next) => {
+                        base.insert(event, next);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 /// 内置编码规则开关（缺省开启；config.toml [coding_rules] enabled = false 关闭）。
@@ -263,68 +330,7 @@ pub fn experimental_config() -> ExperimentalConfig {
     super::config_cache::cached_user_config().map(|c| c.experimental).unwrap_or_default()
 }
 
-/// voice.set_engine 的局部更新：覆盖 engine/fallback（空数组 = 清空降级链，
-/// 前端两个调用点都显式传当前链）；locale 仅 Some 时覆盖；transcribe_model 等其他键保留。
-pub fn merge_voice_engine(doc: &mut toml::Table, engine: &str, fallback: &[String], locale: Option<&str>) {
-    let entry = doc.entry("voice").or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if !entry.is_table() {
-        *entry = toml::Value::Table(toml::Table::new());
-    }
-    let voice = entry.as_table_mut().expect("voice table");
-    voice.insert("engine".into(), toml::Value::String(engine.into()));
-    voice.insert("fallback".into(), toml::Value::Array(fallback.iter().map(|f| toml::Value::String(f.clone())).collect()));
-    if let Some(l) = locale {
-        voice.insert("locale".into(), toml::Value::String(l.into()));
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_role_providers_align_with_registry_and_probe() {
-        let mut config = Config::default();
-        config.seed_default_roles();
-        let expected = ["chat", "thinking", "planning", "execution", "review", "research"];
-        let probe_keys: Vec<&str> = crate::auth::probe::RULES.iter().map(|r| r.provider).collect();
-        for role in expected {
-            let b = config.roles.get(role).unwrap_or_else(|| panic!("缺角色 {role} 默认绑定"));
-            let spec = crate::providers::find(&b.provider).unwrap_or_else(|| panic!("角色 {role} provider {} 不在注册表", b.provider));
-            assert!(probe_keys.contains(&b.provider.as_str()), "角色 {role} provider {} 不在探测 key 集合", b.provider);
-            // 无 /models 端点的 provider 只能靠静态种子，绑错模型名会在路由期静默 404
-            if !spec.models_endpoint {
-                assert!(spec.static_models.iter().any(|m| m.id == b.model), "角色 {role} 模型 {} 不在 {} 静态模型集", b.model, b.provider);
-            }
-        }
-        // planning 必须绑 kimi-for-coding：探测导入的凭证键是 kimi-for-coding，绑 "kimi"（API key provider）会失配
-        assert_eq!(config.roles["planning"].provider, "kimi-for-coding");
-    }
-
-    #[test]
-    fn merge_voice_engine_keeps_other_voice_keys() {
-        let mut doc: toml::Table =
-            toml::from_str("[voice]\nengine = \"apple\"\nfallback = [\"openai\"]\nlocale = \"en-US\"\ntranscribe_model = \"whisper-1\"\n")
-                .expect("fixture toml");
-        merge_voice_engine(&mut doc, "openai", &["xai".to_string()], None);
-        let voice = doc["voice"].as_table().expect("voice table");
-        assert_eq!(voice["engine"].as_str(), Some("openai"));
-        assert_eq!(voice["fallback"].as_array().map(Vec::len), Some(1));
-        assert_eq!(voice["locale"].as_str(), Some("en-US"), "locale 不传不得丢");
-        assert_eq!(voice["transcribe_model"].as_str(), Some("whisper-1"), "transcribe_model 不得丢");
-
-        // locale 传入即覆盖
-        merge_voice_engine(&mut doc, "apple", &["xai".to_string()], Some("zh-CN"));
-        assert_eq!(doc["voice"]["locale"].as_str(), Some("zh-CN"));
-
-        // 空 fallback = 显式清空降级链（前端总是显式传当前链）
-        merge_voice_engine(&mut doc, "apple", &[], None);
-        let voice = doc["voice"].as_table().expect("voice table");
-        assert_eq!(voice["fallback"].as_array().map(Vec::len), Some(0), "空数组必须清链");
-
-        // 无 [voice] 表时新建
-        let mut empty = toml::Table::new();
-        merge_voice_engine(&mut empty, "apple", &[], None);
-        assert_eq!(empty["voice"]["engine"].as_str(), Some("apple"));
-    }
-}
+mod search_tests;
+#[cfg(test)]
+mod tests;

@@ -20,8 +20,8 @@ fn store_file() -> PathBuf {
     crate::core::paths::data_dir().join("notifications.json")
 }
 
-/// 启动恢复：文件缺失/损坏一律空缓冲（通知非关键数据，不值得为排障阻塞启动）
-pub fn load() -> VecDeque<Notice> {
+/// 启动恢复：缺失 = 空；损坏或不可读必须显式失败，避免下一条通知覆盖诊断证据。
+pub fn load() -> Result<VecDeque<Notice>, String> {
     load_from(&store_file())
 }
 
@@ -31,26 +31,58 @@ pub fn push(buf: &mut VecDeque<Notice>, at: u64, text: String, session_id: Optio
     buf.truncate(CAP);
 }
 
-/// 原子写（tmp + rename）：崩溃窗口最多丢一轮通知，不留半截 JSON
-pub fn persist(buf: &VecDeque<Notice>) {
-    persist_to(&store_file(), buf);
+/// 事务调用点使用：持久化失败必须由上层补偿，不能把内存变更误报为已提交。
+pub fn persist_checked(buf: &VecDeque<Notice>) -> Result<(), String> {
+    persist_to(&store_file(), buf)
 }
 
-fn load_from(path: &Path) -> VecDeque<Notice> {
-    let Ok(text) = std::fs::read_to_string(path) else { return VecDeque::new() };
-    let Ok(notes) = serde_json::from_str::<Vec<Notice>>(&text) else { return VecDeque::new() };
+fn load_from(path: &Path) -> Result<VecDeque<Notice>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let notes = serde_json::from_str::<Vec<Notice>>(&text).map_err(|error| format!("parse {}: {error}", path.display()))?;
     let mut buf: VecDeque<Notice> = notes.into_iter().collect();
     buf.truncate(CAP);
-    buf
+    Ok(buf)
 }
 
-fn persist_to(path: &Path, buf: &VecDeque<Notice>) {
+fn persist_to(path: &Path, buf: &VecDeque<Notice>) -> Result<(), String> {
     let notes: Vec<Notice> = buf.iter().cloned().collect();
-    let Ok(json) = serde_json::to_string_pretty(&notes) else { return };
+    let json = serde_json::to_string_pretty(&notes).map_err(|error| error.to_string())?;
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+    file.write_all(json.as_bytes()).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+    file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let cleanup = match std::fs::remove_file(&tmp) {
+            Ok(()) => None,
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => None,
+            Err(cleanup) => Some(cleanup),
+        };
+        return Err(cleanup.map_or_else(
+            || format!("replace {}: {error}", path.display()),
+            |cleanup| format!("replace {}: {error}; temp cleanup failed: {cleanup}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -69,8 +101,8 @@ mod tests {
             push(&mut buf, i, format!("n{i}"), (i % 2 == 0).then(|| format!("s{i}")));
         }
         assert_eq!(buf.len(), CAP, "内存侧 cap 必须生效");
-        persist_to(&path, &buf);
-        let loaded = load_from(&path);
+        persist_to(&path, &buf).unwrap();
+        let loaded = load_from(&path).unwrap();
         assert_eq!(loaded.len(), CAP);
         let head = loaded.front().unwrap();
         assert_eq!(head.text, "n59", "最新一条在头部");
@@ -80,11 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_or_missing_file_yields_empty() {
+    fn corrupt_file_is_rejected_and_missing_is_empty() {
         let path = tmp("bad");
-        assert!(load_from(&path).is_empty(), "缺失文件 = 空缓冲");
+        assert!(load_from(&path).unwrap().is_empty(), "缺失文件 = 空缓冲");
         std::fs::write(&path, "not json").unwrap();
-        assert!(load_from(&path).is_empty(), "损坏文件 = 空缓冲，不许 panic");
+        assert!(load_from(&path).is_err(), "损坏文件必须阻止后续覆盖");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::session::{Part, Role, load_messages, load_meta, now_ms};
+use crate::core::session::{Part, Role, load_messages_checked, load_meta, now_ms};
 
 /// 导出 markdown：user/assistant 正文 + 工具调用摘要（reasoning 略）。
 pub fn export_markdown(dir: &Path, id: &str) -> std::io::Result<String> {
     let session = load_meta(dir, id)?;
-    let messages = load_messages(dir, id);
+    let messages = load_messages_checked(dir, id)?;
     let mut out = format!("# {}\n\n- session: {}\n- directory: {}\n\n", session.title, session.id, session.directory);
     for m in &messages {
         let role = match m.role {
@@ -33,7 +33,7 @@ pub fn export_markdown(dir: &Path, id: &str) -> std::io::Result<String> {
                 Part::Approval { command, decision, .. } => {
                     body.push_str(&format!("\n> 审批 {decision}: {command}\n"));
                 }
-                Part::Reasoning { .. } | Part::Context { .. } => {}
+                Part::Reasoning { .. } | Part::Context { .. } | Part::ContextSources { .. } => {}
             }
         }
         if !body.trim().is_empty() {

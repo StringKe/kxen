@@ -13,25 +13,38 @@ pub struct Workspace {
 }
 
 /// 持久化最近 workspace 列表（data_dir/workspaces.json）。
-pub fn list(dir: &Path) -> Vec<Workspace> {
-    let Ok(text) = std::fs::read_to_string(file(dir)) else {
-        return Vec::new();
+pub fn list(dir: &Path) -> std::io::Result<Vec<Workspace>> {
+    let path = file(dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
-    let mut list: Vec<Workspace> = serde_json::from_str(&text).unwrap_or_default();
+    let mut list: Vec<Workspace> =
+        serde_json::from_str(&text).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     list.sort_by_key(|w| std::cmp::Reverse(w.last_used));
-    list
+    Ok(list)
 }
 
 /// 记录一次使用（置顶 + 更新时间戳）。
 pub fn touch(dir: &Path, path: &str) -> std::io::Result<()> {
-    let mut all = list(dir);
+    use std::io::Write;
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = crate::core::shared::lock(&WRITE_LOCK);
+    let mut all = list(dir)?;
     all.retain(|w| w.path != path);
     all.insert(0, Workspace { path: path.into(), last_used: now_ms() });
     all.truncate(20);
     std::fs::create_dir_all(dir)?;
     let tmp = file(dir).with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&all)?)?;
-    std::fs::rename(&tmp, file(dir))
+    let mut output = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+    output.write_all(serde_json::to_string_pretty(&all)?.as_bytes())?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(&tmp, file(dir))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn file(dir: &Path) -> PathBuf {
@@ -164,9 +177,20 @@ mod tests {
         touch(&dir, "/a").unwrap();
         touch(&dir, "/b").unwrap();
         touch(&dir, "/a").unwrap();
-        let all = list(&dir);
+        let all = list(&dir).unwrap();
         assert_eq!(all[0].path, "/a");
         assert_eq!(all.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_recent_list_blocks_touch_without_overwrite() {
+        let dir = std::env::temp_dir().join(format!("kxen-ws-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(file(&dir), "{not json").unwrap();
+        assert!(list(&dir).is_err());
+        assert!(touch(&dir, "/new").is_err());
+        assert_eq!(std::fs::read_to_string(file(&dir)).unwrap(), "{not json");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -178,6 +202,7 @@ mod tests {
             parent_id: None,
             created_at: 0,
             updated_at: updated,
+            message_revision: 0,
             pinned: false,
             sort_order: None,
             model: None,
@@ -199,6 +224,8 @@ mod tests {
             activated_at: None,
             turns_used: 0,
             tokens_used: 0,
+            unmetered_calls: 0,
+            acknowledged_unmetered_calls: 0,
             last_block_reason: None,
             consecutive_blocks: 0,
             block_reason: None,
@@ -206,6 +233,8 @@ mod tests {
             session_id: sid.map(String::from),
             paused_ms: 0,
             paused_at: None,
+            metering_receipts: Vec::new(),
+            completion_attempt: None,
         }
     }
 
@@ -219,6 +248,7 @@ mod tests {
             next_fire: 0,
             enabled: true,
             history: std::collections::VecDeque::new(),
+            dispatch_id: None,
         }
     }
 

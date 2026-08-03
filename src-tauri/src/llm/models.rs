@@ -14,14 +14,23 @@ fn bearer_of(store: &AuthStore, provider: &str, account: Option<&str>) -> Option
 }
 
 /// GET {base}/models（openai 形态）或 {base}/v1/models（anthropic 形态），解析 data[].id。
-pub async fn fetch_models(store: &AuthStore, provider: &str, account: Option<&str>, timeout_s: u64) -> ModelsOutcome {
+pub async fn fetch_models(
+    mrm: &crate::llm::mrm::ModelResourceManager,
+    store: &AuthStore,
+    provider: &str,
+    account: Option<&str>,
+    timeout_s: u64,
+) -> ModelsOutcome {
     let (url, api_key_header) = if let Some(name) = provider.strip_prefix("custom:") {
-        let cfg = crate::core::config::Config::load(&crate::core::paths::config_dir().join("config.toml"), None).unwrap_or_default();
-        let Some(def) = cfg.custom_providers.get(name) else {
+        let Some(def) = mrm.custom_provider(name) else {
             return ModelsOutcome { models: vec![], source: "error".into(), detail: format!("custom provider not configured: {name}") };
         };
-        let root = def.base_url.trim_end_matches('/');
-        if def.protocol == "anthropic" { (format!("{root}/v1/models"), true) } else { (format!("{root}/models"), false) }
+        let suffix = if def.protocol == "anthropic" { "v1/models" } else { "models" };
+        let url = match crate::core::net_security::join_base_endpoint(&def.base_url, suffix) {
+            Ok(url) => url,
+            Err(error) => return ModelsOutcome { models: vec![], source: "error".into(), detail: error },
+        };
+        (url, def.protocol == "anthropic")
     } else {
         let Some(spec) = crate::providers::find(provider) else {
             return ModelsOutcome {
@@ -46,7 +55,7 @@ pub async fn fetch_models(store: &AuthStore, provider: &str, account: Option<&st
     if !local_free && bearer.is_none() {
         return ModelsOutcome { models: vec![], source: "error".into(), detail: "无凭证".into() };
     }
-    let mut req = crate::llm::client::shared_http().get(&url).timeout(std::time::Duration::from_secs(timeout_s));
+    let mut req = crate::llm::client::shared_http_for_url(&url).get(&url).timeout(std::time::Duration::from_secs(timeout_s));
     req = match (api_key_header, &bearer) {
         (true, Some(b)) => req.header("x-api-key", b).header("anthropic-version", "2023-06-01"),
         (false, Some(b)) => req.bearer_auth(b),
@@ -54,7 +63,8 @@ pub async fn fetch_models(store: &AuthStore, provider: &str, account: Option<&st
     };
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            let body: serde_json::Value = match resp.json().await {
+            let body: serde_json::Value = match crate::net_response::json(resp, crate::net_response::JSON_BODY_LIMIT, "model catalog").await
+            {
                 Ok(v) => v,
                 Err(e) => return ModelsOutcome { models: vec![], source: "error".into(), detail: format!("响应解析失败: {e}") },
             };
@@ -69,12 +79,16 @@ pub async fn fetch_models(store: &AuthStore, provider: &str, account: Option<&st
                 ModelsOutcome { models, source: "endpoint".into(), detail: String::new() }
             }
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            ModelsOutcome { models: vec![], source: "error".into(), detail: crate::llm::client::format_http_error(provider, status, &body) }
-        }
-        Err(e) => ModelsOutcome { models: vec![], source: "error".into(), detail: format!("请求失败: {e}") },
+        Ok(resp) => ModelsOutcome {
+            models: vec![],
+            source: "error".into(),
+            detail: crate::llm::client::bounded_http_error(provider, resp, bearer.as_deref().as_slice()).await,
+        },
+        Err(error) => ModelsOutcome {
+            models: vec![],
+            source: "error".into(),
+            detail: format!("请求失败: {}", crate::core::net_security::sanitize_authenticated_error(&error, bearer.as_deref().as_slice(),)),
+        },
     }
 }
 
@@ -116,5 +130,31 @@ mod tests {
             .map(|arr| arr.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect::<Vec<_>>())
             .unwrap_or_default();
         assert_eq!(models, vec!["m1", "m2"]);
+    }
+
+    #[tokio::test]
+    async fn custom_models_use_the_supplied_workspace_mrm_definition() {
+        let base = mock_server(r#"{"data":[{"id":"workspace-model"}]}"#);
+        let mut config = crate::core::config::Config::default();
+        config.custom_providers.insert(
+            "workspace_models_test".into(),
+            crate::core::config::CustomProviderDef {
+                base_url: base,
+                protocol: "openai".into(),
+                models: vec!["configured-model".into()],
+                capabilities: vec!["text".into()],
+            },
+        );
+        let mrm = crate::llm::mrm::ModelResourceManager::new(config);
+        let mut store = AuthStore::new();
+        store.insert(
+            "custom:workspace_models_test".into(),
+            crate::auth::credential::CredentialKind::Api { key: "workspace-key".into(), region: None },
+        );
+
+        let outcome = fetch_models(&mrm, &store, "custom:workspace_models_test", None, 2).await;
+
+        assert_eq!(outcome.source, "endpoint");
+        assert_eq!(outcome.models, vec!["workspace-model"]);
     }
 }

@@ -1,14 +1,20 @@
 //! mrm（全局模型资源管理）：角色路由 + per-provider 并发总池 + 账号 RPM 滑窗 + 降级链。
 //! 一切 LLM 调用与 subagent 派发经 acquire/release（RAII guard 自然释放）。
 
-use crate::core::config::{Config, RoleBinding};
+use crate::core::config::Config;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
+mod route;
+mod rpm;
 mod state;
 
+use rpm::RpmReservation;
+
+const GLOBAL_POOL_KEY: &str = "global";
+
 pub struct ModelResourceManager {
-    config: Config,
+    config: Arc<std::sync::RwLock<Config>>,
+    circuit_scope: Arc<str>,
     /// 可变运行状态（槽位/RPM/历史/熔断）：热换重建经 reconfigured 沿用同一句柄
     state: Arc<state::Shared>,
 }
@@ -26,12 +32,46 @@ pub struct DispatchRecord {
 pub struct Slot {
     _permit_global: state::PoolPermit,
     _permit_provider: state::PoolPermit,
+    _circuit_probe: Option<CircuitLease>,
 }
 
-/// acquire_role 的产出：解析证据与并发槽绑定（Drop 即释放槽位，杜绝解析到占槽之间的超发窗口）。
-pub struct Grant {
-    pub resolved: Resolved,
-    _slot: Slot,
+pub struct CallPermit {
+    slot: Slot,
+    rpm: RpmReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    Success,
+    Failure,
+    /// The request started but the user or Goal cancelled observation. This
+    /// neither heals nor poisons Provider health.
+    Neutral,
+}
+
+impl CallPermit {
+    /// 与 raw stream 创建保持无 await 相邻：到这里才把真实 Provider 请求计入 RPM。
+    pub fn start(mut self) -> Slot {
+        self.rpm.commit();
+        self.slot
+    }
+}
+
+struct CircuitLease {
+    state: Arc<state::Shared>,
+    lease: crate::llm::mrm_health::AdmissionLease,
+}
+
+impl Drop for CircuitLease {
+    fn drop(&mut self) {
+        self.state.health.release_probe(&self.lease);
+    }
+}
+
+impl Slot {
+    fn circuit_lease(&self) -> Option<&crate::llm::mrm_health::AdmissionLease> {
+        self._circuit_probe.as_ref().map(|probe| &probe.lease)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,283 +92,159 @@ impl Resolved {
 
 impl ModelResourceManager {
     pub fn new(config: Config) -> Self {
-        Self { config, state: Arc::new(state::Shared::default()) }
+        Self {
+            config: Arc::new(std::sync::RwLock::new(config)),
+            circuit_scope: Arc::from("process"),
+            state: Arc::new(state::Shared::default()),
+        }
     }
 
     /// 热换重建：配置按新值生效，运行状态沿用同一句柄。
-    /// 在飞 Grant 的槽位仍计入并发上限，熔断计数与 RPM 滑窗不复位。
+    /// 在飞 request 的槽位仍计入并发上限，熔断计数与 RPM 滑窗不复位。
     pub fn reconfigured(&self, config: Config) -> Self {
-        Self { config, state: Arc::clone(&self.state) }
+        *crate::core::shared::write(&self.config) = config;
+        self.activate();
+        Self { config: Arc::clone(&self.config), circuit_scope: Arc::clone(&self.circuit_scope), state: Arc::clone(&self.state) }
     }
 
-    pub fn role(&self, role: &str) -> Option<&RoleBinding> {
-        self.config.roles.get(role)
+    /// Workspace 视图使用独立配置。Circuit 按稳定 Workspace scope 和 custom
+    /// endpoint 隔离；并发计数、RPM 与路由历史仍共享同一进程状态。
+    pub fn scoped(&self, scope: impl Into<Arc<str>>, config: Config) -> Self {
+        let circuit_scope = scope.into();
+        let next = Self { config: Arc::new(std::sync::RwLock::new(config)), circuit_scope, state: Arc::clone(&self.state) };
+        next.activate();
+        next
     }
 
-    /// 角色 -> 可执行 provider/model/account（只查不占；占槽走 acquire_role/acquire）。
-    pub async fn resolve(&self, role: &str, store: &crate::auth::credential::AuthStore) -> Option<Resolved> {
-        self.resolve_inner(role, store, true).await
-    }
-
-    /// resolve 的只查不记变体：主会话默认模型在每轮 run 与状态栏轮询都解析，
-    /// 记历史会把轮询刷成派发证据（mrm.stats 失真），轮询路径必须走这里。
-    pub async fn peek(&self, role: &str, store: &crate::auth::credential::AuthStore) -> Option<Resolved> {
-        self.resolve_inner(role, store, false).await
-    }
-
-    async fn resolve_inner(&self, role: &str, store: &crate::auth::credential::AuthStore, record: bool) -> Option<Resolved> {
-        let chain = self.role_chain(role);
-        let mut first = true;
-        for r in chain {
-            let binding = self.config.roles.get(&r)?;
-            let degraded_from = if first { None } else { Some(role.to_string()) };
-            for (key, account) in self.candidates(binding, store) {
-                if self.candidate_open(&binding.provider, &key).await {
-                    let resolved = Resolved { provider: binding.provider.clone(), model: binding.model.clone(), account, degraded_from };
-                    if record {
-                        self.record(role, &resolved).await;
-                    }
-                    return Some(resolved);
-                }
-            }
-            first = false;
-        }
-        None
-    }
-
-    /// 原子 resolve+acquire：候选序列与 resolve 同序，先查 RPM 窗（只查不记账），
-    /// 再 try 占 provider 槽，选定即占槽并记 RPM。全部候选占满返回 None。
-    pub async fn acquire_role(&self, role: &str, store: &crate::auth::credential::AuthStore) -> Option<Grant> {
-        let chain = self.role_chain(role);
-        let mut first = true;
-        for r in chain {
-            let binding = self.config.roles.get(&r)?;
-            let degraded_from = if first { None } else { Some(role.to_string()) };
-            for (key, account) in self.candidates(binding, store) {
-                if self.rpm_blocked(&key).await {
-                    continue;
-                }
-                if let Some(slot) = self.try_slot(&binding.provider).await {
-                    let resolved = Resolved { provider: binding.provider.clone(), model: binding.model.clone(), account, degraded_from };
-                    self.note_rpm(&key).await;
-                    self.record(role, &resolved).await;
-                    return Some(Grant { resolved, _slot: slot });
-                }
-            }
-            first = false;
-        }
-        None
-    }
-
-    async fn record(&self, role: &str, resolved: &Resolved) {
-        let mut history = self.state.history.lock().await;
-        history.push_back(DispatchRecord {
-            role: role.to_string(),
-            provider: resolved.provider.clone(),
-            model: resolved.model.clone(),
-            account: resolved.account.clone(),
-            degraded_from: resolved.degraded_from.clone(),
-            at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
-        });
-        if history.len() > 50 {
-            history.pop_front();
+    /// 两阶段 runtime 更新的无副作用 candidate。只替换配置视图，资源计数和
+    /// Circuit 存储继续共享；调用 activate 前不会唤醒 waiter 或归一化 Circuit。
+    pub(crate) fn candidate(&self, config: Config) -> Self {
+        Self {
+            config: Arc::new(std::sync::RwLock::new(config)),
+            circuit_scope: Arc::clone(&self.circuit_scope),
+            state: Arc::clone(&self.state),
         }
     }
 
-    /// 同 provider 换账号（与 resolve 同一可用性判断；run.rs 重试换账号专用）。
-    /// 与 resolve 不同：不记录派发历史、不走角色链，只在同 provider 账号池内找下一个可用的。
-    pub async fn rotate_account(
-        &self,
-        provider: &str,
-        store: &crate::auth::credential::AuthStore,
-        current: Option<&str>,
-    ) -> Option<String> {
-        let effective = current.unwrap_or("default");
-        for key in crate::auth::credential::accounts_of(store, provider) {
-            let name = key.strip_prefix(&format!("{provider}:")).map(String::from).unwrap_or_else(|| "default".into());
-            if name != effective && self.candidate_open(provider, &key).await {
-                return Some(name);
-            }
-        }
-        None
+    pub(crate) fn activate(&self) {
+        self.state.health.reconfigure(&self.circuit_scope, &self.config_snapshot());
+        self.state.pools.wake_waiters();
+        self.state.rpm_notify.notify_waiters();
     }
 
-    /// 派发历史（新->旧）。
-    pub async fn history(&self) -> Vec<DispatchRecord> {
-        self.state.history.lock().await.iter().rev().cloned().collect()
+    pub fn custom_provider(&self, name: &str) -> Option<crate::core::config::CustomProviderDef> {
+        self.config_snapshot().custom_providers.get(name).cloned()
     }
 
-    fn role_chain(&self, role: &str) -> Vec<String> {
-        // 未绑定角色（如 observer）回落 execution，避免 teammate spawn 因角色未配置直接失败
-        if !self.config.roles.contains_key(role) && self.config.roles.contains_key("execution") {
-            return vec!["execution".to_string()];
-        }
-        // config 化兜底链：binding.fallback 单跳（链式递归取），缺省走静态链
-        let mut chain = vec![role.to_string()];
-        let mut cursor = role.to_string();
-        let mut hops = 0;
-        while hops < 3 {
-            let Some(next) = self.config.roles.get(&cursor).and_then(|b| b.fallback.clone()) else { break };
-            if chain.contains(&next) {
-                break;
-            }
-            chain.push(next.clone());
-            cursor = next;
-            hops += 1;
-        }
-        if chain.len() > 1 {
-            return chain;
-        }
-        // 静态兜底（无 config fallback 时）
-        let fallback: &[&str] = match role {
-            "thinking" => &["planning", "research"],
-            "planning" => &["thinking", "research"],
-            "review" => &["thinking", "research"],
-            _ => &[],
-        };
-        for f in fallback {
-            if self.config.roles.contains_key(*f) {
-                chain.push((*f).to_string());
-            }
-        }
-        chain
-    }
-
-    /// 候选序列（resolve/acquire_role 共用同序）：钉账号单候选（缺凭证则无候选，走链下一环）；
-    /// 否则账号链（默认 -> 命名字典序），无账号线索时退回默认键（限流不看凭证在否）。
-    fn candidates(&self, binding: &RoleBinding, store: &crate::auth::credential::AuthStore) -> Vec<(String, Option<String>)> {
-        if let Some(acc) = &binding.account {
-            let key = crate::auth::credential::account_id(&binding.provider, acc);
-            return if store.contains_key(&key) { vec![(key, Some(acc.clone()))] } else { Vec::new() };
-        }
-        let keys = crate::auth::credential::accounts_of(store, &binding.provider);
-        if keys.is_empty() {
-            // 持有其它 provider 凭证时跳过无凭证 provider：降级链才能走到用户真实持有的订阅；
-            // store 全空（首启探测前/测试）退回盲默认键
-            if !store.is_empty() {
-                return Vec::new();
-            }
-            return vec![(binding.provider.clone(), None)];
-        }
-        keys.into_iter()
-            .map(|key| {
-                let account = key.strip_prefix(&format!("{}:", binding.provider)).map(String::from);
-                (key, account)
-            })
-            .collect()
-    }
-
-    /// 候选可用性：provider 并发有余量 + 该账号 RPM 窗未满（账号维度限流只剩 RPM）。
-    async fn candidate_open(&self, provider: &str, key: &str) -> bool {
-        self.state.health.admit(provider, &self.config).await.is_ok() && self.available(provider).await && !self.rpm_blocked(key).await
+    fn config_snapshot(&self) -> Config {
+        crate::core::shared::read(&self.config).clone()
     }
 
     /// 主会话显式模型在占槽前也必须经过预算和熔断，不得绕过角色路由的 admission。
     pub async fn admit(&self, provider: &str) -> Result<(), String> {
-        self.state.health.admit(provider, &self.config).await
+        self.state.health.eligible(&self.circuit_scope, provider, &self.config_snapshot())
     }
 
     pub async fn record_result(&self, provider: &str, success: bool) {
-        self.state.health.record_result(provider, success, &self.config).await;
+        self.state.health.record_result(&self.circuit_scope, provider, success, None, false, &self.config_snapshot());
+    }
+
+    pub async fn record_call_result(&self, provider: &str, slot: Option<&Slot>, success: bool) {
+        self.state.health.record_result(
+            &self.circuit_scope,
+            provider,
+            success,
+            slot.and_then(Slot::circuit_lease),
+            true,
+            &self.config_snapshot(),
+        );
+    }
+
+    pub async fn record_call_outcome(&self, provider: &str, slot: Option<&Slot>, outcome: CallOutcome) {
+        match outcome {
+            CallOutcome::Success => self.record_call_result(provider, slot, true).await,
+            CallOutcome::Failure => self.record_call_result(provider, slot, false).await,
+            CallOutcome::Neutral => {}
+        }
+    }
+
+    /// 单次 chat/completion 请求的统一起点。排队前后各做一次 admission，
+    /// 防止等待期间刚结算的 usage 或新打开的 circuit 被当前请求越过。
+    pub async fn begin_call(&self, provider: &str, account: Option<&str>) -> Result<CallPermit, String> {
+        self.begin_call_inner(provider, account, true).await
+    }
+
+    /// 临时凭证探测仍受预算、RPM 与并发约束，但不读取或修改已保存 Provider 的 circuit。
+    pub async fn begin_probe_call(&self, provider: &str, account: Option<&str>) -> Result<CallPermit, String> {
+        self.begin_call_inner(provider, account, false).await
+    }
+
+    async fn begin_call_inner(&self, provider: &str, account: Option<&str>, enforce_circuit: bool) -> Result<CallPermit, String> {
+        crate::auth::credential::validate_identity(provider, "provider")?;
+        let config = self.config_snapshot();
+        if enforce_circuit {
+            self.state.health.eligible(&self.circuit_scope, provider, &config)?;
+        } else {
+            self.state.health.budget_admit(provider, &config)?;
+        }
+        let key = crate::auth::credential::account_id(provider, account.unwrap_or("default"));
+        loop {
+            self.wait_rpm_available(&key).await;
+            let mut slot = self.acquire_slot(provider).await;
+            if let Some(rpm) = self.try_reserve_rpm(&key) {
+                let config = self.config_snapshot();
+                if enforce_circuit {
+                    if let Some(lease) = self.state.health.claim(&self.circuit_scope, provider, &config)? {
+                        slot._circuit_probe = Some(CircuitLease { state: Arc::clone(&self.state), lease });
+                    }
+                } else {
+                    self.state.health.budget_admit(provider, &config)?;
+                }
+                return Ok(CallPermit { slot, rpm });
+            }
+            drop(slot);
+        }
     }
 
     pub async fn health(&self) -> Vec<crate::llm::mrm_health::HealthReport> {
-        self.state.health.reports(&self.config).await
+        self.state.health.reports(&self.circuit_scope, &self.config_snapshot()).await
     }
 
-    /// 并发池按 provider 段归一：同 provider 多账号共享一个池（"" 为全局池，不进此归一以外的拆分）。
+    /// 并发池直接使用完整 provider id：账号从不作为池 key，`custom:name` 中的冒号属于 provider 本身。
     /// 限额实时读 config：热更换限即生效，在飞计数经共享 state 跨重建保留。
     fn slot_limit(&self, key: &str) -> usize {
-        // key 可为账号槽位键（provider:account）：取 provider 段的限额配置
-        let provider = key.split(':').next().unwrap_or(key);
-        self.config.limits.providers.get(provider).and_then(|l| l.concurrent).unwrap_or(self.config.limits.global_concurrent.max(1))
-            as usize
+        let config = self.config_snapshot();
+        config.limits.providers.get(key).and_then(|l| l.concurrent).unwrap_or(config.limits.global_concurrent.max(1)) as usize
     }
 
     pub async fn available(&self, provider: &str) -> bool {
-        self.state.pools.in_flight(provider) < self.slot_limit(provider).max(1)
+        self.state.pools.in_flight(&provider_pool_key(provider)) < self.slot_limit(provider).max(1)
     }
 
-    /// 占槽（RPM 滑窗等待 + provider 并发总池 + 全局并发池），返回 RAII guard。
-    /// account 只决定 RPM 记账键；并发槽认 provider 段，不按账号拆。
-    pub async fn acquire(&self, provider: &str, account: Option<&str>) -> Slot {
-        let key = crate::auth::credential::account_id(provider, account.unwrap_or("default"));
-        self.wait_rpm(&key).await;
-        let permit_provider = self.state.pools.acquire(provider, self.slot_limit(provider)).await;
+    /// 仅占 provider/global 并发槽。生产请求必须走 begin_call，避免绕过 RPM 和 admission。
+    pub async fn acquire_slot(&self, provider: &str) -> Slot {
+        let provider_key = provider_pool_key(provider);
+        let permit_provider = self.state.pools.acquire(&provider_key, || self.slot_limit(provider)).await;
         // 全局并发（global_concurrent 总量的独立池）
-        let permit_global = self.state.pools.acquire("", self.slot_limit("")).await;
-        Slot { _permit_global: permit_global, _permit_provider: permit_provider }
-    }
-
-    /// 非阻塞占槽：provider 池 try 成功才选定；全局池失败时 provider permit 随 drop 回吐，不留半占状态。
-    async fn try_slot(&self, provider: &str) -> Option<Slot> {
-        let permit_provider = self.state.pools.try_acquire(provider, self.slot_limit(provider))?;
-        let permit_global = self.state.pools.try_acquire("", self.slot_limit(""))?;
-        Some(Slot { _permit_global: permit_global, _permit_provider: permit_provider })
-    }
-
-    /// RPM 窗是否已满（只查不记账；key 为账号限流键）。
-    pub async fn rpm_blocked(&self, key: &str) -> bool {
-        let provider = key.split(':').next().unwrap_or(key);
-        let rpm = match self.config.limits.providers.get(provider).and_then(|l| l.rpm) {
-            Some(r) if r > 0 => r,
-            _ => return false,
-        };
-        let mut windows = self.state.rpm_windows.lock().await;
-        let window = windows.entry(key.to_string()).or_default();
-        let cutoff = Instant::now() - Duration::from_secs(60);
-        window.retain(|t| *t > cutoff);
-        (window.len() as u32) >= rpm
-    }
-
-    /// RPM 记账（acquire_role 选定候选时补记，与 wait_rpm 的记账点对齐）。
-    async fn note_rpm(&self, key: &str) {
-        let provider = key.split(':').next().unwrap_or(key);
-        if self.config.limits.providers.get(provider).and_then(|l| l.rpm).is_none_or(|r| r == 0) {
-            return;
-        }
-        let mut windows = self.state.rpm_windows.lock().await;
-        let window = windows.entry(key.to_string()).or_default();
-        let cutoff = Instant::now() - Duration::from_secs(60);
-        window.retain(|t| *t > cutoff);
-        window.push(Instant::now());
-    }
-
-    async fn wait_rpm(&self, key: &str) {
-        let provider = key.split(':').next().unwrap_or(key);
-        let rpm = match self.config.limits.providers.get(provider).and_then(|l| l.rpm) {
-            Some(r) if r > 0 => r,
-            _ => return,
-        };
-        loop {
-            let wait_ms = {
-                let mut windows = self.state.rpm_windows.lock().await;
-                let window = windows.entry(key.to_string()).or_default();
-                let cutoff = Instant::now() - Duration::from_secs(60);
-                window.retain(|t| *t > cutoff);
-                if (window.len() as u32) < rpm {
-                    window.push(Instant::now());
-                    0
-                } else {
-                    let oldest = window[0];
-                    60_000u64.saturating_sub(oldest.elapsed().as_millis() as u64)
-                }
-            };
-            if wait_ms == 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
+        let permit_global =
+            self.state.pools.acquire(GLOBAL_POOL_KEY, || self.config_snapshot().limits.global_concurrent.max(1) as usize).await;
+        Slot { _permit_global: permit_global, _permit_provider: permit_provider, _circuit_probe: None }
     }
 
     pub async fn describe(&self) -> String {
-        let mut lines = vec![format!("global limit: {}", self.config.limits.global_concurrent)];
-        for (provider, in_flight) in self.state.pools.snapshot() {
-            let limit = self.slot_limit(&provider).max(1);
+        let config = self.config_snapshot();
+        let mut lines = vec![format!("global limit: {}", config.limits.global_concurrent)];
+        for (key, in_flight) in self.state.pools.snapshot() {
+            let Some(provider) = key.strip_prefix("provider:") else { continue };
+            let limit = self.slot_limit(provider).max(1);
             lines.push(format!("{provider}: {}/{} available", limit.saturating_sub(in_flight), limit));
         }
         lines.join("\n")
     }
+}
+
+fn provider_pool_key(provider: &str) -> String {
+    format!("provider:{provider}")
 }
 
 #[cfg(test)]

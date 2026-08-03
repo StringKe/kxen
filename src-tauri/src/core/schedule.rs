@@ -4,6 +4,15 @@
 use crate::core::shared::now_ms;
 use serde::{Deserialize, Serialize};
 
+#[path = "schedule/storage.rs"]
+mod storage;
+use storage::{LoadResult, load_from, persist, store_file};
+#[path = "schedule/lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::{claim_due, due_candidates, job_session};
+#[cfg(test)]
+use storage::{fail_next_before_rename, fail_next_parent_sync, write_atomic};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
     pub id: String,
@@ -21,6 +30,9 @@ pub struct CronJob {
     /// 最近执行记录（新->旧，cap HISTORY_CAP）
     #[serde(default)]
     pub history: std::collections::VecDeque<RunRecord>,
+    /// 已持久化 claim、尚未确认写入 pending queue 的 delivery id。崩溃恢复复用同一 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,56 +51,51 @@ fn default_enabled() -> bool {
 }
 
 static JOBS: std::sync::Mutex<Vec<CronJob>> = std::sync::Mutex::new(Vec::new());
-static LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static LOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+static BLOCKED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-fn store_file() -> std::path::PathBuf {
-    crate::core::paths::data_dir().join("schedule.json")
+fn ensure_loaded() -> Result<(), String> {
+    LOADED
+        .get_or_init(|| match load_from(&store_file()) {
+            LoadResult::Jobs(jobs) => {
+                *crate::core::shared::lock(&JOBS) = jobs;
+                Ok(())
+            }
+            LoadResult::Missing => Ok(()),
+            // 损坏或不可读时保留原文件并阻止后续写入，避免以空表覆盖存量任务。
+            LoadResult::Corrupt(error) => Err(error),
+        })
+        .clone()
 }
 
-fn ensure_loaded() {
-    LOADED.get_or_init(|| match load_from(&store_file()) {
-        LoadResult::Jobs(jobs) => *crate::core::shared::lock(&JOBS) = jobs,
-        LoadResult::Missing => {}
-        // 损坏不置空内存、不覆盖旧文件（P1-7）：隔离为 .corrupt 留证，后续 persist 另起新文件
-        LoadResult::Corrupt => {
-            let path = store_file();
-            if let Err(e) = std::fs::rename(&path, path.with_extension("json.corrupt")) {
-                tracing::warn!(error = %e, "corrupt schedule.json quarantine failed");
+fn ensure_store_available() -> Result<(), String> {
+    match crate::core::shared::lock(&BLOCKED).clone() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn block_indeterminate(error: String) -> String {
+    let message = format!("schedule store is blocked because committed state durability is indeterminate: {error}");
+    *crate::core::shared::lock(&BLOCKED) = Some(message.clone());
+    tracing::error!(%message, "schedule store blocked");
+    message
+}
+
+fn commit_mutation(jobs: &mut Vec<CronJob>, original: Vec<CronJob>) -> Result<(), String> {
+    match persist(jobs) {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            let committed = failure.committed();
+            let message = failure.into_message();
+            if committed {
+                Err(block_indeterminate(message))
+            } else {
+                *jobs = original;
+                Err(message)
             }
         }
-    });
-}
-
-enum LoadResult {
-    Jobs(Vec<CronJob>),
-    Missing,
-    Corrupt,
-}
-
-fn load_from(path: &std::path::Path) -> LoadResult {
-    let Ok(text) = std::fs::read_to_string(path) else { return LoadResult::Missing };
-    match serde_json::from_str::<Vec<CronJob>>(&text) {
-        Ok(jobs) => LoadResult::Jobs(jobs),
-        Err(e) => {
-            tracing::warn!(error = %e, "schedule.json parse failed; in-memory jobs kept, file quarantined");
-            LoadResult::Corrupt
-        }
     }
-}
-
-/// 落盘：tmp+rename 原子写（同 settings/embedding_cache 口径），崩溃不留半截 JSON。
-fn persist() {
-    let jobs = crate::core::shared::lock(&JOBS).clone();
-    let text = serde_json::to_string_pretty(&jobs).unwrap_or_default();
-    if let Err(e) = write_atomic(&store_file(), &text) {
-        tracing::warn!(error = %e, "schedule.json persist failed");
-    }
-}
-
-fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// 解析 cron 并算下一次触发（本地时区）。cron crate 需秒位：5 字段标准 crontab 自动补 0 秒。
@@ -109,7 +116,7 @@ fn chrono_from_ms(ms: u64) -> chrono::DateTime<chrono::Local> {
 }
 
 pub fn add(cron: &str, prompt: &str, session_id: &str, once: bool) -> Result<CronJob, String> {
-    ensure_loaded(); // 先加载存量再 push+persist，否则重启后首次 add 覆盖全部历史
+    ensure_loaded()?; // 先加载存量再 push+persist，否则重启后首次 add 覆盖全部历史
     let next_fire = next_fire_of(cron, now_ms())?;
     let job = CronJob {
         id: crate::core::ids::new_id("cron"),
@@ -120,47 +127,54 @@ pub fn add(cron: &str, prompt: &str, session_id: &str, once: bool) -> Result<Cro
         next_fire,
         enabled: true,
         history: std::collections::VecDeque::new(),
+        dispatch_id: None,
     };
-    crate::core::shared::lock(&JOBS).push(job.clone());
-    persist();
+    let mut jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    let original = jobs.clone();
+    jobs.push(job.clone());
+    commit_mutation(&mut jobs, original)?;
     Ok(job)
 }
 
-pub fn list() -> Vec<CronJob> {
-    ensure_loaded();
-    crate::core::shared::lock(&JOBS).clone()
+pub fn list() -> Result<Vec<CronJob>, String> {
+    ensure_loaded()?;
+    let jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    Ok(jobs.clone())
 }
 
-pub fn remove(id: &str) -> bool {
-    ensure_loaded();
+pub fn remove(id: &str) -> Result<bool, String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
-    let before = jobs.len();
-    jobs.retain(|j| j.id != id);
-    let removed = jobs.len() != before;
-    drop(jobs);
-    if removed {
-        persist();
-    }
-    removed
+    ensure_store_available()?;
+    let Some(index) = jobs.iter().position(|job| job.id == id) else { return Ok(false) };
+    let original = jobs.clone();
+    jobs.remove(index);
+    commit_mutation(&mut jobs, original)?;
+    Ok(true)
 }
 
 /// 会话删除连带清理：该 session 的 job 全下掉（已删会话的 job 不许再被 tick 出列）。幂等。
-pub fn remove_by_session(session_id: &str) -> usize {
-    ensure_loaded();
+pub fn remove_by_session(session_id: &str) -> Result<usize, String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    let original = jobs.clone();
     let before = jobs.len();
     jobs.retain(|j| j.session_id != session_id);
     let removed = before - jobs.len();
-    drop(jobs);
     if removed > 0 {
-        persist();
+        commit_mutation(&mut jobs, original)?;
     }
-    removed
+    Ok(removed)
 }
 
-pub fn restore_jobs(restored: Vec<CronJob>) -> usize {
-    ensure_loaded();
+pub fn restore_jobs(restored: Vec<CronJob>) -> Result<usize, String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    let original = jobs.clone();
     let mut added = 0;
     for job in restored {
         if jobs.iter().any(|current| current.id == job.id) {
@@ -169,170 +183,138 @@ pub fn restore_jobs(restored: Vec<CronJob>) -> usize {
         jobs.push(job);
         added += 1;
     }
-    drop(jobs);
     if added > 0 {
-        persist();
+        commit_mutation(&mut jobs, original)?;
     }
-    added
+    Ok(added)
 }
 
 #[cfg(test)]
 pub fn clear() {
-    crate::core::shared::lock(&JOBS).clear();
+    let mut jobs = crate::core::shared::lock(&JOBS);
+    jobs.clear();
+    *crate::core::shared::lock(&BLOCKED) = None;
 }
 
 /// 暂停/恢复：恢复时按当前时间重算 next_fire（暂停期间的到期不追补，避免唤醒风暴）
-pub fn set_enabled(id: &str, enabled: bool) -> bool {
-    ensure_loaded();
+pub fn set_enabled(id: &str, enabled: bool) -> Result<bool, String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
-    let Some(job) = jobs.iter_mut().find(|j| j.id == id) else { return false };
+    ensure_store_available()?;
+    let Some(index) = jobs.iter().position(|job| job.id == id) else { return Ok(false) };
+    let original = jobs.clone();
+    let job = &mut jobs[index];
     job.enabled = enabled;
     if enabled {
         match next_fire_of(&job.cron, now_ms()) {
             Ok(nf) => job.next_fire = nf,
-            Err(_) => return false,
+            Err(error) => {
+                *jobs = original;
+                return Err(error);
+            }
         }
     }
-    drop(jobs);
-    persist();
-    true
+    commit_mutation(&mut jobs, original)?;
+    Ok(true)
 }
 
 /// 记录一次执行结果（新->旧，cap HISTORY_CAP；job 已删则静默丢弃）
-pub fn record(id: &str, ok: bool, error: Option<String>) {
-    ensure_loaded();
+pub fn record(id: &str, ok: bool, error: Option<String>) -> Result<(), String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
-    let Some(job) = jobs.iter_mut().find(|j| j.id == id) else { return };
+    ensure_store_available()?;
+    let Some(index) = jobs.iter().position(|job| job.id == id) else { return Ok(()) };
+    let original = jobs.clone();
+    let job = &mut jobs[index];
     job.history.push_front(RunRecord { at: now_ms(), ok, error });
     job.history.truncate(HISTORY_CAP);
-    drop(jobs);
-    persist();
+    commit_mutation(&mut jobs, original)?;
+    Ok(())
 }
 
-/// 到期任务出列（once 删除；周期任务就地重算下次；暂停 job 不出列）。
-pub fn drain_due(now: u64) -> Vec<CronJob> {
-    ensure_loaded();
+/// Claim 到期任务。这里只持久化稳定 delivery id，不删除 once、不推进 recurring；
+/// 调用方把消息写入 durable pending queue 后必须 `ack_dispatch`，失败则保留 claim 供下次重放。
+pub fn drain_due(now: u64) -> Result<Vec<CronJob>, String> {
+    ensure_loaded()?;
     let mut jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    let original = jobs.clone();
     let mut due = Vec::new();
+    let mut changed = false;
     let mut i = 0;
     while i < jobs.len() {
-        if jobs[i].enabled && jobs[i].next_fire <= now {
-            let job = jobs[i].clone();
-            due.push(job.clone());
-            if job.once {
-                jobs.remove(i);
-                continue;
+        if jobs[i].enabled && (jobs[i].next_fire <= now || jobs[i].dispatch_id.is_some()) {
+            if jobs[i].dispatch_id.is_none() {
+                jobs[i].dispatch_id = Some(crate::core::ids::new_id("queue"));
+                changed = true;
             }
-            match next_fire_of(&job.cron, now) {
-                Ok(nf) => jobs[i].next_fire = nf,
-                Err(_) => {
-                    jobs.remove(i);
-                    continue;
-                }
-            }
+            due.push(jobs[i].clone());
         }
         i += 1;
     }
-    drop(jobs);
-    if !due.is_empty() {
-        persist();
+    if changed {
+        commit_mutation(&mut jobs, original)?;
     }
-    due
+    Ok(due)
+}
+
+/// pending queue 已 durable 接收该 occurrence 后提交调度状态。
+pub fn ack_dispatch(id: &str, dispatch_id: &str, now: u64) -> Result<bool, String> {
+    ensure_loaded()?;
+    let mut jobs = crate::core::shared::lock(&JOBS);
+    ensure_store_available()?;
+    let Some(index) = jobs.iter().position(|job| job.id == id) else { return Ok(false) };
+    if jobs[index].dispatch_id.as_deref() != Some(dispatch_id) {
+        return Err(format!("schedule dispatch generation changed: {id}"));
+    }
+    let original = jobs.clone();
+    if jobs[index].once {
+        jobs.remove(index);
+    } else {
+        jobs[index].dispatch_id = None;
+        match next_fire_of(&jobs[index].cron, now) {
+            Ok(next_fire) => jobs[index].next_fire = next_fire,
+            Err(error) => {
+                jobs[index].enabled = false;
+                jobs[index].history.push_front(RunRecord {
+                    at: now_ms(),
+                    ok: false,
+                    error: Some(format!("schedule disabled after next_fire failure: {error}")),
+                });
+                jobs[index].history.truncate(HISTORY_CAP);
+            }
+        }
+    }
+    if let Err(failure) = persist(&jobs) {
+        let committed = failure.committed();
+        let message = failure.into_message();
+        if committed {
+            // pending queue 已先落盘；这里返回 Err 会触发其补偿删除，造成 schedule 已 ack 但消息丢失。
+            // 保留 ack 并封锁后续 schedule 写入，重启后由同一 delivery id 收敛不确定状态。
+            block_indeterminate(message);
+            return Ok(true);
+        }
+        *jobs = original;
+        return Err(message);
+    }
+    Ok(true)
+}
+
+/// Queue consumers must not execute a schedule-backed delivery until the matching
+/// schedule claim is durably acknowledged. A blocked store is also unsafe: the
+/// visible in-memory ack may disappear after a crash when its parent sync failed.
+pub fn ensure_delivery_admitted(id: &str, dispatch_id: &str) -> Result<(), String> {
+    crate::core::ids::validate_id(id)?;
+    crate::core::ids::validate_id(dispatch_id)?;
+    ensure_loaded()?;
+    ensure_store_available()?;
+    let jobs = crate::core::shared::lock(&JOBS);
+    if jobs.iter().any(|job| job.id == id && job.dispatch_id.as_deref() == Some(dispatch_id)) {
+        return Err(format!("schedule delivery is not durably acknowledged: {id}/{dispatch_id}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn cron_parse_and_next() {
-        let nf = next_fire_of("*/1 * * * *", 0).unwrap();
-        assert!(nf > 0);
-        assert!(next_fire_of("not a cron", 0).is_err());
-    }
-
-    #[test]
-    fn once_drains_and_removes() {
-        let _g = crate::core::shared::lock(&TEST_LOCK);
-        clear();
-        let job = add("*/1 * * * *", "ping", "s1", true).unwrap();
-        let due = drain_due(job.next_fire + 1);
-        assert!(due.iter().any(|j| j.id == job.id));
-        assert!(list().iter().all(|j| j.id != job.id), "once 应触发后删除");
-    }
-
-    #[test]
-    fn recurring_reschedules() {
-        let _g = crate::core::shared::lock(&TEST_LOCK);
-        clear();
-        let job = add("*/1 * * * *", "ping", "s2", false).unwrap();
-        let due = drain_due(job.next_fire + 1);
-        assert!(due.iter().any(|j| j.id == job.id));
-        let after = list().into_iter().find(|j| j.id == job.id).unwrap();
-        assert!(after.next_fire > job.next_fire);
-        remove(&job.id);
-    }
-
-    #[test]
-    fn disabled_job_not_drained_and_resume_recomputes() {
-        let _g = crate::core::shared::lock(&TEST_LOCK);
-        clear();
-        let job = add("*/1 * * * *", "ping", "s3", false).unwrap();
-        assert!(set_enabled(&job.id, false));
-        assert!(drain_due(job.next_fire + 1).is_empty(), "暂停 job 到期不出列");
-        assert!(set_enabled(&job.id, true));
-        let after = list().into_iter().find(|j| j.id == job.id).unwrap();
-        assert!(after.enabled);
-        assert!(after.next_fire >= now_ms(), "恢复必须重算 next_fire，不追补暂停期");
-        remove(&job.id);
-        assert!(!set_enabled("cron-missing", false), "不存在的 job 返回 false");
-    }
-
-    #[test]
-    fn record_caps_history_and_ignores_missing_job() {
-        let _g = crate::core::shared::lock(&TEST_LOCK);
-        clear();
-        let job = add("*/1 * * * *", "ping", "s4", false).unwrap();
-        for i in 0..12 {
-            record(&job.id, i % 2 == 0, if i % 2 == 0 { None } else { Some(format!("err{i}")) });
-        }
-        let after = list().into_iter().find(|j| j.id == job.id).unwrap();
-        assert_eq!(after.history.len(), HISTORY_CAP, "历史必须 cap");
-        assert_eq!(after.history.front().unwrap().error.as_deref(), Some("err11"), "最新记录在前");
-        remove(&job.id);
-        record(&job.id, true, None); // 已删 job：静默丢弃不 panic
-    }
-
-    #[test]
-    fn load_from_distinguishes_missing_loaded_corrupt() {
-        let dir = std::env::temp_dir().join(format!("kxen-schedule-{}-{}", std::process::id(), "load"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("schedule.json");
-
-        assert!(matches!(load_from(&path), LoadResult::Missing), "缺失文件 = Missing");
-
-        std::fs::write(&path, serde_json::to_string(&Vec::<CronJob>::new()).unwrap()).unwrap();
-        assert!(matches!(load_from(&path), LoadResult::Jobs(_)), "合法文件 = Jobs");
-
-        // 损坏文件 = Corrupt：调用方保留内存 jobs 并隔离旧文件，不静默清空（P1-7）
-        std::fs::write(&path, "{not json").unwrap();
-        assert!(matches!(load_from(&path), LoadResult::Corrupt));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json", "load_from 不得动旧文件");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn write_atomic_goes_through_tmp_rename() {
-        let dir = std::env::temp_dir().join(format!("kxen-schedule-{}-{}", std::process::id(), "atomic"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("schedule.json");
-        write_atomic(&path, "[]").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
-        assert!(!path.with_extension("json.tmp").exists(), "tmp 文件必须已 rename 走");
-        write_atomic(&path, "[1]").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[1]", "覆盖写同样原子");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
+#[path = "schedule/tests.rs"]
+mod tests;

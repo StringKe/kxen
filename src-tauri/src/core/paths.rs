@@ -4,19 +4,27 @@ use std::path::PathBuf;
 
 pub const APP_DIR: &str = "kxen";
 
+fn home_dir() -> PathBuf {
+    dirs::home_dir()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .filter(|path| path.is_absolute())
+        // 不能返回字面量 `~`：Rust 不会展开它，数据会相对当前工作目录落盘。
+        .unwrap_or_else(|| PathBuf::from("/var/empty"))
+}
+
 /// ~/.config/kxen（XDG 风格，跨平台一致，与官方 CLI 的 ~/.codex ~/.grok 同风格）
 pub fn config_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("~")).join(".config").join(APP_DIR)
+    home_dir().join(".config").join(APP_DIR)
 }
 
 /// ~/Library/Application Support/kxen（数据：goals、sessions、auth.json）
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from("~/Library/Application Support")).join(APP_DIR)
+    dirs::data_dir().unwrap_or_else(|| home_dir().join("Library/Application Support")).join(APP_DIR)
 }
 
 /// ~/Library/Caches/kxen
 pub fn cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| PathBuf::from("~/Library/Caches")).join(APP_DIR)
+    dirs::cache_dir().unwrap_or_else(|| home_dir().join("Library/Caches")).join(APP_DIR)
 }
 
 /// auth.json 路径（0600）

@@ -19,16 +19,19 @@ static CRON_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn cron_jobs_of_deleted_session_never_fire() {
     let _g = CRON_LOCK.lock().unwrap();
+    let schedule_path = std::env::temp_dir().join(format!("kxen-schedule-cleanup-{}.json", std::process::id()));
+    // SAFETY: this integration-test process uses the schedule singleton only in this serialized test.
+    unsafe { std::env::set_var("KXEN_SCHEDULE_FILE", schedule_path) };
     let a = kxen_app::core::schedule::add("*/1 * * * *", "ping-a", "ses_dead", true).unwrap();
     let b = kxen_app::core::schedule::add("*/1 * * * *", "ping-b", "ses_live", true).unwrap();
-    assert_eq!(kxen_app::core::schedule::remove_by_session("ses_dead"), 1);
-    assert_eq!(kxen_app::core::schedule::remove_by_session("ses_dead"), 0, "重复清理应幂等");
+    assert_eq!(kxen_app::core::schedule::remove_by_session("ses_dead").unwrap(), 1);
+    assert_eq!(kxen_app::core::schedule::remove_by_session("ses_dead").unwrap(), 0, "重复清理应幂等");
     // 存储层断言：已删 session 的 job 不在列表即永不再被 tick 出列（drain_due 只遍历内存 job 表）
-    let jobs = kxen_app::core::schedule::list();
+    let jobs = kxen_app::core::schedule::list().unwrap();
     assert!(jobs.iter().all(|j| j.session_id != "ses_dead"), "已删 session 的 job 必须清除");
     assert!(jobs.iter().any(|j| j.id == b.id));
-    kxen_app::core::schedule::remove(&a.id);
-    kxen_app::core::schedule::remove(&b.id);
+    kxen_app::core::schedule::remove(&a.id).unwrap();
+    kxen_app::core::schedule::remove(&b.id).unwrap();
 }
 
 fn goal_contract() -> GoalContract {
@@ -74,21 +77,25 @@ fn team_deps(fallback: &Path) -> SpawnDeps {
         extras: Arc::new(kxen_app::agent::agent_loop::SessionExtrasRegistry::default()),
         agents: Arc::new(kxen_app::agent::activity::AgentRegistry::default()),
         approvals: None,
+        session_usage: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
 #[test]
 fn team_dir_is_removed_on_session_delete() {
     let root = tmp_dir("team");
-    let mgr = TeamManager::new(root.clone(), team_deps(&root), EventBus::default(), root.join("no-sessions"), None);
+    let sessions = root.join("sessions");
+    let session = kxen_app::core::session::create(&sessions, root.to_str().unwrap()).unwrap();
+    let teams = root.join("teams");
+    let mgr = TeamManager::new(teams.clone(), team_deps(&root), EventBus::default(), sessions, None);
     // state_for 惰性建目录（team.json 落盘前的最小团队形态）
-    assert!(mgr.list_json("s1").is_object());
-    assert!(root.join("s1").is_dir());
-    mgr.drop_session("s1");
-    assert!(!root.join("s1").exists(), "session 删除后 team 目录必须清掉");
+    assert!(mgr.list_json(&session.id).unwrap().is_object());
+    assert!(teams.join(&session.id).is_dir());
+    mgr.drop_session(&session.id).unwrap();
+    assert!(!teams.join(&session.id).exists(), "session 删除后 team 目录必须清掉");
     // 幂等与非法 id：都不许炸
-    mgr.drop_session("s1");
-    mgr.drop_session("../escape");
+    mgr.drop_session(&session.id).unwrap();
+    assert!(mgr.drop_session("../escape").is_err());
     std::fs::remove_dir_all(&root).ok();
 }
 

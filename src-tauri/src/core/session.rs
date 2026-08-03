@@ -8,7 +8,31 @@ use crate::llm::ModelRef;
 #[path = "session_compaction.rs"]
 mod compaction;
 pub use compaction::*;
-
+#[path = "session_catalog.rs"]
+mod catalog;
+pub use catalog::{list, list_checked};
+#[path = "session_messages.rs"]
+mod messages;
+pub use messages::{load_messages, load_messages_checked};
+#[path = "session/fork.rs"]
+mod fork_session;
+pub use fork_session::fork;
+#[path = "session/cursor.rs"]
+mod cursor;
+pub use cursor::{current_message_cursor_checked, load_message_snapshot_checked, message_cursor};
+#[path = "session/transaction.rs"]
+mod transaction;
+use transaction::mutation_transaction;
+pub(crate) use transaction::{SessionTransaction, acquire_transaction};
+#[path = "session/storage.rs"]
+pub(crate) mod storage;
+pub use storage::{CommitFailure, CommitPhase, repair_message_durability};
+#[path = "session/storage_recovery.rs"]
+mod storage_recovery;
+pub use storage_recovery::{MessageIntegrity, RecoveryReport, inspect_storage, repair_storage};
+#[path = "session/append.rs"]
+mod append;
+pub use append::{append_message, append_message_durable, append_message_idempotent, append_message_idempotent_durable};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -18,6 +42,10 @@ pub struct Session {
     pub parent_id: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// 消息内容的单调 revision。每次真实 append/rewrite 递增，meta/UI 变更不递增。
+    /// Knowledge consolidation 以它作为无丢失 cursor，不能使用毫秒时间戳代替。
+    #[serde(default)]
+    pub message_revision: u64,
     /// 置顶（排在该目录组最前）
     #[serde(default)]
     pub pinned: bool,
@@ -39,6 +67,11 @@ pub enum Part {
     /// 历史回放给模型时带上，时间线渲染时跳过。
     Context {
         text: String,
+    },
+    /// 用户选择的可逆 @ 引用描述。Web/Docs URL 落盘前已移除凭证型 URL 成分；
+    /// Context 仍保存当次展开快照，回放模型不重新读取这里的来源。
+    ContextSources {
+        items: Vec<crate::agent::context::ContextItem>,
     },
     ToolCall {
         name: String,
@@ -74,6 +107,10 @@ pub struct Message {
     pub session_id: String,
     pub role: Role,
     pub parts: Vec<Part>,
+    /// 生成本条 Assistant 消息的实际路由模型。User/System 与旧 JSONL 缺省为 None。
+    /// 不能用 session 当前配置回推：fallback 或后续切模型都会让历史署名失真。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
     pub created_at: u64,
 }
 
@@ -88,21 +125,6 @@ pub enum Role {
 // ---------------- 持久化（<sessions_dir>/<id>.json meta + <id>.jsonl 消息行） ----------------
 
 pub(crate) use super::shared::now_ms;
-
-// per-session 写锁：cron/队列续跑可能并发 touch 同一会话 JSONL，append 与 rewrite（tmp+rename）必须串行，否则丢并发行
-static WRITE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
-    std::sync::OnceLock::new();
-
-fn write_lock(id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-    let registry = WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    crate::core::shared::lock(registry).entry(id.to_string()).or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(()))).clone()
-}
-
-pub fn drop_write_lock(id: &str) {
-    if let Some(registry) = WRITE_LOCKS.get() {
-        crate::core::shared::lock(registry).remove(id);
-    }
-}
 
 fn meta_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.json"))
@@ -130,11 +152,14 @@ pub fn create(dir: &Path, directory: &str) -> std::io::Result<Session> {
         parent_id: None,
         created_at: now,
         updated_at: now,
+        message_revision: 0,
         pinned: false,
         sort_order: None,
         model: None,
     };
-    save_meta(dir, &session)?;
+    let _transaction = mutation_transaction(dir, &session.id)?;
+    let meta = serde_json::to_vec_pretty(&session)?;
+    finish_commit(&session.id, storage::create_session_files(&meta_path(dir, &session.id), &meta, &messages_path(dir, &session.id), b""))?;
     Ok(session)
 }
 
@@ -147,6 +172,7 @@ pub fn update_meta(
     pinned: Option<bool>,
     sort_order: Option<Option<u64>>,
 ) -> std::io::Result<Session> {
+    let _transaction = mutation_transaction(dir, id)?;
     let mut session = load_meta(dir, id)?;
     if let Some(t) = title {
         session.title = t.to_string();
@@ -157,15 +183,16 @@ pub fn update_meta(
     if let Some(so) = sort_order {
         session.sort_order = so;
     }
-    save_meta(dir, &session)?;
+    finish_commit(&session.id, save_meta_unlocked(dir, &session))?;
     Ok(session)
 }
 
 /// 写会话级模型覆盖（None = 清除，跟随全局默认）。不 bump updated_at：切模型不算会话活动。
 pub fn set_model(dir: &Path, id: &str, model: Option<ModelRef>) -> std::io::Result<Session> {
+    let _transaction = mutation_transaction(dir, id)?;
     let mut session = load_meta(dir, id)?;
     session.model = model;
-    save_meta(dir, &session)?;
+    finish_commit(&session.id, save_meta_unlocked(dir, &session))?;
     Ok(session)
 }
 
@@ -175,29 +202,24 @@ pub fn effective_model<'a>(session_override: Option<&'a ModelRef>, global_defaul
 }
 
 pub fn save_meta(dir: &Path, session: &Session) -> std::io::Result<()> {
-    crate::core::ids::validate_id_io(&session.id)?;
-    let tmp = meta_path(dir, &session.id).with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(session)?)?;
-    std::fs::rename(&tmp, meta_path(dir, &session.id))
+    let _transaction = mutation_transaction(dir, &session.id)?;
+    let current = load_meta(dir, &session.id)?;
+    let mut replacement = session.clone();
+    // 调用方可能持有 append 前的旧 meta，禁止普通元信息保存把内容 revision/活动时间写回旧值。
+    replacement.message_revision = replacement.message_revision.max(current.message_revision);
+    replacement.updated_at = replacement.updated_at.max(current.updated_at);
+    finish_commit(&session.id, save_meta_unlocked(dir, &replacement))
+}
+
+fn save_meta_unlocked(dir: &Path, session: &Session) -> Result<(), CommitFailure> {
+    let bytes = serde_json::to_vec_pretty(session).map_err(|error| CommitFailure::before(std::io::Error::other(error)))?;
+    storage::write_atomic(&meta_path(dir, &session.id), &bytes)
 }
 
 pub fn load_meta(dir: &Path, id: &str) -> std::io::Result<Session> {
     crate::core::ids::validate_id_io(id)?;
     let text = std::fs::read_to_string(meta_path(dir, id))?;
     serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// 全部会话元信息（updated_at 倒序）。
-pub fn list(dir: &Path) -> Vec<Session> {
-    let mut out: Vec<Session> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok())
-        .collect();
-    out.sort_by_key(|m| std::cmp::Reverse(m.updated_at));
-    out
 }
 
 /// 删除会话：移入系统废纸篓（Finder 可恢复）。
@@ -208,6 +230,9 @@ pub fn remove(dir: &Path, id: &str) {
     if crate::core::ids::validate_id(id).is_err() {
         return;
     }
+    let Ok(_transaction) = mutation_transaction(dir, id) else {
+        return;
+    };
     let paths = [meta_path(dir, id), messages_path(dir, id), compaction_path(dir, id)];
     // 会话子目录（browser 截图等运行期产物）一并清，口径与消息文件相同
     let session_dir = dir.join(id);
@@ -224,86 +249,30 @@ pub fn remove(dir: &Path, id: &str) {
     }
 }
 
-/// 追加一条消息（JSONL 行）并维护 meta（updated_at + 首条用户消息生成标题）。
-pub fn append_message(dir: &Path, message: &Message) -> std::io::Result<Session> {
-    append_message_inner(dir, message, false)
+fn next_activity_time(previous: u64) -> u64 {
+    now_ms().max(previous.saturating_add(1))
 }
 
-/// Queue delivery 使用稳定 message id 幂等追加：崩溃发生在 JSONL append 与 queue ack 之间时，
-/// 重放同一 delivery 只完成 ack，不会把同一用户消息写两次。
-pub fn append_message_idempotent(dir: &Path, message: &Message) -> std::io::Result<Session> {
-    append_message_inner(dir, message, true)
-}
-
-fn append_message_inner(dir: &Path, message: &Message, idempotent: bool) -> std::io::Result<Session> {
-    use std::io::Write;
-    crate::core::ids::validate_id_io(&message.session_id)?;
-    let lock = write_lock(&message.session_id);
-    let _guard = crate::core::shared::lock(&lock);
-    // 已删会话拒绝写入：meta 不在即拒，防孤儿 JSONL 重建
-    if !meta_path(dir, &message.session_id).exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("session not found: {}", message.session_id)));
-    }
-    if idempotent {
-        let path = messages_path(dir, &message.session_id);
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Some(existing) =
-                text.lines().filter_map(|line| serde_json::from_str::<Message>(line).ok()).find(|item| item.id == message.id)
-        {
-            if serde_json::to_value(&existing)? != serde_json::to_value(message)? {
-                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("message id collision: {}", message.id)));
-            }
-            return load_meta(dir, &message.session_id);
-        }
-    }
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(messages_path(dir, &message.session_id))?;
-    writeln!(file, "{}", serde_json::to_string(message)?)?;
-
-    let mut session = load_meta(dir, &message.session_id)?;
-    session.updated_at = now_ms();
-    if message.role == Role::User
-        && session.title == "新会话"
-        && let Some(Part::Text { text }) = message.parts.first()
+fn finish_typed<T>(id: &str, result: Result<T, CommitFailure>) -> Result<T, CommitFailure> {
+    if let Err(error) = &result
+        && error.committed()
     {
-        session.title = text.chars().take(30).collect();
+        transaction::block_indeterminate(id, &error.to_string());
     }
-    save_meta(dir, &session)?;
-    Ok(session)
+    result
 }
 
-pub fn load_messages(dir: &Path, id: &str) -> Vec<Message> {
-    // 不返回 Result 的读取口：非法 id 按 not-found 处理（空历史），绝不拼路径
-    if crate::core::ids::validate_id(id).is_err() {
-        return Vec::new();
-    }
-    let Ok(text) = std::fs::read_to_string(messages_path(dir, id)) else {
-        return Vec::new();
-    };
-    text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+fn finish_commit<T>(id: &str, result: Result<T, CommitFailure>) -> std::io::Result<T> {
+    finish_typed(id, result).map_err(CommitFailure::into_io_error)
 }
 
 pub fn new_message(session_id: &str, role: Role, parts: Vec<Part>) -> Message {
-    Message { id: crate::core::ids::new_id("msg"), session_id: session_id.into(), role, parts, created_at: now_ms() }
+    Message { id: crate::core::ids::new_id("msg"), session_id: session_id.into(), role, parts, model: None, created_at: now_ms() }
 }
 
-/// 从指定消息分叉：新会话携带 [..=message_id] 前缀历史（parent_id 指向源会话）。
-pub fn fork(dir: &Path, id: &str, message_id: &str) -> std::io::Result<Session> {
-    let parent = load_meta(dir, id)?;
-    let messages = load_messages(dir, id);
-    let Some(idx) = messages.iter().position(|m| m.id == message_id) else {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("message not found: {message_id}")));
-    };
-    let mut session = create(dir, &parent.directory)?;
-    session.parent_id = Some(id.to_string());
-    session.model = parent.model.clone();
-    session.title = format!("分叉: {}", parent.title.chars().take(24).collect::<String>());
-    save_meta(dir, &session)?;
-    for m in &messages[..=idx] {
-        let mut cloned = m.clone();
-        // id 重新生成：checkpoint label 与 UI identity 都以消息 id 为键，同 id 分叉会撞
-        cloned.id = crate::core::ids::new_id("msg");
-        cloned.session_id = session.id.clone();
-        append_message(dir, &cloned)?;
-    }
-    Ok(session)
-}
+#[cfg(test)]
+#[path = "session/failure_tests.rs"]
+mod failure_tests;
+#[cfg(test)]
+#[path = "session/tests.rs"]
+mod tests;

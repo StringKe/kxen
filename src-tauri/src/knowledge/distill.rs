@@ -1,11 +1,10 @@
 //! 显式或 opt-in 自动蒸馏：消息流 -> 当前 provider 一次性调用 -> 0..N 条 note 落 personal notes/。
 //! 纯函数（build_prompt/parse_output）可单测；流错误经 Result 上抛，是否阻塞由调用方决定。
 
-use super::{Scope, add};
 use crate::llm::{Message, ModelRef};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NewNote {
     #[serde(default = "default_scope")]
     pub scope: String,
@@ -50,6 +49,7 @@ pub fn parse_output(text: &str) -> Result<Vec<NewNote>, String> {
     if notes.len() > 5 {
         return Err(format!("distill output contains {} notes; maximum is 5", notes.len()));
     }
+    let mut slugs = std::collections::HashSet::new();
     for (index, note) in notes.iter().enumerate() {
         if note.scope != "personal" {
             return Err(format!("distill note {index} has unsupported scope {:?}", note.scope));
@@ -65,6 +65,9 @@ pub fn parse_output(text: &str) -> Result<Vec<NewNote>, String> {
         if note.content.trim().is_empty() || content_len > 500 {
             return Err(format!("distill note {index} content must contain 1..=500 characters"));
         }
+        if !slugs.insert(crate::knowledge::slugify(&note.description)) {
+            return Err(format!("distill note {index} would overwrite another generated note"));
+        }
     }
     Ok(notes)
 }
@@ -73,27 +76,30 @@ pub fn parse_output(text: &str) -> Result<Vec<NewNote>, String> {
 /// 超时按失败处理上抛；显式删除蒸馏会保留 Session，后台 consolidation 保留水位下轮重试。
 pub const DISTILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-pub struct DistillAttempt {
-    pub result: Result<usize, String>,
+pub(crate) struct GeneratedNotes {
+    pub result: Result<Vec<NewNote>, String>,
     pub usage: Option<crate::llm::managed::TokenUsage>,
     pub unmetered_call: bool,
     pub metering_warning: Option<String>,
+    pub request_started: bool,
 }
 
-/// 删除前兜底蒸馏。返回沉淀条数；LLM 流报错（Delta::Error）与超时以 Err 传播，
-/// 由调用方决定保留 Session（删除路径）或留水位重试（consolidation）；任一 note 落盘失败均返回 Err，
-/// 防止水位前移后永久丢失本轮未写入内容。
-pub async fn distill_on_delete(
+pub(crate) async fn generate_notes(
     mrm: &crate::llm::mrm::ModelResourceManager,
     model: &ModelRef,
     store: &crate::auth::credential::AuthStore,
-    workdir: &std::path::Path,
     transcript: Vec<String>,
     timeout: std::time::Duration,
     cancel: Option<&crate::agent::cancel::CancelToken>,
-) -> DistillAttempt {
+) -> GeneratedNotes {
     if transcript.is_empty() {
-        return DistillAttempt { result: Ok(0), usage: None, unmetered_call: false, metering_warning: None };
+        return GeneratedNotes {
+            result: Ok(Vec::new()),
+            usage: None,
+            unmetered_call: false,
+            metering_warning: None,
+            request_started: false,
+        };
     }
     let joined = transcript.join("\n\n");
     // 蒸馏输入截断：长会话只取尾部 12k 字符（最近的纠正/结论密度最高）
@@ -102,11 +108,12 @@ pub async fn distill_on_delete(
     let output = match crate::llm::managed::collect_text_observed(mrm, model, &messages, store, timeout, None, cancel).await {
         Ok(output) => output,
         Err(error) => {
-            return DistillAttempt {
+            return GeneratedNotes {
                 result: Err(error.message),
                 usage: error.usage,
                 unmetered_call: error.request_started && !error.usage_reported,
                 metering_warning: error.metering_warning,
+                request_started: error.request_started,
             };
         }
     };
@@ -116,22 +123,10 @@ pub async fn distill_on_delete(
     let notes = match parse_output(&output.text) {
         Ok(notes) => notes,
         Err(error) => {
-            return DistillAttempt { result: Err(error), usage, unmetered_call, metering_warning };
+            return GeneratedNotes { result: Err(error), usage, unmetered_call, metering_warning, request_started: true };
         }
     };
-    let mut written = 0;
-    for note in notes {
-        if let Err(error) = add(Scope::Personal, workdir, None, &note.note_type, &note.description, &note.content) {
-            return DistillAttempt {
-                result: Err(format!("persist distilled note '{}': {error}", note.description)),
-                usage,
-                unmetered_call,
-                metering_warning,
-            };
-        }
-        written += 1;
-    }
-    DistillAttempt { result: Ok(written), usage, unmetered_call, metering_warning }
+    GeneratedNotes { result: Ok(notes), usage, unmetered_call, metering_warning, request_started: true }
 }
 
 /// 限时收集流式正文：超时时长参数化（测试用短限时，生产用 DISTILL_TIMEOUT）。
@@ -174,6 +169,9 @@ mod tests {
         assert!(parse_output("not json at all").is_err());
         assert!(parse_output("[{\"description\":\"\",\"content\":\"\"}]").is_err());
         assert!(parse_output("[{\"scope\":\"project\",\"description\":\"x\",\"content\":\"y\"}]").is_err());
+        assert!(
+            parse_output("[{\"description\":\"same note\",\"content\":\"x\"},{\"description\":\"same note!\",\"content\":\"y\"}]").is_err()
+        );
     }
 
     #[test]

@@ -4,7 +4,43 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[path = "config/security.rs"]
+mod security;
+
+pub(crate) use security::{is_sensitive_remote_header, validate_project_stdio, validate_secure_endpoint, validate_server_key};
+
+/// 配置来源是安全边界的一部分：项目配置不能继承个人配置的执行授权或 OAuth token。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConfigScope {
+    Personal,
+    Project(PathBuf),
+}
+
+impl ConfigScope {
+    pub fn is_project(&self) -> bool {
+        matches!(self, Self::Project(_))
+    }
+
+    pub fn storage_id(&self) -> String {
+        match self {
+            Self::Personal => "personal".to_string(),
+            Self::Project(root) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let bytes = root.as_os_str().as_bytes();
+                    format!("project:hex:{}", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+                }
+                #[cfg(not(unix))]
+                {
+                    format!("project:{}", root.to_string_lossy())
+                }
+            }
+        }
+    }
+}
 
 /// per-tool 策略三态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +97,9 @@ pub struct StdioConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// stdio server 的工作目录必须显式固定，不能继承 app 启动目录。
+    pub cwd: PathBuf,
+    pub scope: ConfigScope,
 }
 
 /// remote server 的 OAuth 2.0 授权配置（全可选；授权流实现见 mcp/oauth.rs）。
@@ -84,6 +123,7 @@ pub struct RemoteConfig {
     pub transport: RemoteKind,
     pub headers: HashMap<String, String>,
     pub oauth: Option<OAuthConfig>,
+    pub scope: ConfigScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,177 +202,122 @@ struct OAuthDef {
     auth_server_metadata_url: Option<String>,
 }
 
-fn parse_server(name: String, def: ServerDef) -> Option<ServerConfig> {
+fn parse_server(name: String, def: ServerDef, scope: &ConfigScope, cwd: &Path) -> Result<ServerConfig, String> {
+    validate_server_key(&name).map_err(|error| format!("MCP server {name:?}: {error}"))?;
     let kind = def.kind.as_deref().or(def.transport.as_deref());
+    if def.url.is_some() && def.command.is_some() {
+        return Err(format!("MCP server {name} cannot define both url and command"));
+    }
     if let Some(url) = def.url {
-        // scheme 配置期先挡：运行时才报比加载时 warn 难定位得多
-        match url.split_once("://").map(|(s, _)| s) {
-            Some("http") | Some("https") => {}
-            _ => {
-                tracing::warn!(name, url, "mcp remote url 仅支持 http/https，跳过");
-                return None;
+        validate_secure_endpoint(&url, false).map_err(|error| format!("MCP server {name} remote URL {error}"))?;
+        if scope.is_project() {
+            if let Some(header) = def.headers.keys().find(|header| is_sensitive_remote_header(header)) {
+                return Err(format!("MCP server {name} project config cannot store sensitive header {header:?}"));
+            }
+            if def.oauth.as_ref().is_some_and(|oauth| oauth.client_secret.is_some()) {
+                return Err(format!("MCP server {name} project config cannot store oauth.clientSecret"));
             }
         }
         let transport = match kind {
             // 缺省 http：streamable http 是现行标准形态，legacy sse 需显式声明
             None | Some("http") => RemoteKind::Http,
             Some("sse") => RemoteKind::Sse,
-            Some(other) => {
-                tracing::warn!(name, transport = other, "mcp remote transport 非法（http|sse），跳过");
-                return None;
-            }
+            Some(other) => return Err(format!("MCP server {name} remote transport must be http or sse, got {other}")),
         };
-        return Some(ServerConfig::Remote(RemoteConfig {
-            name,
-            url,
-            transport,
-            headers: def.headers,
-            oauth: def.oauth.map(|o| OAuthConfig {
-                client_id: o.client_id,
-                client_secret: o.client_secret,
-                callback_port: o.callback_port,
-                scopes: o.scopes,
-                auth_server_metadata_url: o.auth_server_metadata_url,
-            }),
-        }));
+        let oauth = def
+            .oauth
+            .map(|oauth| -> Result<OAuthConfig, String> {
+                if let Some(url) = oauth.auth_server_metadata_url.as_deref() {
+                    validate_secure_endpoint(url, false).map_err(|error| format!("MCP server {name} OAuth metadata URL {error}"))?;
+                }
+                Ok(OAuthConfig {
+                    client_id: oauth.client_id,
+                    client_secret: oauth.client_secret,
+                    callback_port: oauth.callback_port,
+                    scopes: oauth.scopes,
+                    auth_server_metadata_url: oauth.auth_server_metadata_url,
+                })
+            })
+            .transpose()?;
+        return Ok(ServerConfig::Remote(RemoteConfig { name, url, transport, headers: def.headers, oauth, scope: scope.clone() }));
     }
     if let Some(command) = def.command {
         if let Some(k) = kind
             && k != "stdio"
         {
-            tracing::warn!(name, kind = k, "command server 的 type 只能是 stdio，跳过");
-            return None;
+            return Err(format!("MCP server {name} command transport must be stdio, got {k}"));
         }
-        return Some(ServerConfig::Stdio(StdioConfig { name, command, args: def.args, env: def.env }));
+        if command.trim().is_empty() {
+            return Err(format!("MCP server {name} command must not be empty"));
+        }
+        let config = StdioConfig { name, command, args: def.args, env: def.env, cwd: cwd.to_path_buf(), scope: scope.clone() };
+        if scope.is_project() {
+            validate_project_stdio(&config)?;
+        }
+        return Ok(ServerConfig::Stdio(config));
     }
-    tracing::warn!(name, "mcp server 既无 command 也无 url，跳过");
-    None
+    Err(format!("MCP server {name} must define exactly one of command or url"))
 }
 
-fn load_file(path: &Path) -> (Vec<ServerConfig>, PolicySet) {
-    let Ok(text) = std::fs::read_to_string(path) else { return (vec![], PolicySet::default()) };
-    let parsed: McpFile = match serde_json::from_str(&text) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path.display(), "mcp.json parse failed");
-            return (vec![], PolicySet::default());
-        }
+type ScopedConfig = (Vec<ServerConfig>, PolicySet);
+
+fn load_file(path: &Path, scope: &ConfigScope, cwd: &Path) -> Result<ScopedConfig, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], PolicySet::default())),
+        Err(error) => return Err(format!("read MCP config {}: {error}", path.display())),
     };
-    let servers = parsed.servers.into_iter().filter_map(|(name, def)| parse_server(name, def)).collect();
+    let parsed: McpFile = serde_json::from_str(&text).map_err(|error| format!("parse MCP config {}: {error}", path.display()))?;
+    let servers = parsed.servers.into_iter().map(|(name, def)| parse_server(name, def, scope, cwd)).collect::<Result<Vec<_>, _>>()?;
     let mut policies = PolicySet::default();
     for (key, value) in parsed.policies {
-        match ToolPolicy::parse(&value) {
-            Some(p) => policies.insert(&key, p),
-            None => tracing::warn!(key, value, "mcp toolPolicies 非法值（allow|ask|deny），跳过"),
+        let (server, tool) = key.split_once('.').map_or((key.as_str(), None), |(server, tool)| (server, Some(tool)));
+        validate_server_key(server).map_err(|error| format!("MCP config {} toolPolicies.{key}: {error}", path.display()))?;
+        if let Some(tool) = tool {
+            crate::mcp::tools::provider_tool_name(server, tool)
+                .map_err(|error| format!("MCP config {} toolPolicies.{key}: {error}", path.display()))?;
         }
+        let policy = ToolPolicy::parse(&value)
+            .ok_or_else(|| format!("MCP config {} toolPolicies.{key} must be allow, ask, or deny, got {value}", path.display()))?;
+        policies.insert(&key, policy);
     }
-    (servers, policies)
+    Ok((servers, policies))
 }
 
-/// 双 scope 合并：项目覆盖用户同名 server 与同键 policy。项目部分只在已信任时读。
-pub fn load(workdir: &Path, project_trusted: bool) -> (Vec<ServerConfig>, PolicySet) {
+/// 分 scope 加载。调用方可在 merge 前对项目 stdio 做独立执行审批；拒绝项目覆盖时，
+/// 同名个人 server 会自然保留，而不是被项目配置一并隐藏。
+pub(super) fn load_scoped(workdir: &Path, project_trusted: bool) -> Result<(ScopedConfig, ScopedConfig), String> {
+    let personal_scope = ConfigScope::Personal;
+    let personal = load_file(&crate::core::paths::config_dir().join("mcp.json"), &personal_scope, workdir)?;
+    let project = if project_trusted {
+        let project_scope = ConfigScope::Project(workdir.to_path_buf());
+        load_file(&workdir.join(".mcp.json"), &project_scope, workdir)?
+    } else {
+        (Vec::new(), PolicySet::default())
+    };
+    Ok((personal, project))
+}
+
+pub(super) fn merge_scoped(personal: ScopedConfig, project: ScopedConfig) -> ScopedConfig {
     let mut out: HashMap<String, ServerConfig> = HashMap::new();
-    let mut policies = PolicySet::default();
-    let (cfgs, ps) = load_file(&crate::core::paths::config_dir().join("mcp.json"));
+    let (cfgs, mut policies) = personal;
     for cfg in cfgs {
         out.insert(cfg.name().to_string(), cfg);
     }
-    policies.extend(ps);
-    if project_trusted {
-        let (cfgs, ps) = load_file(&workdir.join(".mcp.json"));
-        for cfg in cfgs {
-            out.insert(cfg.name().to_string(), cfg);
-        }
-        policies.extend(ps);
+    let (cfgs, project_policies) = project;
+    for cfg in cfgs {
+        out.insert(cfg.name().to_string(), cfg);
     }
+    policies.extend(project_policies);
     (out.into_values().collect(), policies)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write(dir: &Path, text: &str) -> std::path::PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(".mcp.json");
-        std::fs::write(&path, text).unwrap();
-        path
-    }
-
-    #[test]
-    fn parses_stdio_and_remote_and_policies() {
-        let dir = std::env::temp_dir().join(format!("kxen-mcp-cfg-{}", std::process::id()));
-        let path = write(
-            &dir,
-            r#"{
-            "mcpServers": {
-                "fs": {"command": "npx", "args": ["-y", "srv"], "type": "stdio"},
-                "web": {"type": "http", "url": "https://x.example/mcp", "headers": {"Authorization": "Bearer t"}},
-                "old": {"url": "https://y.example/sse", "transport": "sse"},
-                "bad": {"url": "ftp://z.example/x"}
-            },
-            "toolPolicies": {"fs": "ask", "fs.read_file": "allow", "web": "deny", "oops": "maybe"}
-        }"#,
-        );
-        let (cfgs, policies) = load_file(&path);
-        assert_eq!(cfgs.len(), 3, "非法 scheme 必须跳过: {cfgs:?}");
-        let web = cfgs.iter().find(|c| c.name() == "web").unwrap();
-        assert_eq!(web.transport_kind(), "http");
-        assert_eq!(web.url(), Some("https://x.example/mcp"));
-        let old = cfgs.iter().find(|c| c.name() == "old").unwrap();
-        assert_eq!(old.transport_kind(), "sse", "transport 键与 type 键都收");
-        assert_eq!(policies.for_tool("fs", "read_file"), ToolPolicy::Allow);
-        assert_eq!(policies.for_tool("fs", "write_file"), ToolPolicy::Ask);
-        assert_eq!(policies.for_tool("web", "anything"), ToolPolicy::Deny);
-        assert_eq!(policies.for_tool("unknown", "x"), ToolPolicy::Allow, "缺省 Allow（WHY 见 for_tool）");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn parses_remote_oauth_object() {
-        let dir = std::env::temp_dir().join(format!("kxen-mcp-oauth-cfg-{}", std::process::id()));
-        let path = write(
-            &dir,
-            r#"{"mcpServers": {
-            "full": {"url": "https://x.example/mcp", "oauth": {
-                "clientId": "cid", "clientSecret": "sec", "callbackPort": 19876,
-                "scopes": "mcp read", "authServerMetadataUrl": "https://as.example/meta"
-            }},
-            "bare": {"url": "https://y.example/mcp"}
-        }}"#,
-        );
-        let (cfgs, _) = load_file(&path);
-        assert_eq!(cfgs.len(), 2);
-        let full = cfgs.iter().find(|c| c.name() == "full").unwrap();
-        let ServerConfig::Remote(rc) = full else { panic!("full 必须是 remote") };
-        let oauth = rc.oauth.as_ref().expect("oauth 对象必须解析");
-        assert_eq!(oauth.client_id.as_deref(), Some("cid"));
-        assert_eq!(oauth.client_secret.as_deref(), Some("sec"));
-        assert_eq!(oauth.callback_port, Some(19876));
-        assert_eq!(oauth.scopes.as_deref(), Some("mcp read"));
-        assert_eq!(oauth.auth_server_metadata_url.as_deref(), Some("https://as.example/meta"));
-        let bare = cfgs.iter().find(|c| c.name() == "bare").unwrap();
-        let ServerConfig::Remote(rc) = bare else { panic!("bare 必须是 remote") };
-        assert!(rc.oauth.is_none(), "无 oauth 键必须为 None");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn infers_kind_from_command_or_url() {
-        let dir = std::env::temp_dir().join(format!("kxen-mcp-infer-{}", std::process::id()));
-        let path = write(
-            &dir,
-            r#"{"mcpServers": {
-            "a": {"command": "srv"},
-            "b": {"url": "https://b.example/mcp"}
-        }}"#,
-        );
-        let (cfgs, _) = load_file(&path);
-        assert_eq!(cfgs.len(), 2);
-        let a = cfgs.iter().find(|c| c.name() == "a").unwrap();
-        assert_eq!(a.transport_kind(), "stdio");
-        let b = cfgs.iter().find(|c| c.name() == "b").unwrap();
-        assert_eq!(b.transport_kind(), "http", "url 缺省推断 streamable http");
-        std::fs::remove_dir_all(&dir).ok();
-    }
+/// 双 scope 合并：项目覆盖用户同名 server 与同键 policy。项目部分只在已信任时读。
+pub fn load(workdir: &Path, project_trusted: bool) -> Result<(Vec<ServerConfig>, PolicySet), String> {
+    let (personal, project) = load_scoped(workdir, project_trusted)?;
+    Ok(merge_scoped(personal, project))
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

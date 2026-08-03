@@ -10,47 +10,120 @@ use crate::AppState;
 pub(crate) fn restore_queues(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Arc<AppState>>();
-        for sid in state.pending_messages.restore() {
+        let ready = state.pending_messages.restore();
+        if let Some(error) = state.pending_messages.store_error() {
+            state.bus.publish(kxen_app::core::event::Event::notify(format!("待处理队列存储不可用，已阻止后续覆盖：{error}"), None));
+        }
+        for (sid, error) in state.pending_messages.blocked() {
+            state.bus.publish(kxen_app::core::event::Event::notify(format!("会话 {sid} 的待处理队列损坏，已阻止覆盖：{error}"), Some(sid)));
+        }
+        report_session_recovery(&state);
+        for sid in ready {
             // 会话已删（队列文件残留）：清盘不续跑
-            if kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), &sid).is_err() {
-                if let Err(error) = state.pending_messages.clear(&sid) {
-                    tracing::warn!(session = sid, %error, "orphan pending queue cleanup failed");
-                }
-                continue;
-            }
-            let q = match state.pending_messages.claim(&sid) {
-                Ok(Some(queue)) => queue,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::error!(session = sid, %error, "pending queue claim failed during restore");
+            match kxen_app::core::session::load_meta(&kxen_app::core::paths::sessions_dir(), &sid) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Err(error) = state.pending_messages.clear(&sid) {
+                        tracing::warn!(session = sid, %error, "orphan pending queue cleanup failed");
+                    }
                     continue;
                 }
-            };
+                Err(error) => {
+                    tracing::error!(session = sid, %error, "session metadata unavailable; pending queue preserved");
+                    state.bus.publish(kxen_app::core::event::Event::notify(
+                        format!("会话元数据不可用，待处理消息已保留：{error}"),
+                        Some(sid.clone()),
+                    ));
+                    continue;
+                }
+            }
+            let (q, cancel) =
+                match super::run_slot::claim_queued_run(&state.active_runs, &kxen_app::core::paths::sessions_dir(), &sid, || {
+                    state.pending_messages.claim(&sid)
+                }) {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::error!(session = sid, %error, "pending queue run claim failed during restore");
+                        super::queue_retry::schedule_retry(app.clone(), sid.clone());
+                        continue;
+                    }
+                };
             let stream_id = super::protocol::stream_id("run");
-            tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
+            super::llm_task::spawn_claimed_run(
+                super::llm_task::RunInput {
+                    stream_id,
+                    session_id: sid,
+                    text: q.text,
+                    context: q.context,
+                    images: q.images,
+                    queue_delivery_id: Some(q.id),
+                    queue_created_at: Some(q.created_at),
+                    schedule_job_id: q.schedule_job_id,
+                    app: app.clone(),
+                },
+                cancel,
+            );
         }
     });
 }
 
-/// P0-2b 续跑触发：teammate -> lead 报告入队且无活跃 run 时弹队首起 run。
-/// spawn 前一刻复核 active_runs：入队与本回调之间用户消息恰好起 run 时让位
-///（该 run 收尾 pop 会消化队列），不并发起第二个 run（并发 run 交叉写 JSONL 历史）。
+fn report_session_recovery(state: &AppState) {
+    let sessions = kxen_app::core::paths::sessions_dir();
+    for session in kxen_app::core::session::list(&sessions) {
+        let diagnostic = match kxen_app::core::session::inspect_storage(&sessions, &session.id) {
+            Ok(report)
+                if report.blocked.is_some() || !matches!(&report.messages, kxen_app::core::session::MessageIntegrity::Healthy { .. }) =>
+            {
+                serde_json::to_string(&report).unwrap_or_else(|_| "storage recovery required".into())
+            }
+            Ok(_) => continue,
+            Err(error) => error,
+        };
+        tracing::error!(session = session.id, %diagnostic, "session storage recovery required");
+        state.bus.publish(kxen_app::core::event::Event::notify(
+            format!("会话存储需要恢复检查，已阻止不安全写入：{diagnostic}"),
+            Some(session.id),
+        ));
+    }
+}
+
+/// P0-2b 续跑触发：delivery claim 与 run lease 原子完成；落败 kick 不接触 in_flight。
 pub(crate) fn kick_session(app: AppHandle, sid: String) {
     tauri::async_runtime::spawn(async move {
         let state = app.state::<Arc<AppState>>();
-        if kxen_app::core::shared::lock(&state.active_runs).contains_key(&sid) {
-            return;
-        }
-        let q = match state.pending_messages.claim(&sid) {
-            Ok(Some(queue)) => queue,
-            Ok(None) => return,
+        let (q, cancel) = match super::run_slot::claim_queued_run(&state.active_runs, &kxen_app::core::paths::sessions_dir(), &sid, || {
+            state.pending_messages.claim(&sid)
+        }) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                let active = kxen_app::core::shared::lock(&state.active_runs).contains_key(&sid);
+                if !active && !state.pending_messages.has_queued(&sid) {
+                    super::queue_retry::reset_retry(&sid);
+                }
+                return;
+            }
             Err(error) => {
-                tracing::error!(session = sid, %error, "pending queue claim failed");
+                tracing::error!(session = sid, %error, "pending queue run claim failed");
+                super::queue_retry::schedule_retry(app.clone(), sid.clone());
                 return;
             }
         };
         let stream_id = super::protocol::stream_id("run");
-        tokio::spawn(super::llm_task::run_llm(stream_id, sid, q.text, q.context, q.images, Some(q.id), app.clone()));
+        super::llm_task::spawn_claimed_run(
+            super::llm_task::RunInput {
+                stream_id,
+                session_id: sid,
+                text: q.text,
+                context: q.context,
+                images: q.images,
+                queue_delivery_id: Some(q.id),
+                queue_created_at: Some(q.created_at),
+                schedule_job_id: q.schedule_job_id,
+                app: app.clone(),
+            },
+            cancel,
+        );
     });
 }
 
@@ -61,7 +134,7 @@ pub(crate) fn wire_team_kick(app: &AppHandle) {
 }
 
 /// background late 通知的续跑触发接线：notify.close 的 late 闭包入队后拉活，
-/// 与 team kick 同一判活 / 同一 spawn 口（kick_session 复核 active_runs，不并发起第二个 run）
+/// 与 team kick 共用原子 queue/run admission。
 pub(crate) fn wire_background_kick(app: &AppHandle) {
     let handle = app.clone();
     kxen_app::agent::background::set_late_kick(move |sid| kick_session(handle.clone(), sid));

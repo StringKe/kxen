@@ -13,6 +13,8 @@ fn parse_chat_answer(body: &str, engine: &str) -> Result<EngineResult, String> {
         choices: Vec<Choice>,
         #[serde(default)]
         citations: Vec<String>,
+        #[serde(default)]
+        usage: Option<ChatUsage>,
     }
     #[derive(serde::Deserialize)]
     struct Choice {
@@ -22,7 +24,13 @@ fn parse_chat_answer(body: &str, engine: &str) -> Result<EngineResult, String> {
     struct Msg {
         content: String,
     }
+    #[derive(serde::Deserialize)]
+    struct ChatUsage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    }
     let resp: Resp = serde_json::from_str(body).map_err(|e| format!("bad {engine} json: {e}"))?;
+    let usage = resp.usage.map(|usage| crate::llm::managed::TokenUsage { input: usage.prompt_tokens, output: usage.completion_tokens });
     let answer = resp.choices.into_iter().next().map(|c| c.message.content).filter(|c| !c.is_empty());
     let hits = resp
         .citations
@@ -32,7 +40,7 @@ fn parse_chat_answer(body: &str, engine: &str) -> Result<EngineResult, String> {
             SearchHit { title, url, snippet: String::new() }
         })
         .collect();
-    Ok(EngineResult { hits, answer })
+    Ok(EngineResult { hits, answer, usage })
 }
 
 fn chat_body(query: &str, model: &str, extra: serde_json::Value) -> serde_json::Value {
@@ -93,6 +101,8 @@ fn parse_responses_answer(body: &str) -> Result<EngineResult, String> {
     #[derive(serde::Deserialize)]
     struct Resp {
         output: Vec<Item>,
+        #[serde(default)]
+        usage: Option<ResponsesUsage>,
     }
     #[derive(serde::Deserialize)]
     struct Item {
@@ -118,6 +128,11 @@ fn parse_responses_answer(body: &str) -> Result<EngineResult, String> {
         #[serde(default)]
         title: String,
     }
+    #[derive(serde::Deserialize)]
+    struct ResponsesUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+    }
     let resp: Resp = serde_json::from_str(body).map_err(|e| format!("bad openai responses json: {e}"))?;
     let mut answer = String::new();
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -139,7 +154,8 @@ fn parse_responses_answer(body: &str) -> Result<EngineResult, String> {
             }
         }
     }
-    Ok(EngineResult { hits, answer: if answer.is_empty() { None } else { Some(answer) } })
+    let usage = resp.usage.map(|usage| crate::llm::managed::TokenUsage { input: usage.input_tokens, output: usage.output_tokens });
+    Ok(EngineResult { hits, answer: if answer.is_empty() { None } else { Some(answer) }, usage })
 }
 
 /// Anthropic web_search_20250305 服务端工具：text 块的 citations + web_search_tool_result
@@ -172,6 +188,9 @@ pub fn anthropic_native<'a>(query: &'a str, store: &'a AuthStore, _cfg: &'a Sear
 
 fn parse_anthropic_answer(body: &str) -> Result<EngineResult, String> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("bad anthropic json: {e}"))?;
+    let usage = v.get("usage").and_then(|usage| {
+        Some(crate::llm::managed::TokenUsage { input: usage.get("input_tokens")?.as_u64()?, output: usage.get("output_tokens")?.as_u64()? })
+    });
     let mut answer = String::new();
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut push_hit = |url: &str, title: &str| {
@@ -206,7 +225,7 @@ fn parse_anthropic_answer(body: &str) -> Result<EngineResult, String> {
             _ => {}
         }
     }
-    Ok(EngineResult { hits, answer: if answer.is_empty() { None } else { Some(answer) } })
+    Ok(EngineResult { hits, answer: if answer.is_empty() { None } else { Some(answer) }, usage })
 }
 
 #[cfg(test)]
@@ -217,13 +236,15 @@ mod tests {
     fn parses_answer_with_citations() {
         let body = r#"{
             "choices": [{"message": {"content": "Rust 1.96 已发布。"}}],
-            "citations": ["https://blog.rust-lang.org/1", "https://doc.rust-lang.org/2"]
+            "citations": ["https://blog.rust-lang.org/1", "https://doc.rust-lang.org/2"],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7}
         }"#;
         let r = parse_chat_answer(body, "perplexity").expect("chat json");
         assert_eq!(r.answer.as_deref(), Some("Rust 1.96 已发布。"));
         assert_eq!(r.hits.len(), 2);
         assert_eq!(r.hits[0].title, "blog.rust-lang.org", "引用标题取 host");
         assert_eq!(r.hits[0].url, "https://blog.rust-lang.org/1");
+        assert_eq!(r.usage, Some(crate::llm::managed::TokenUsage { input: 12, output: 7 }));
     }
 
     #[test]
@@ -254,12 +275,14 @@ mod tests {
                         {"type": "url_citation", "url": "https://b.com", "title": ""}
                     ]}
                 ]}
-            ]
+            ],
+            "usage": {"input_tokens": 18, "output_tokens": 9}
         }"#;
         let r = parse_responses_answer(body).expect("responses json");
         assert_eq!(r.answer.as_deref(), Some("答案第一段"));
         assert_eq!(r.hits.len(), 2, "同 url 去重");
         assert_eq!(r.hits[0].title, "A");
+        assert_eq!(r.usage, Some(crate::llm::managed::TokenUsage { input: 18, output: 9 }));
     }
 
     #[test]
@@ -275,11 +298,13 @@ mod tests {
                     {"type": "web_search_result_citation", "url": "https://b.com", "title": "B"},
                     {"type": "web_search_result_citation", "url": "https://c.com", "title": "C"}
                 ]}
-            ]
+            ],
+            "usage": {"input_tokens": 21, "output_tokens": 11}
         }"#;
         let r = parse_anthropic_answer(body).expect("anthropic json");
         assert_eq!(r.answer.as_deref(), Some("综合答案"));
         assert_eq!(r.hits.len(), 3, "tool_result 与 citations 合并去重");
         assert_eq!(r.hits[2].url, "https://c.com");
+        assert_eq!(r.usage, Some(crate::llm::managed::TokenUsage { input: 21, output: 11 }));
     }
 }

@@ -55,7 +55,14 @@ impl LeadRelay {
     pub fn deliver(&self, session_id: &str, note: String) -> LeadPath {
         let router = lock(&self.routers).get(session_id).cloned();
         if let Some(r) = router {
-            return if r.notify(note) { LeadPath::Notify } else { LeadPath::Pending };
+            return match r.notify(note) {
+                Ok(crate::agent::background::NotifyPath::ActiveRun) => LeadPath::Notify,
+                Ok(crate::agent::background::NotifyPath::Late) => LeadPath::Pending,
+                Err(error) => {
+                    tracing::error!(session = session_id, %error, "teammate report notification delivery failed");
+                    LeadPath::Inbox
+                }
+            };
         }
         match &self.pending {
             Some(p) => match p.enqueue(session_id, note, vec![], vec![]) {
@@ -82,6 +89,7 @@ mod tests {
     fn relay_with_pending(tag: &str) -> (LeadRelay, Arc<PendingQueues>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("kxen-relay-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        super::super::types::seed_test_session(&dir, "s1", std::path::Path::new("/tmp"));
         let pending = Arc::new(PendingQueues::new(dir.clone()));
         (LeadRelay::new(Some(pending.clone())), pending, dir)
     }
@@ -134,10 +142,25 @@ mod tests {
         relay.register("s1", &router);
         let late_got = Arc::new(Mutex::new(Vec::<String>::new()));
         let late2 = late_got.clone();
-        router.close(Arc::new(move |text| late2.lock().unwrap().push(text)));
+        router
+            .close(Arc::new(move |notice| {
+                late2.lock().unwrap().push(notice.text);
+                Ok(())
+            }))
+            .unwrap();
         // run 收尾已切 late、注册未摘的竞态窗口：归 Pending（通知已入 late 通道，不得再走 inbox）
         assert_eq!(relay.deliver("s1", "[teammate w] done".into()), LeadPath::Pending);
         assert_eq!(late_got.lock().unwrap().as_slice(), &["[teammate w] done".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_late_delivery_returns_inbox_fallback() {
+        let relay = LeadRelay::new(None);
+        let router = Arc::new(NotifyRouter::new());
+        relay.register("s1", &router);
+        router.close(Arc::new(|_| Err("disk unavailable".into()))).unwrap();
+
+        assert_eq!(relay.deliver("s1", "must survive".into()), LeadPath::Inbox);
     }
 }

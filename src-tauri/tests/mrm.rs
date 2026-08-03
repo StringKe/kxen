@@ -1,4 +1,4 @@
-// mrm 调度测试：原子 acquire / provider 级总池 / 账号轮转。
+// mrm 调度测试：per-request acquire / provider 级总池 / 账号轮转。
 use kxen_app::auth::credential::{AuthStore, CredentialKind};
 use kxen_app::core::config::{Config, Limits, ProviderLimit, RoleBinding};
 use kxen_app::llm::mrm::ModelResourceManager;
@@ -53,7 +53,7 @@ async fn resolve_and_degrade() {
     assert_eq!(r.provider, "anthropic");
     assert!(r.degraded_from.is_none());
 
-    let slot = mrm.acquire("anthropic", None).await;
+    let slot = mrm.acquire_slot("anthropic").await;
     let r2 = mrm.resolve("thinking", &store()).await.unwrap();
     assert_eq!(r2.provider, "xai");
     assert_eq!(r2.degraded_from.as_deref(), Some("thinking"));
@@ -62,13 +62,29 @@ async fn resolve_and_degrade() {
 
 #[tokio::test]
 async fn unbound_role_falls_back_to_execution() {
-    let mrm = ModelResourceManager::new(config_with(
-        &[("thinking", "anthropic", "claude", None), ("execution", "xai", "grok", None), ("planning", "xai", "grok", None)],
-        &[("anthropic", Some(1), None)],
+    let mut config = config_with(
+        &[("execution", "xai", "grok", None), ("planning", "anthropic", "claude", None)],
+        &[("xai", Some(1), None), ("anthropic", Some(1), None)],
         2,
-    ));
+    );
+    config.roles.get_mut("execution").unwrap().fallback = Some("planning".into());
+    let mrm = ModelResourceManager::new(config);
     let r = mrm.resolve("observer", &store()).await.expect("observer 应回落 execution");
     assert_eq!(r.provider, "xai");
+    assert_eq!(r.degraded_from.as_deref(), Some("observer"));
+
+    let held = mrm.acquire_slot("xai").await;
+    let fallback = mrm.resolve("observer", &store()).await.expect("execution 满载后应继续展开其 fallback");
+    assert_eq!(fallback.provider, "anthropic");
+    assert_eq!(fallback.degraded_from.as_deref(), Some("observer"));
+    drop(held);
+}
+
+#[tokio::test]
+async fn empty_provider_is_rejected_without_pool_deadlock() {
+    let mrm = ModelResourceManager::new(config_with(&[], &[], 1));
+    let error = mrm.begin_call("", None).await.err().expect("empty provider must fail validation");
+    assert!(error.contains("provider must not be empty"));
 }
 
 #[tokio::test]
@@ -83,7 +99,7 @@ async fn multi_account_rotation_and_pin() {
     store.insert("xai".into(), CredentialKind::Api { key: "k0".into(), region: None });
     store.insert("xai:b".into(), CredentialKind::Api { key: "k1".into(), region: None });
 
-    let slot = mrm.acquire("xai", None).await; // 默认账号 RPM 窗记满（rpm=1）
+    let slot = mrm.begin_call("xai", None).await.expect("begin default account").start(); // 默认账号 RPM 窗记满（rpm=1）
     let r = mrm.resolve("execution", &store).await.unwrap();
     assert_eq!(r.account.as_deref(), Some("b"));
     assert_eq!(r.slot_key(), "xai:b");
@@ -101,10 +117,10 @@ async fn multi_account_rotation_and_pin() {
 async fn acquire_blocks_at_limit() {
     let mrm =
         Arc::new(ModelResourceManager::new(config_with(&[("thinking", "anthropic", "claude", None)], &[("anthropic", Some(1), None)], 2)));
-    let s1 = mrm.acquire("anthropic", None).await;
+    let s1 = mrm.acquire_slot("anthropic").await;
     assert!(!mrm.available("anthropic").await);
     let mrm2 = mrm.clone();
-    let handle = tokio::spawn(async move { mrm2.acquire("anthropic", None).await });
+    let handle = tokio::spawn(async move { mrm2.acquire_slot("anthropic").await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!handle.is_finished());
     drop(s1);
@@ -115,9 +131,9 @@ async fn acquire_blocks_at_limit() {
 async fn provider_cap_shared_across_accounts() {
     // provider 总上限：同 provider 两个账号共享一个并发池（limit 1 时第二账号一样排队）
     let mrm = Arc::new(ModelResourceManager::new(config_with(&[], &[("xai", Some(1), None)], 8)));
-    let s1 = mrm.acquire("xai", None).await;
+    let s1 = mrm.acquire_slot("xai").await;
     let mrm2 = mrm.clone();
-    let handle = tokio::spawn(async move { mrm2.acquire("xai", Some("b")).await });
+    let handle = tokio::spawn(async move { mrm2.acquire_slot("xai").await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!handle.is_finished(), "同 provider 账号 b 不应绕过总池上限");
     drop(s1);
@@ -125,43 +141,24 @@ async fn provider_cap_shared_across_accounts() {
 }
 
 #[tokio::test]
-async fn acquire_role_is_atomic_and_mutually_exclusive() {
-    // 4 路并发抢同一角色链：anthropic/xai 各 limit 1 -> 恰好 1 anthropic + 1 xai + 2 None
-    let mrm = Arc::new(ModelResourceManager::new(config_with(
-        &[("thinking", "anthropic", "claude", None), ("planning", "xai", "grok", None)],
-        &[("anthropic", Some(1), None), ("xai", Some(1), None)],
-        8,
-    )));
-    let mut handles = Vec::new();
-    for _ in 0..4 {
-        let m = mrm.clone();
-        handles.push(tokio::spawn(async move { m.acquire_role("thinking", &AuthStore::new()).await }));
-    }
-    let mut grants = Vec::new();
-    for h in handles {
-        grants.push(h.await.unwrap());
-    }
-    let count = |p: &str| grants.iter().filter(|g| g.as_ref().is_some_and(|g| g.resolved.provider == p)).count();
-    assert_eq!(count("anthropic"), 1, "选择即占槽：同 provider 不会超发");
-    assert_eq!(count("xai"), 1);
-    assert_eq!(grants.iter().filter(|g| g.is_none()).count(), 2);
-    // 降级证据：占不到 thinking 的 grant 落在 planning 上
-    let degraded = grants.iter().flatten().find(|g| g.resolved.provider == "xai").unwrap();
-    assert_eq!(degraded.resolved.degraded_from.as_deref(), Some("thinking"));
-    // 释放后立即可再占（guard RAII）
-    drop(grants);
-    let g = mrm.acquire_role("thinking", &AuthStore::new()).await.unwrap();
-    assert_eq!(g.resolved.provider, "anthropic");
+async fn custom_provider_name_keeps_its_full_limit_key() {
+    let mrm = ModelResourceManager::new(config_with(&[("execution", "custom:lab", "model", None)], &[("custom:lab", Some(1), Some(1))], 8));
+
+    let slot = mrm.begin_call("custom:lab", None).await.expect("begin custom provider").start();
+
+    assert!(!mrm.available("custom:lab").await, "custom provider concurrency must use the full provider id");
+    assert!(mrm.rpm_blocked("custom:lab").await, "custom provider RPM must use the full provider id");
+    drop(slot);
 }
 
 #[tokio::test]
 async fn retry_rotation_releases_old_slot() {
     // run.rs 重试姿势：先 drop 旧账号槽再占新账号（同 provider 总池 limit 1）
     let mrm = Arc::new(ModelResourceManager::new(config_with(&[], &[("xai", Some(1), Some(10))], 8)));
-    let slot = mrm.acquire("xai", None).await;
+    let slot = mrm.acquire_slot("xai").await;
     // 对照：不 drop 直接占，新账号也被总池卡住
     let mrm2 = mrm.clone();
-    let handle = tokio::spawn(async move { mrm2.acquire("xai", Some("b")).await });
+    let handle = tokio::spawn(async move { mrm2.acquire_slot("xai").await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!handle.is_finished());
     drop(slot); // 释放旧槽 -> 等待方立即拿到（无泄漏、无双重持有）
@@ -175,9 +172,9 @@ async fn rotate_account_skips_rpm_full_windows() {
     let mut store = store();
     store.insert("xai".into(), CredentialKind::Api { key: "k0".into(), region: None });
     store.insert("xai:b".into(), CredentialKind::Api { key: "k1".into(), region: None });
-    let s1 = mrm.acquire("xai", None).await; // 默认账号 RPM 窗记满
+    let s1 = mrm.begin_call("xai", None).await.expect("begin default account").start(); // 默认账号 RPM 窗记满
     assert_eq!(mrm.rotate_account("xai", &store, None).await.as_deref(), Some("b"));
-    let s2 = mrm.acquire("xai", Some("b")).await; // b 窗也记满
+    let s2 = mrm.begin_call("xai", Some("b")).await.expect("begin account b").start(); // b 窗也记满
     assert_eq!(mrm.rotate_account("xai", &store, Some("b")).await, None);
     drop((s1, s2));
 }

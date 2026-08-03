@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::core::config::{ProviderLimit, RoleBinding};
+use std::time::Duration;
 
 fn config(limit: ProviderLimit) -> Config {
     let mut config = Config::default();
@@ -16,15 +17,14 @@ fn config(limit: ProviderLimit) -> Config {
 async fn in_flight_slot_survives_rebuild() {
     let cfg = || config(ProviderLimit { concurrent: Some(1), ..Default::default() });
     let mrm = ModelResourceManager::new(cfg());
-    let store = crate::auth::credential::AuthStore::default();
-    let grant = mrm.acquire_role("execution", &store).await.expect("首次必须占槽成功");
+    let slot = mrm.acquire_slot("p").await;
 
     let rebuilt = mrm.reconfigured(cfg());
     assert!(!rebuilt.available("p").await, "旧实例在飞槽位仍计入并发上限");
-    assert!(rebuilt.acquire_role("execution", &store).await.is_none(), "超限不得放行");
+    assert!(tokio::time::timeout(Duration::from_millis(20), rebuilt.acquire_slot("p")).await.is_err(), "超限不得放行");
 
-    drop(grant);
-    assert!(rebuilt.acquire_role("execution", &store).await.is_some(), "旧槽位释放后恢复放行");
+    drop(slot);
+    assert!(tokio::time::timeout(Duration::from_secs(1), rebuilt.acquire_slot("p")).await.is_ok(), "旧槽位释放后恢复放行");
 }
 
 /// 熔断状态跨重建保留：熔断中改配置（重建）不得复位熔断计数。
@@ -45,12 +45,12 @@ async fn rpm_window_and_history_survive_rebuild() {
     let cfg = || config(ProviderLimit { rpm: Some(1), concurrent: Some(4), ..Default::default() });
     let mrm = ModelResourceManager::new(cfg());
     let store = crate::auth::credential::AuthStore::default();
-    let grant = mrm.acquire_role("execution", &store).await.expect("首次派发记 RPM");
-    drop(grant);
+    assert!(mrm.resolve("execution", &store).await.is_some(), "首次角色解析成功并记录派发历史");
+    drop(mrm.begin_call("p", None).await.expect("begin request").start());
 
     let rebuilt = mrm.reconfigured(cfg());
     assert!(rebuilt.rpm_blocked("p").await, "RPM 滑窗跨重建保留");
-    assert!(rebuilt.acquire_role("execution", &store).await.is_none(), "RPM 满窗不放行");
+    assert!(rebuilt.resolve("execution", &store).await.is_none(), "RPM 满窗不解析为可派发候选");
     assert_eq!(rebuilt.history().await.len(), 1, "派发历史跨重建保留");
 }
 
@@ -58,14 +58,13 @@ async fn rpm_window_and_history_survive_rebuild() {
 #[tokio::test]
 async fn lowered_concurrency_limit_takes_effect_on_rebuild() {
     let mrm = ModelResourceManager::new(config(ProviderLimit { concurrent: Some(2), ..Default::default() }));
-    let store = crate::auth::credential::AuthStore::default();
-    let g1 = mrm.acquire_role("execution", &store).await.expect("首次必须占槽成功");
-    let g2 = mrm.acquire_role("execution", &store).await.expect("限额 2 第二槽必须成功");
+    let g1 = mrm.acquire_slot("p").await;
+    let g2 = mrm.acquire_slot("p").await;
 
     let lowered = mrm.reconfigured(config(ProviderLimit { concurrent: Some(1), ..Default::default() }));
     assert!(!lowered.available("p").await, "在飞 2 槽 > 新限额 1，闸门立即按新限额判定");
     drop(g1);
-    assert!(lowered.acquire_role("execution", &store).await.is_none(), "仍有 1 槽在飞，新限额下不得放行");
+    assert!(tokio::time::timeout(Duration::from_millis(20), lowered.acquire_slot("p")).await.is_err(), "仍有 1 槽在飞，新限额下不得放行");
     drop(g2);
     assert!(lowered.available("p").await, "释放到限额以下恢复放行");
 
@@ -77,12 +76,46 @@ async fn lowered_concurrency_limit_takes_effect_on_rebuild() {
 #[tokio::test]
 async fn raised_concurrency_limit_takes_effect_on_rebuild() {
     let mrm = ModelResourceManager::new(config(ProviderLimit { concurrent: Some(1), ..Default::default() }));
-    let store = crate::auth::credential::AuthStore::default();
-    let _g1 = mrm.acquire_role("execution", &store).await.expect("首次必须占槽成功");
+    let _g1 = mrm.acquire_slot("p").await;
 
     let raised = mrm.reconfigured(config(ProviderLimit { concurrent: Some(3), ..Default::default() }));
-    let g2 = raised.acquire_role("execution", &store).await.expect("调高到 3 后第二槽必须立即放行");
-    let g3 = raised.acquire_role("execution", &store).await.expect("第三槽必须放行");
-    assert!(raised.acquire_role("execution", &store).await.is_none(), "第四槽超新限额不放行");
+    let g2 = raised.acquire_slot("p").await;
+    let g3 = raised.acquire_slot("p").await;
+    assert!(!raised.available("p").await, "第四槽超新限额不放行");
     drop((g2, g3));
+}
+
+/// 已经排队的旧句柄也必须观察热更后的上限；只让新建 MRM 看见配置会把后台
+/// Agent 永久卡在旧容量上。
+#[tokio::test]
+async fn queued_old_handle_observes_raised_limit() {
+    let mrm = Arc::new(ModelResourceManager::new(config(ProviderLimit { concurrent: Some(1), ..Default::default() })));
+    let held = mrm.acquire_slot("p").await;
+    let queued_mrm = mrm.clone();
+    let mut queued = tokio::spawn(async move { queued_mrm.acquire_slot("p").await });
+    tokio::task::yield_now().await;
+
+    let _rebuilt = mrm.reconfigured(config(ProviderLimit { concurrent: Some(2), ..Default::default() }));
+
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut queued).await.is_ok(), "热更调高应主动唤醒旧句柄 waiter");
+    drop(held);
+}
+
+/// 未开始真实请求的 RPM reservation 被取消时必须立即叫醒后继请求，不能让它
+/// 继续睡到 60 秒滑窗自然过期。
+#[tokio::test]
+async fn cancelled_rpm_reservation_wakes_waiter() {
+    let mrm = Arc::new(ModelResourceManager::new(config(ProviderLimit { rpm: Some(1), concurrent: Some(2), ..Default::default() })));
+    let reserved = mrm.begin_call("p", None).await.expect("reserve first request");
+    let queued_mrm = mrm.clone();
+    let mut queued = tokio::spawn(async move { queued_mrm.begin_call("p", None).await });
+    tokio::task::yield_now().await;
+
+    drop(reserved);
+
+    let next = tokio::time::timeout(Duration::from_millis(50), &mut queued)
+        .await
+        .expect("rollback must wake the RPM waiter")
+        .expect("waiter task");
+    drop(next.expect("second reservation"));
 }

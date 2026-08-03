@@ -40,6 +40,28 @@ fn model_roundtrip_and_legacy_compat() {
 }
 
 #[test]
+fn assistant_actual_model_roundtrip_and_legacy_message_compat() {
+    let dir = tmp_dir("message-model");
+    let session = ses::create(&dir, "/tmp/work").unwrap();
+    let mut assistant = ses::new_message(&session.id, ses::Role::Assistant, vec![ses::Part::Text { text: "fallback answer".into() }]);
+    assistant.model = Some(ModelRef::with_account("anthropic", "claude-sonnet-4-6", "work"));
+    ses::append_message(&dir, &assistant).unwrap();
+
+    let loaded = ses::load_messages(&dir, &session.id);
+    assert_eq!(loaded[0].model, assistant.model, "actual routed model must survive the JSONL roundtrip");
+
+    let legacy = format!(
+        r#"{{"id":"msg_legacy","session_id":"{}","role":"assistant","parts":[{{"type":"text","text":"old"}}],"created_at":1}}"#,
+        session.id
+    );
+    std::fs::write(dir.join(format!("{}.jsonl", session.id)), format!("{legacy}\n")).unwrap();
+    let loaded = ses::load_messages(&dir, &session.id);
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].model.is_none(), "old JSONL without model must remain readable");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn fork_inherits_model_override() {
     let dir = tmp_dir("fork");
     let s = ses::create(&dir, "/tmp/work").unwrap();

@@ -2,6 +2,7 @@
 //! worktree 放 `<repo>/.kxen/worktrees/<name>`（自动把 .kxen/ 写进 .gitignore），分支 `kxen/<name>`。
 
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -211,7 +212,7 @@ pub async fn status(repo: &Path) -> Result<Vec<StatusEntry>, String> {
 /// 单文件 diff（未暂存）；未跟踪文件走 --no-index 合成 new-file diff。
 pub async fn diff_file(repo: &Path, path: &str) -> Result<String, String> {
     let repo = &canon(repo);
-    let diff = git(repo, &["diff", "--", path]).await.unwrap_or_default();
+    let diff = git(repo, &["diff", "--", path]).await?;
     if !diff.trim().is_empty() {
         return Ok(diff);
     }
@@ -234,8 +235,15 @@ pub fn resolve_in_workspace(path: &str, workspace: &Path, grants: &std::collecti
 
 /// .kxen/ 进 .gitignore（幂等）。fs_tool 的覆盖备份也落在 .kxen/ 下，共用此入口。
 pub(crate) fn ensure_gitignore(repo: &Path) -> Result<(), String> {
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let _guard = crate::core::shared::lock(&WRITE_LOCK);
     let path = repo.join(".gitignore");
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
     if content.lines().any(|l| l.trim() == ".kxen/") {
         return Ok(());
     }
@@ -244,7 +252,31 @@ pub(crate) fn ensure_gitignore(repo: &Path) -> Result<(), String> {
         new.push('\n');
     }
     new.push_str(".kxen/\n");
-    std::fs::write(&path, new).map_err(|e| e.to_string())
+    let id = TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = repo.join(format!(".gitignore.kxen-{}-{id}.tmp", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|error| format!("open {}: {error}", tmp.display()))?;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            std::fs::set_permissions(&tmp, metadata.permissions()).map_err(|error| format!("chmod {}: {error}", tmp.display()))?;
+        }
+        file.write_all(new.as_bytes()).map_err(|error| format!("write {}: {error}", tmp.display()))?;
+        file.sync_all().map_err(|error| format!("sync {}: {error}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, &path).map_err(|error| format!("replace {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(repo)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {}: {error}", repo.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
 }
 
 /// .kxen/backups/ 数量上限：超出清最旧（mtime 升序），覆盖备份不无界增长。
