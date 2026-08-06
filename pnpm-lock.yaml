@@ -217,8 +217,8 @@ importers:
         specifier: 1.0.0-beta.6
         version: 1.0.0-beta.6(@pierre/theme@2.0.0)(@shikijs/themes@4.3.1)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(shiki@4.3.1)
       '@solidjs/router':
-        specifier: ^0.16.3
-        version: 0.16.3(solid-js@1.9.14)
+        specifier: ^1.0.0
+        version: 1.0.0(solid-js@1.9.14)
       '@tauri-apps/api':
         specifier: ^2.9.0
         version: 2.11.1
@@ -918,8 +918,8 @@ packages:
   '@shikijs/vscode-textmate@10.0.2':
     resolution: {integrity: sha512-83yeghZ2xxin3Nj8z1NMd/NCuca+gsYXswywDy5bHvwlWL8tpTQmzGeUuHd9FC3E/SBEMvzJRwWEOz5gGes9Qg==}
 
-  '@solidjs/router@0.16.3':
-    resolution: {integrity: sha512-WWQkmSmSpl+15HgUktGPbeXkgWmonj4XwPOcZVHJz1EQV3dz5qWHIyQ/BKXFevor6u/0dKvC9FlUmKmDwE1QHw==}
+  '@solidjs/router@1.0.0':
+    resolution: {integrity: sha512-cCSk1hvgCowiMa9bzzYWHiLu1U4E22+DfJe6/rOwAyECKrxc3jrd5QnoW3sDDJtW+e077cz/M67bPl3DqOBw1Q==}
     peerDependencies:
       solid-js: ^1.8.6
 
@@ -3254,7 +3254,7 @@ snapshots:
 
   '@shikijs/vscode-textmate@10.0.2': {}
 
-  '@solidjs/router@0.16.3(solid-js@1.9.14)':
+  '@solidjs/router@1.0.0(solid-js@1.9.14)':
     dependencies:
       solid-js: 1.9.14
 
