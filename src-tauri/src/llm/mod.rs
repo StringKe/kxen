@@ -5,6 +5,8 @@ pub mod anthropic;
 pub mod anthropic_sse;
 pub mod catalog;
 pub mod client;
+pub mod gemini;
+pub mod kiro;
 pub mod managed;
 pub mod models;
 pub mod mrm;

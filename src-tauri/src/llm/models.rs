@@ -92,6 +92,49 @@ pub async fn fetch_models(
     }
 }
 
+/// 不落盘探测：添加自定义 provider 前用候选凭证拉模型清单（保存前预览）。
+/// base_url/protocol 的合法性由调用方（RPC 层）先行校验。
+pub async fn probe_custom_models(base_url: &str, api_key: &str, protocol: &str, timeout_s: u64) -> ModelsOutcome {
+    let suffix = if protocol == "anthropic" { "v1/models" } else { "models" };
+    let url = match crate::core::net_security::join_base_endpoint(base_url, suffix) {
+        Ok(url) => url,
+        Err(error) => return ModelsOutcome { models: vec![], source: "error".into(), detail: error },
+    };
+    let anthropic = protocol == "anthropic";
+    let mut req = crate::llm::client::shared_http_for_url(&url).get(&url).timeout(std::time::Duration::from_secs(timeout_s));
+    req = if anthropic { req.header("x-api-key", api_key).header("anthropic-version", "2023-06-01") } else { req.bearer_auth(api_key) };
+    let secrets = [api_key];
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = match crate::net_response::json(resp, crate::net_response::JSON_BODY_LIMIT, "model catalog").await
+            {
+                Ok(v) => v,
+                Err(e) => return ModelsOutcome { models: vec![], source: "error".into(), detail: format!("响应解析失败: {e}") },
+            };
+            let models = body
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| arr.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if models.is_empty() {
+                ModelsOutcome { models, source: "error".into(), detail: "清单为空（端点不兼容）".into() }
+            } else {
+                ModelsOutcome { models, source: "endpoint".into(), detail: String::new() }
+            }
+        }
+        Ok(resp) => ModelsOutcome {
+            models: vec![],
+            source: "error".into(),
+            detail: crate::llm::client::bounded_http_error("custom", resp, secrets.as_slice()).await,
+        },
+        Err(error) => ModelsOutcome {
+            models: vec![],
+            source: "error".into(),
+            detail: format!("请求失败: {}", crate::core::net_security::sanitize_authenticated_error(&error, secrets.as_slice())),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

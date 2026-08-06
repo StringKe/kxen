@@ -4,9 +4,13 @@
 
 pub mod consent;
 pub mod credential;
+pub mod oauth_login;
 pub mod probe;
 pub mod refresh;
 pub mod shared_store;
+
+/// AWS SSO OIDC 共享契约（Kiro 登录/refresh 的端点与动态客户端注册）。
+pub(crate) mod aws_sso;
 
 pub use credential::{Credential, CredentialKind};
 pub use probe::{ProbeOutcome, ProbeRule, probe_all};

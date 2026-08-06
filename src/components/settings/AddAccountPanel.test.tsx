@@ -46,6 +46,7 @@ const P = (key: string, auth: ProviderInfo["auth"]): ProviderInfo => ({
   models_endpoint: true,
   default_model: "m1",
   doc_url: "https://example.com/docs",
+  oauth_login: false,
 });
 
 const REGISTRY = [

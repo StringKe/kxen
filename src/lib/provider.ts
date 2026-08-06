@@ -13,6 +13,8 @@ export interface ProviderInfo {
   display: string;
   protocol: "anthropic" | "openai_compat";
   auth: "api_key" | "oauth" | "local_free";
+  /** 应用内 OAuth 登录可用（openrouter 是 api_key 认证但支持 OAuth 换 key）。 */
+  oauth_login: boolean;
   regions: RegionInfo[];
   models_endpoint: boolean;
   default_model: string;
@@ -64,6 +66,48 @@ export interface ModelsResult {
 
 export function providerModels(provider: string, account?: string): Promise<ModelsResult> {
   return client.rpc("provider.models", account ? { provider, account } : { provider });
+}
+
+/** oauth_begin 返回的登录会话：code = 浏览器授权码流；device = 设备码流。 */
+export interface OAuthBeginResult {
+  session: string;
+  flow: "code" | "device";
+  authorize_url?: string; // flow=code：后端已尝试拉起浏览器，前端展示链接兜底
+  manual_paste?: boolean; // flow=code 且支持手贴授权码（如 anthropic）
+  verification_url?: string; // flow=device
+  user_code?: string; // flow=device，如 "ABCD-EFGH"
+  interval?: number; // device 轮询间隔秒
+  expires_in?: number; // device code 有效期秒
+}
+
+export function oauthBegin(provider: string, account: string): Promise<OAuthBeginResult> {
+  return client.rpc("provider.oauth_begin", { provider, account });
+}
+
+export type OAuthWaitResult =
+  | { status: "pending" }
+  | { status: "done"; id: string }
+  | { status: "failed"; error: string };
+
+/** manual_code 仅在 manual_paste=true 时由用户粘贴授权码后提交一次。 */
+export function oauthWait(session: string, manualCode?: string): Promise<OAuthWaitResult> {
+  return client.rpc("provider.oauth_wait", {
+    session,
+    ...(manualCode ? { manual_code: manualCode } : {}),
+  });
+}
+
+export function oauthCancel(session: string): Promise<{ cancelled: boolean }> {
+  return client.rpc("provider.oauth_cancel", { session });
+}
+
+/** 探测自定义端点的模型清单（不落盘）。 */
+export function probeModels(
+  baseUrl: string,
+  apiKey: string,
+  protocol: "openai" | "anthropic",
+): Promise<{ models: string[] }> {
+  return client.rpc("provider.probe_models", { base_url: baseUrl, api_key: apiKey, protocol });
 }
 
 export interface AccountInfo {

@@ -62,7 +62,7 @@ async fn mcp_auth(params: &Value, app: &AppHandle) -> Result<Value, String> {
 
 /// 开浏览器：macOS 用 `open`（app 仅 Apple Silicon，零新依赖，不引 webbrowser crate）；
 /// 失败返回 false，调用方把 URL 给前端展示供手动复制。
-fn open_browser(url: &str) -> bool {
+pub(super) fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open").arg(url).spawn();
     #[cfg(not(target_os = "macos"))]

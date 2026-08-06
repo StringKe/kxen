@@ -2,7 +2,7 @@
 //! 路由 = 两个订阅特例（anthropic/openai 的 OAuth 形态）+ custom: 用户端点 + providers registry（其余全部）。
 
 use crate::llm::types::{Delta, Message, ModelRef};
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
 /// LLM 流式调用签名：run 主循环的注入缝（AgentContext::stream_override）。
@@ -82,6 +82,58 @@ impl LlmClient {
         }
     }
 
+    /// Google Code Assist 订阅（gemini-cli / Antigravity 凭证）：先 discover_project（带缓存）再流式；发现失败给明确错误。
+    fn stream_google_oauth(
+        model: &ModelRef,
+        messages: &[Message],
+        tools: &[crate::llm::tool::ToolDefinition],
+        store: &crate::auth::credential::AuthStore,
+    ) -> Pin<Box<dyn Stream<Item = Delta> + Send>> {
+        let provider = model.provider.clone();
+        let flavor = crate::llm::gemini::Flavor::for_provider(&provider);
+        let cred = crate::auth::credential::credential_for(store, &provider, model.account.as_deref()).cloned();
+        let model_name = model.model.clone();
+        let messages_owned = messages.to_vec();
+        let tools_owned = tools.to_vec();
+        let start = async move {
+            let Some(cred) = cred else { return Err(format!("{provider} credential missing (run doctor)")) };
+            let token = cred.bearer().to_string();
+            let http = shared_http();
+            let project = crate::llm::gemini::discover_project(&http, crate::llm::gemini::DEFAULT_BASE, &token, flavor).await?;
+            Ok(crate::llm::gemini::GeminiProvider::new(crate::llm::gemini::DEFAULT_BASE.to_string(), token, project)
+                .with_flavor(flavor)
+                .stream_chat_with_tools(&model_name, &messages_owned, &tools_owned))
+        };
+        Box::pin(futures::stream::once(start).flat_map(|result: Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, String>| match result {
+            Ok(stream) => stream,
+            Err(error) => Box::pin(futures::stream::once(async move { Delta::Error(error) })),
+        }))
+    }
+
+    /// MiniMax 订阅（全球/中国）：Anthropic 兼容端点 + Bearer（不带 OAuth beta 头，对方会拒）。
+    fn stream_minimax_oauth(
+        model: &ModelRef,
+        messages: &[Message],
+        tools: &[crate::llm::tool::ToolDefinition],
+        store: &crate::auth::credential::AuthStore,
+    ) -> Pin<Box<dyn Stream<Item = Delta> + Send>> {
+        let provider = model.provider.as_str();
+        let Some(spec) = crate::providers::find(provider) else {
+            let provider = provider.to_string();
+            return Box::pin(futures::stream::once(async move { Delta::Error(format!("unknown provider: {provider}")) }));
+        };
+        let Some(cred) = crate::auth::credential::credential_for(store, provider, model.account.as_deref()) else {
+            let label = spec.key;
+            return Box::pin(futures::stream::once(async move { Delta::Error(format!("{label} credential missing (run doctor)")) }));
+        };
+        let url = spec.chat_url(cred.region());
+        crate::llm::anthropic::AnthropicProvider::bearer_custom(url, cred.bearer().to_string(), spec.key).stream_chat(
+            &model.model,
+            messages,
+            tools,
+        )
+    }
+
     fn stream_with_tools(
         model: &ModelRef,
         messages: &[Message],
@@ -110,6 +162,9 @@ impl LlmClient {
                 }
                 _ => Box::pin(futures::stream::once(async { Delta::Error("openai credential missing (run doctor)".into()) })),
             },
+            "google-oauth" | "google-antigravity" => Self::stream_google_oauth(model, messages, tools, store),
+            "minimax-oauth" | "minimax-cn-oauth" => Self::stream_minimax_oauth(model, messages, tools, store),
+            "kiro" => crate::llm::kiro::stream(model, messages, tools, store),
             other if other.starts_with("custom:") => {
                 // 自定义类型提供商：config.toml 给端点+协议，auth.json 给 key（custom:<name>）
                 let name = other[7..].to_string();
@@ -155,7 +210,22 @@ impl LlmClient {
                     }
                 };
                 let url = spec.chat_url(cred.and_then(|c| c.region()));
-                crate::llm::xai::XaiProvider::custom(url, bearer).stream_chat_with_tools(&model.model, messages, tools)
+                // 厂商私有头：copilot 缺 Editor-* 系列会被拒；qwen 订阅需声明 oauth 身份
+                let extra_headers: &[(&str, &str)] = match p {
+                    "github-copilot" => &[
+                        ("User-Agent", "GitHubCopilotChat/0.35.0"),
+                        ("Editor-Version", "vscode/1.107.0"),
+                        ("Editor-Plugin-Version", "copilot-chat/0.35.0"),
+                        ("Copilot-Integration-Id", "vscode-chat"),
+                    ],
+                    "qwen-oauth" => &[("X-DashScope-AuthType", "qwen-oauth")],
+                    _ => &[],
+                };
+                crate::llm::xai::XaiProvider::custom(url, bearer).with_extra_headers(extra_headers).stream_chat_with_tools(
+                    &model.model,
+                    messages,
+                    tools,
+                )
             }
         }
     }

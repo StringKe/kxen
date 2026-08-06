@@ -43,12 +43,22 @@ pub(super) fn unmap_tool_name(name: &str) -> String {
     .to_string()
 }
 
+/// 认证形态：OAuth 契约（identity 行 + beta 头 + claude-cli UA）、x-api-key 直连（自定义端点）、
+/// Bearer 直连（MiniMax 订阅 Anthropic 兼容端点：不带 OAuth beta 头，对方会拒）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireAuth {
+    Oauth,
+    ApiKey,
+    Bearer,
+}
+
 pub struct AnthropicProvider {
     url: std::borrow::Cow<'static, str>,
     http: reqwest::Client,
     bearer: crate::core::shared::SharedStr,
-    /// true = OAuth 契约（identity 行 + beta 头 + claude-cli UA）；false = api-key 直连（自定义端点）
-    oauth: bool,
+    auth: WireAuth,
+    /// 错误串前缀（minimax-oauth 走本实现时错误须带自身 provider 名）。
+    label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -190,14 +200,27 @@ impl AnthropicProvider {
             url: API_URL.into(),
             http: crate::llm::client::shared_http(),
             bearer: crate::core::shared::SharedStr::from(bearer.into()),
-            oauth: true,
+            auth: WireAuth::Oauth,
+            label: "anthropic",
         }
     }
 
     /// 自定义 anthropic 兼容端点：x-api-key 直连，无 OAuth 契约要素。
     pub fn custom(base_url: String, api_key: impl Into<String>) -> Self {
         let http = crate::llm::client::shared_http_for_url(&base_url);
-        Self { url: base_url.into(), http, bearer: crate::core::shared::SharedStr::from(api_key.into()), oauth: false }
+        Self {
+            url: base_url.into(),
+            http,
+            bearer: crate::core::shared::SharedStr::from(api_key.into()),
+            auth: WireAuth::ApiKey,
+            label: "anthropic",
+        }
+    }
+
+    /// Bearer 直连的 anthropic 兼容端点（MiniMax 订阅）：无 identity 行 / beta 头 / claude-cli UA。
+    pub fn bearer_custom(base_url: String, token: impl Into<String>, label: &'static str) -> Self {
+        let http = crate::llm::client::shared_http_for_url(&base_url);
+        Self { url: base_url.into(), http, bearer: crate::core::shared::SharedStr::from(token.into()), auth: WireAuth::Bearer, label }
     }
 
     pub fn stream_chat(
@@ -209,16 +232,17 @@ impl AnthropicProvider {
         let bearer = self.bearer.clone();
         let error_bearer = bearer.clone();
         let url = self.url.clone();
-        let oauth = self.oauth;
+        let auth = self.auth;
+        let label = self.label;
         let model = model.to_string();
         let messages_owned: Vec<Message> = messages.to_vec();
         let tools_owned: Vec<crate::llm::tool::ToolDefinition> = tools.to_vec();
         let http = self.http.clone();
 
         let start = async move {
-            // OAuth contract: 系统块第一行固定身份行，用户 system 追加在后；api-key 直连不注入
+            // OAuth contract: 系统块第一行固定身份行，用户 system 追加在后；api-key/Bearer 直连不注入
             let mut system: Vec<SystemBlock> = Vec::new();
-            if oauth {
+            if auth == WireAuth::Oauth {
                 system.push(SystemBlock { kind: "text", text: IDENTITY_LINE, cache_control: None });
             }
             system.extend(system_blocks_of(messages_owned.iter().filter(|m| m.role == Role::System).map(|m| m.content.as_str())));
@@ -239,14 +263,14 @@ impl AnthropicProvider {
             };
             let req = MessagesRequest { model: &model, max_tokens: 8192, system, messages: api_messages, stream: true, tools: tools_api };
             let mut builder = http.post(url.as_ref());
-            if oauth {
-                builder = builder
+            builder = match auth {
+                WireAuth::Oauth => builder
                     .header("authorization", format!("Bearer {bearer}"))
                     .header("anthropic-beta", OAUTH_BETA)
-                    .header("user-agent", USER_AGENT);
-            } else {
-                builder = builder.header("x-api-key", bearer.as_ref());
-            }
+                    .header("user-agent", USER_AGENT),
+                WireAuth::ApiKey => builder.header("x-api-key", bearer.as_ref()),
+                WireAuth::Bearer => builder.header("authorization", format!("Bearer {bearer}")),
+            };
             builder.header("anthropic-version", "2023-06-01").header("content-type", "application/json").json(&req).send().await
         };
 
@@ -255,7 +279,7 @@ impl AnthropicProvider {
             Ok(resp) => {
                 let error_bearer = error_bearer.clone();
                 futures::stream::once(async move {
-                    Delta::Error(crate::llm::client::bounded_http_error("anthropic", resp, &[error_bearer.as_ref()]).await)
+                    Delta::Error(crate::llm::client::bounded_http_error(label, resp, &[error_bearer.as_ref()]).await)
                 })
                 .boxed()
             }
@@ -263,7 +287,7 @@ impl AnthropicProvider {
                 let error_bearer = error_bearer.clone();
                 futures::stream::once(async move {
                     Delta::Error(format!(
-                        "anthropic request failed: {}",
+                        "{label} request failed: {}",
                         crate::core::net_security::sanitize_authenticated_error(&error, &[error_bearer.as_ref()])
                     ))
                 })
@@ -274,67 +298,7 @@ impl AnthropicProvider {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::types::AssistantToolCall;
-
-    #[test]
-    fn tool_remap_roundtrip() {
-        assert_eq!(remap_tool_name("exec"), "Bash");
-        assert_eq!(unmap_tool_name("Bash"), "exec");
-        assert_eq!(unmap_tool_name("custom_tool"), "custom_tool");
-    }
-
-    #[test]
-    fn system_blocks_split_at_cache_boundary() {
-        let text = format!("frozen part\n\n{}\n\ndynamic part", crate::agent::prompt::CACHE_BOUNDARY);
-        let blocks = system_blocks_of([text.as_str()].into_iter());
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].text, "frozen part");
-        assert!(blocks[0].cache_control.is_some(), "frozen 块必须打 ephemeral 断点");
-        assert_eq!(blocks[1].text, "dynamic part");
-        assert!(blocks[1].cache_control.is_none());
-    }
-
-    #[test]
-    fn system_blocks_without_boundary_stay_plain() {
-        let blocks = system_blocks_of(["no marker here"].into_iter());
-        assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].cache_control.is_none());
-    }
-
-    #[test]
-    fn assistant_tool_calls_become_tool_use_blocks() {
-        let m = Message::assistant_with_tools("看下目录", vec![AssistantToolCall::function("toolu_1", "exec", "{\"command\":\"ls\"}")]);
-        let v = assistant_content(&m);
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[1]["type"], "tool_use");
-        assert_eq!(arr[1]["name"], "Bash");
-        assert_eq!(arr[1]["input"]["command"], "ls");
-    }
-
-    #[test]
-    fn consecutive_tool_results_merge_into_one_user() {
-        let msgs = vec![
-            Message::assistant_with_tools(
-                "",
-                vec![AssistantToolCall::function("toolu_1", "exec", "{}"), AssistantToolCall::function("toolu_2", "read", "{}")],
-            ),
-            Message::tool_result("toolu_1", "exec", "out1"),
-            Message::tool_result("toolu_2", "read", "out2"),
-            Message::user("继续"),
-        ];
-        let api = api_messages_of(&msgs);
-        assert_eq!(api.len(), 3);
-        assert_eq!(api[1].role, "user");
-        let blocks = api[1].content.as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[0]["tool_use_id"], "toolu_1");
-        assert_eq!(blocks[1]["tool_use_id"], "toolu_2");
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod wire_tests;

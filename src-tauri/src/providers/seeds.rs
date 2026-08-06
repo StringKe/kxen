@@ -29,6 +29,36 @@ pub const XAI: &[StaticModel] = &[
 pub const KIMI_CODING: &[StaticModel] =
     &[m("k3", "Kimi K3", 1_048_576, true, false), m("kimi-for-coding", "Kimi K2.7 Code", 262_144, true, true)];
 
+pub const GITHUB_COPILOT: &[StaticModel] = &[
+    m("gpt-4.1", "GPT-4.1 (Copilot)", 1_047_576, false, true),
+    m("gpt-4o", "GPT-4o (Copilot)", 128_000, false, true),
+    m("claude-sonnet-4", "Claude Sonnet 4 (Copilot)", 200_000, true, true),
+];
+
+pub const QWEN_OAUTH: &[StaticModel] = &[
+    m("qwen3-coder-plus", "Qwen3 Coder Plus", 1_000_000, true, true),
+    m("qwen3-coder-flash", "Qwen3 Coder Flash", 1_000_000, true, false),
+];
+
+pub const GOOGLE_OAUTH: &[StaticModel] = &[
+    m("gemini-2.5-pro", "Gemini 2.5 Pro (订阅)", 1_048_576, true, true),
+    m("gemini-2.5-flash", "Gemini 2.5 Flash (订阅)", 1_048_576, true, true),
+    m("gemini-3-pro-preview", "Gemini 3 Pro Preview (订阅)", 1_048_576, true, true),
+    m("gemini-3-flash-preview", "Gemini 3 Flash Preview (订阅)", 1_048_576, true, true),
+];
+
+pub const MINIMAX_OAUTH: &[StaticModel] = &[
+    m("MiniMax-M2.7", "MiniMax M2.7", 1_000_000, true, false),
+    m("MiniMax-M2.7-highspeed", "MiniMax M2.7 Highspeed", 1_000_000, true, false),
+];
+
+// Kiro 模型 id 以 9router providers/registry/kiro.js 实证为准（kiro.dev/docs/models）
+pub const KIRO: &[StaticModel] = &[
+    m("claude-sonnet-4.5", "Claude Sonnet 4.5 (Kiro)", 200_000, true, true),
+    m("claude-sonnet-4", "Claude Sonnet 4 (Kiro)", 200_000, true, true),
+    m("claude-opus-4.5", "Claude Opus 4.5 (Kiro)", 200_000, true, true),
+];
+
 pub const OPENROUTER: &[StaticModel] = &[
     m("anthropic/claude-opus-4.8", "Claude Opus 4.8 (OpenRouter)", 1_000_000, true, true),
     m("openai/gpt-5.4", "GPT-5.4 (OpenRouter)", 1_050_000, true, true),
@@ -165,4 +195,62 @@ pub const NOVITA: &[StaticModel] = &[
     m("deepseek/deepseek-v3.1", "DeepSeek V3.1 (Novita)", 131_072, false, false),
     m("zai-org/glm-5", "GLM 5 (Novita)", 202_800, true, false),
     m("google/gemma-3-27b-it", "Gemma 3 27B (Novita)", 98_304, false, true),
+];
+
+pub const ZHIPU_CODING: &[StaticModel] = &[
+    m("glm-5.2", "GLM-5.2 (Coding Plan)", 202_800, true, true),
+    m("glm-5.2-highspeed", "GLM-5.2 Highspeed (Coding Plan)", 202_800, true, true),
+    m("glm-5-turbo", "GLM-5 Turbo (Coding Plan)", 202_800, true, true),
+    m("glm-4.7", "GLM-4.7 (Coding Plan)", 204_800, true, true),
+];
+
+pub const QWEN_CODING: &[StaticModel] = &[
+    m("qwen3-coder-plus", "Qwen3 Coder Plus (Coding Plan)", 1_000_000, true, true),
+    m("qwen3-coder-flash", "Qwen3 Coder Flash (Coding Plan)", 1_000_000, true, false),
+    m("qwen3-max", "Qwen3 Max (Coding Plan)", 262_144, false, false),
+];
+
+// 方舟 Coding Plan 独立模型目录：ark-code-latest 为官方 Auto 调度入口
+pub const DOUBAO_CODING: &[StaticModel] = &[
+    m("ark-code-latest", "Ark Code (Coding Plan)", 262_144, true, true),
+    m("doubao-seed-2.0-code", "Doubao Seed 2.0 Code", 262_144, true, true),
+    m("glm-4.7", "GLM-4.7 (Ark Coding)", 204_800, true, true),
+    m("deepseek-v3.2", "DeepSeek V3.2 (Ark Coding)", 164_000, true, false),
+    m("kimi-k2.5", "Kimi K2.5 (Ark Coding)", 262_144, true, false),
+];
+
+pub const QIANFAN_CODING: &[StaticModel] = &[
+    m("qianfan-code-latest", "Qianfan Code (Coding Plan)", 262_144, true, true),
+    m("glm-4.7", "GLM-4.7 (千帆 Coding)", 204_800, true, true),
+    m("deepseek-v3.2", "DeepSeek V3.2 (千帆 Coding)", 164_000, true, false),
+    m("kimi-k2.5", "Kimi K2.5 (千帆 Coding)", 262_144, true, false),
+];
+
+pub const HUNYUAN_CODING: &[StaticModel] = &[
+    m("tc-code-latest", "TC Code (Coding Plan)", 262_144, true, true),
+    m("hunyuan-turbos", "Hunyuan TurboS (Coding Plan)", 262_144, true, false),
+    m("hunyuan-2.0-thinking", "Hunyuan 2.0 Thinking (Coding Plan)", 262_144, true, false),
+];
+
+pub const STEPFUN_PLAN: &[StaticModel] = &[
+    m("step-3.5-flash", "Step 3.5 Flash (Step Plan)", 256_000, true, false),
+    m("step-3.7-flash", "Step 3.7 Flash (Step Plan)", 256_000, true, true),
+];
+
+pub const HUGGINGFACE: &[StaticModel] = &[
+    m("deepseek-ai/DeepSeek-V3.2", "DeepSeek V3.2 (HF)", 164_000, true, false),
+    m("zai-org/GLM-5", "GLM-5 (HF)", 202_800, true, false),
+    m("meta-llama/Llama-3.3-70B-Instruct", "Llama 3.3 70B (HF)", 131_072, false, false),
+];
+
+pub const VERCEL: &[StaticModel] = &[
+    m("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6 (Vercel)", 1_000_000, true, true),
+    m("openai/gpt-5.4", "GPT-5.4 (Vercel)", 1_050_000, true, true),
+    m("google/gemini-2.5-pro", "Gemini 2.5 Pro (Vercel)", 1_048_576, true, true),
+];
+
+pub const OLLAMA_CLOUD: &[StaticModel] = &[
+    m("kimi-k2.5", "Kimi K2.5 (Ollama Cloud)", 262_144, true, false),
+    m("glm-5.1", "GLM-5.1 (Ollama Cloud)", 202_800, true, false),
+    m("deepseek-v4-flash", "DeepSeek V4 Flash (Ollama Cloud)", 1_000_000, true, false),
 ];

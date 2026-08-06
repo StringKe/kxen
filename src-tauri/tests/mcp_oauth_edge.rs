@@ -27,7 +27,9 @@ async fn discovery_falls_back_to_8414() {
 async fn callback_exact_path_code_state_then_404() {
     let (listener, port) = oauth_flow::bind_callback(None).await.unwrap();
     let task =
-        tokio::spawn(async move { oauth_flow::wait_callback(&listener, "/callback/abc", "s1", std::time::Duration::from_secs(5)).await });
+        tokio::spawn(
+            async move { oauth_flow::wait_callback(&listener, "/callback/abc", Some("s1"), std::time::Duration::from_secs(5)).await },
+        );
     // 错 path：404 且继续等
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.write_all(b"GET /wrong HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
@@ -50,10 +52,9 @@ async fn callback_exact_path_code_state_then_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn callback_error_params_and_timeout() {
     let (listener, port) = oauth_flow::bind_callback(None).await.unwrap();
-    let task =
-        tokio::spawn(
-            async move { oauth_flow::wait_callback(&listener, "/callback/abc", "expected", std::time::Duration::from_secs(5)).await },
-        );
+    let task = tokio::spawn(async move {
+        oauth_flow::wait_callback(&listener, "/callback/abc", Some("expected"), std::time::Duration::from_secs(5)).await
+    });
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.write_all(b"GET /callback/abc?error=access_denied&error_description=nope&state=expected HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();
     let cb = task.await.unwrap().unwrap();
@@ -62,17 +63,17 @@ async fn callback_error_params_and_timeout() {
     assert!(cb.code.is_none());
 
     let (listener, _) = oauth_flow::bind_callback(None).await.unwrap();
-    let err = oauth_flow::wait_callback(&listener, "/callback/abc", "expected", std::time::Duration::from_millis(50)).await.unwrap_err();
+    let err =
+        oauth_flow::wait_callback(&listener, "/callback/abc", Some("expected"), std::time::Duration::from_millis(50)).await.unwrap_err();
     assert!(err.contains("超时"), "短超时必须报超时: {err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forged_state_and_oversized_request_do_not_consume_real_callback() {
     let (listener, port) = oauth_flow::bind_callback(None).await.unwrap();
-    let task =
-        tokio::spawn(
-            async move { oauth_flow::wait_callback(&listener, "/callback/abc", "fresh", std::time::Duration::from_secs(5)).await },
-        );
+    let task = tokio::spawn(async move {
+        oauth_flow::wait_callback(&listener, "/callback/abc", Some("fresh"), std::time::Duration::from_secs(5)).await
+    });
 
     let mut forged = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     forged.write_all(b"GET /callback/abc?code=stale&state=stale HTTP/1.1\r\nhost: x\r\n\r\n").unwrap();

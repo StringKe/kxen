@@ -16,6 +16,7 @@ const KIMI: ProviderInfo = {
   models_endpoint: true,
   default_model: "kimi-k2.5",
   doc_url: "https://platform.moonshot.cn/docs",
+  oauth_login: false,
 };
 
 const KIMI_WORK: AccountInfo = {

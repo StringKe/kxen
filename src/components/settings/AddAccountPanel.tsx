@@ -1,17 +1,18 @@
 // 添加账号面板：registry 驱动三类入口；表单状态在 add-account-form.ts，卸载不清半填内容。
+// OAuth tab 主操作是应用内登录（OAuthLogin），手贴凭证收进「高级」折叠区（ManualTokenForm）。
 import { createSignal, For, onMount, Show } from "solid-js";
 import {
   addCustomProvider,
-  importAccount,
+  probeModels,
   providerList,
-  providerVerify,
   type ProviderInfo,
 } from "../../lib/provider";
 import { flashErr } from "../../lib/flash";
-import { formatError } from "../../lib/error-text";
 import { errText } from "../err-text";
 import { createSeqGuard } from "../../lib/async-guard";
 import ProviderRegistryStatus from "./ProviderRegistryStatus";
+import OAuthLogin from "./OAuthLogin";
+import ManualTokenForm from "./ManualTokenForm";
 import {
   ACCOUNT_NAME_BAD,
   baseUrl,
@@ -19,7 +20,6 @@ import {
   kind,
   models,
   name,
-  parseAccountToken,
   protocol,
   provider,
   region,
@@ -41,7 +41,8 @@ const KINDS: { id: AccountKind; label: string; detail: string }[] = [
   {
     id: "oauth",
     label: "订阅 OAuth",
-    detail: "Claude/ChatGPT/Grok/Kimi 订阅（OAuth JSON 或 access token）",
+    detail:
+      "Claude / ChatGPT / Gemini / Grok / Kimi / Qwen / MiniMax / OpenRouter 订阅（应用内授权登录）",
   },
   {
     id: "apikey",
@@ -58,13 +59,16 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
   const [providerError, setProviderError] = createSignal("");
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(false);
-  const [testing, setTesting] = createSignal(false);
-  const [testMsg, setTestMsg] = createSignal<{ ok: boolean; text: string } | null>(null);
+  const [probing, setProbing] = createSignal(false);
+  const [probeMsg, setProbeMsg] = createSignal<{ ok: boolean; text: string } | null>(null);
   const providerGuard = createSeqGuard();
 
-  // oauth/api key 分别只列对应厂商；local_free 无凭证概念，不进入账号面板。
+  // oauth tab 列订阅厂商 + 支持应用内 OAuth 登录的 api_key 厂商（如 openrouter 换永久 key）；
+  // api key tab 只列手填 key 厂商；local_free 无凭证概念，不进入账号面板。
   const visible = () =>
-    providers().filter((p) => (kind() === "oauth" ? p.auth === "oauth" : p.auth === "api_key"));
+    providers().filter((p) =>
+      kind() === "oauth" ? p.auth === "oauth" || p.oauth_login : p.auth === "api_key",
+    );
 
   const loadProviders = async () => {
     const request = providerGuard.next();
@@ -95,44 +99,19 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
   const toggleCap = (c: string) =>
     setCaps((prev) => (prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]));
 
-  const checkName = (): boolean => {
-    if (!name().trim()) {
-      setError(kind() === "custom" ? "提供商名必填" : "账号名必填");
-      return false;
-    }
-    if (ACCOUNT_NAME_BAD.test(name().trim())) {
-      setError("名称不能含冒号或空白字符（会成为凭证键的一部分）");
-      return false;
-    }
-    return true;
-  };
-
-  // 候选凭证仅进后端内存克隆；custom 要落盘后再从列表实测。
-  const testConn = async () => {
-    const { access, refresh, expires } = parseAccountToken(kind(), token());
-    if (!access) {
-      setError("先填凭证再测试连接");
-      return;
-    }
-    setTesting(true);
+  // 探测自定义端点模型清单（不落盘），成功直接覆盖模型清单输入框
+  const probeEndpoint = async () => {
+    setProbing(true);
+    setProbeMsg(null);
     setError("");
-    setTestMsg(null);
     try {
-      const r = await providerVerify(provider(), undefined, {
-        access,
-        refresh,
-        expires,
-        kind: kind() === "apikey" ? "api" : "oauth",
-        region: chosenRegion(),
-      });
-      setTestMsg({
-        ok: r.ok,
-        text: r.ok ? `连接正常 ${(r.latency_ms / 1000).toFixed(1)}s` : formatError(r.detail),
-      });
+      const r = await probeModels(baseUrl().trim(), token().trim(), protocol());
+      setModels(r.models.join(", "));
+      setProbeMsg({ ok: true, text: `已拉取 ${r.models.length} 个模型` });
     } catch (e) {
-      setTestMsg({ ok: false, text: errText(e) });
+      setProbeMsg({ ok: false, text: errText(e) });
     } finally {
-      setTesting(false);
+      setProbing(false);
     }
   };
 
@@ -140,46 +119,32 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
     setBusy(true);
     setError("");
     try {
-      if (!checkName()) return;
-      if (kind() === "custom") {
-        const doneName = name().trim();
-        const list = models()
-          .split(/[,，\s]+/)
-          .filter(Boolean);
-        if (!baseUrl().trim() || list.length === 0 || !token().trim()) {
-          setError("base_url / 模型 / key 均必填");
-          return;
-        }
-        await addCustomProvider(
-          name().trim(),
-          baseUrl().trim(),
-          token().trim(),
-          list,
-          protocol(),
-          caps(),
-        );
-        resetAccountForm();
-        props.onDone(`自定义提供商 ${doneName} 已添加`);
+      if (!name().trim()) {
+        setError("提供商名必填");
         return;
       }
-      if (!token().trim()) {
-        setError("凭证必填");
+      if (ACCOUNT_NAME_BAD.test(name().trim())) {
+        setError("名称不能含冒号或空白字符（会成为凭证键的一部分）");
         return;
       }
-      const { access, refresh, expires } = parseAccountToken(kind(), token());
-      await importAccount(
-        provider(),
+      const doneName = name().trim();
+      const list = models()
+        .split(/[,，\s]+/)
+        .filter(Boolean);
+      if (!baseUrl().trim() || list.length === 0 || !token().trim()) {
+        setError("base_url / 模型 / key 均必填");
+        return;
+      }
+      await addCustomProvider(
         name().trim(),
-        access,
-        kind() === "apikey" ? "api" : "oauth",
-        refresh,
-        expires,
-        chosenRegion(),
+        baseUrl().trim(),
+        token().trim(),
+        list,
+        protocol(),
+        caps(),
       );
-      const doneName = name();
-      const doneProvider = provider();
       resetAccountForm();
-      props.onDone(`账号 ${doneProvider}:${doneName} 已添加`);
+      props.onDone(`自定义提供商 ${doneName} 已添加`);
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -201,7 +166,6 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
               title={k.detail}
               onClick={() => {
                 setKind(k.id);
-                setTestMsg(null);
                 if (k.id !== "custom" && !visible().some((p) => p.key === provider())) {
                   setProvider(visible()[0]?.key ?? "");
                 }
@@ -248,22 +212,49 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
           </Show>
           <input
             class="flex-1 bg-transparent border border-[var(--border)] rounded px-2 py-1 text-xs"
-            placeholder="账号名（如 work / personal；不含冒号空格）"
+            placeholder={
+              kind() === "oauth"
+                ? "账号名（默认 default；不含冒号空格）"
+                : "账号名（如 work / personal；不含冒号空格）"
+            }
             value={name()}
             onInput={(e) => setName(e.currentTarget.value)}
           />
         </div>
-        <input
-          type="password"
-          class="form-mono"
-          placeholder={
-            kind() === "oauth"
-              ? "OAuth JSON（access_token/refresh_token/expires_at）或裸 access token"
-              : "sk-... API key"
-          }
-          value={token()}
-          onInput={(e) => setToken(e.currentTarget.value)}
-        />
+        <Show when={kind() === "apikey"}>
+          <ManualTokenForm ready={providerReady} region={chosenRegion} onDone={props.onDone} />
+        </Show>
+        <Show when={kind() === "oauth"}>
+          <Show when={provider() === "google-oauth" || provider() === "google-antigravity"}>
+            <div class="text-2xs text-[var(--warn)]">
+              Google
+              限制第三方客户端复用其登录凭证，使用订阅登录存在账号被限制的风险；在意风险请改用 API
+              Key 方式接入 Gemini。
+            </div>
+          </Show>
+          <Show when={provider() === "zhipu-coding"}>
+            <div class="text-2xs text-[var(--warn)]">
+              Z.AI 未开放第三方登录，该流程复用 ZCode 客户端契约，可能随官方调整失效；失败请改用 API
+              Key。
+            </div>
+          </Show>
+          <OAuthLogin
+            providerKey={provider}
+            ready={providerReady}
+            onDone={(msg) => {
+              resetAccountForm();
+              props.onDone(msg);
+            }}
+          />
+          <details class="rounded border border-[var(--border)] px-2 py-1.5">
+            <summary class="cursor-pointer text-2xs text-[var(--text-faint)]">
+              高级：手动粘贴凭证
+            </summary>
+            <div class="mt-2">
+              <ManualTokenForm ready={providerReady} region={chosenRegion} onDone={props.onDone} />
+            </div>
+          </details>
+        </Show>
       </Show>
 
       <Show when={kind() === "custom"}>
@@ -290,17 +281,34 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
           onInput={(e) => setBaseUrl(e.currentTarget.value)}
         />
         <input
-          class="form-mono"
-          placeholder="模型清单（逗号分隔，如 gpt-4o, claude-sonnet-4-5）"
-          value={models()}
-          onInput={(e) => setModels(e.currentTarget.value)}
-        />
-        <input
           type="password"
           class="form-mono"
           placeholder="api key（存本机 auth.json，0600）"
           value={token()}
           onInput={(e) => setToken(e.currentTarget.value)}
+        />
+        <div class="flex items-center gap-2">
+          <button
+            class="pressable px-3 py-1 rounded-md text-xs border border-[var(--border)] disabled:opacity-40"
+            disabled={probing() || !baseUrl().trim() || !token().trim()}
+            title="用当前 base_url / key 探测端点模型清单（不保存）"
+            onClick={() => void probeEndpoint()}
+          >
+            {probing() ? "探测中…" : "测试连接并拉取模型"}
+          </button>
+          <Show when={probeMsg()}>
+            {(m) => (
+              <span class={`text-xs ${m().ok ? "text-[var(--ok)]" : "text-[var(--err)]"}`}>
+                {m().text}
+              </span>
+            )}
+          </Show>
+        </div>
+        <input
+          class="form-mono"
+          placeholder="模型清单（逗号分隔，如 gpt-4o, claude-sonnet-4-5）"
+          value={models()}
+          onInput={(e) => setModels(e.currentTarget.value)}
         />
         <div class="flex items-center gap-3 text-xs text-[var(--text-dim)]">
           能力：
@@ -314,37 +322,19 @@ export default function AddAccountPanel(props: { onDone: (msg: string) => void }
           </For>
           <span class="text-2xs text-[var(--text-faint)]">audio 可用于语音转写引擎</span>
         </div>
-      </Show>
-
-      <Show when={error()}>
-        <div class="text-xs text-[var(--err)]">{error()}</div>
-      </Show>
-      <Show when={testMsg()}>
-        {(m) => (
-          <div class={`text-xs ${m().ok ? "text-[var(--ok)]" : "text-[var(--err)]"}`}>
-            {m().ok ? `测试连接：${m().text}` : `测试连接失败：${m().text}`}
-          </div>
-        )}
-      </Show>
-      <div class="flex gap-2">
-        <button
-          class="pressable px-3 py-1 rounded-md text-xs border border-[var(--border)] disabled:opacity-40"
-          disabled={busy() || testing() || !providerReady()}
-          onClick={() => void submit()}
-        >
-          {busy() ? "保存中…" : "保存"}
-        </button>
-        <Show when={kind() !== "custom"}>
+        <Show when={error()}>
+          <div class="text-xs text-[var(--err)]">{error()}</div>
+        </Show>
+        <div class="flex gap-2">
           <button
             class="pressable px-3 py-1 rounded-md text-xs border border-[var(--border)] disabled:opacity-40"
-            disabled={busy() || testing() || !providerReady()}
-            title="用候选凭证发一次真实最小调用（不保存凭证）"
-            onClick={() => void testConn()}
+            disabled={busy() || probing()}
+            onClick={() => void submit()}
           >
-            {testing() ? "测试中…" : "测试连接"}
+            {busy() ? "保存中…" : "保存"}
           </button>
-        </Show>
-      </div>
+        </div>
+      </Show>
     </div>
   );
 }

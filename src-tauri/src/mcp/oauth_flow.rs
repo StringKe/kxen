@@ -152,7 +152,7 @@ pub async fn prepare_login(cfg: &RemoteConfig, guard: Guard) -> Result<LoginSess
 
 /// 等回调 -> 验 state -> 换 token -> 落盘。state 不符直接拒（防 CSRF 混流）。
 pub async fn finish_login(session: &LoginSession, store: &TokenStore) -> Result<TokenGrant, String> {
-    let cb = wait_callback(&session.listener, &session.callback_path, &session.expected_state, CALLBACK_TIMEOUT).await?;
+    let cb = wait_callback(&session.listener, &session.callback_path, Some(&session.expected_state), CALLBACK_TIMEOUT).await?;
     if let Some(err) = cb.error {
         let desc = cb.error_description.unwrap_or_default();
         return Err(format!("oauth 授权被拒: {err} {desc}"));

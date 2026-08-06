@@ -12,6 +12,7 @@ pub struct XaiProvider {
     url: std::borrow::Cow<'static, str>,
     http: reqwest::Client,
     bearer: SharedStr,
+    extra_headers: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
@@ -97,7 +98,13 @@ impl XaiProvider {
     /// OpenAI 兼容端点（providers registry / 自定义类型提供商：完整 chat URL + bearer）。
     pub fn custom(base_url: String, bearer: impl Into<String>) -> Self {
         let http = crate::llm::client::shared_http_for_url(&base_url);
-        Self { url: base_url.into(), http, bearer: SharedStr::from(bearer.into()) }
+        Self { url: base_url.into(), http, bearer: SharedStr::from(bearer.into()), extra_headers: Vec::new() }
+    }
+
+    /// 厂商私有头（GitHub Copilot 的 Editor-* 系列、Qwen 的 X-DashScope-AuthType）。
+    pub fn with_extra_headers(mut self, headers: &[(&str, &str)]) -> Self {
+        self.extra_headers = headers.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
+        self
     }
 
     /// 流式调用：返回 Delta 的异步流（'static，不借 provider）。
@@ -115,11 +122,15 @@ impl XaiProvider {
         let http = self.http.clone();
 
         let self_url = self.url.clone();
+        let extra_headers = self.extra_headers.clone();
         let start = async move {
             let tools_opt = tools_owned.as_deref();
             let wire: Vec<WireMessage> = messages.iter().map(wire_message).collect();
-            http.post(self_url.as_ref())
-                .bearer_auth(bearer)
+            let mut request = http.post(self_url.as_ref()).bearer_auth(bearer);
+            for (key, value) in &extra_headers {
+                request = request.header(key, value);
+            }
+            request
                 .json(&ChatRequest {
                     model: &model,
                     messages: wire,

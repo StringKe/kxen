@@ -28,12 +28,12 @@ pub async fn bind_callback(port: Option<u16>) -> Result<(tokio::net::TcpListener
     Ok((listener, port))
 }
 
-/// 只有 path 与 OAuth state 同时匹配才消费回调。无效或慢速连接被逐个拒绝，
-/// 但不会夺走真实浏览器回调的等待机会。
+/// 只有 path 匹配才消费回调；expected_state 为 Some 时还要求 state 一致（OpenRouter 无 state 传 None）。
+/// 无效或慢速连接被逐个拒绝，但不会夺走真实浏览器回调的等待机会。
 pub async fn wait_callback(
     listener: &tokio::net::TcpListener,
     expected_path: &str,
-    expected_state: &str,
+    expected_state: Option<&str>,
     timeout: std::time::Duration,
 ) -> Result<CallbackParams, String> {
     let work = async {
@@ -63,7 +63,11 @@ pub async fn wait_callback(
                 continue;
             }
             let out = parse_params(&parsed);
-            if out.state.as_deref() != Some(expected_state) || (out.code.is_none() && out.error.is_none()) {
+            let state_ok = match expected_state {
+                Some(expected) => out.state.as_deref() == Some(expected),
+                None => true,
+            };
+            if !state_ok || (out.code.is_none() && out.error.is_none()) {
                 respond_empty(&mut socket, "400 Bad Request").await;
                 continue;
             }

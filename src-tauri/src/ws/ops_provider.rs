@@ -21,6 +21,10 @@ pub(super) const METHODS: &[&str] = &[
     "provider.accounts",
     "provider.models",
     "provider.list",
+    "provider.oauth_begin",
+    "provider.oauth_wait",
+    "provider.oauth_cancel",
+    "provider.probe_models",
     "models.catalog",
 ];
 
@@ -43,6 +47,8 @@ pub(super) async fn handle(method: &str, params: &Value, app: &AppHandle) -> Res
                         "models_endpoint": spec.models_endpoint,
                         "default_model": spec.default_model,
                         "doc_url": spec.doc_url,
+                        // 应用内 OAuth 登录可用性（openrouter 是 api_key 认证但支持 OAuth 换 key）
+                        "oauth_login": kxen_app::auth::oauth_login::spec_for(spec.key).is_some(),
                     })
                 })
                 .collect();
@@ -127,6 +133,53 @@ pub(super) async fn handle(method: &str, params: &Value, app: &AppHandle) -> Res
                 &kxen_app::core::paths::auth_file(),
                 &state.workspace_runtimes,
             )
+        }
+        "provider.oauth_begin" => {
+            let provider = params.get("provider").and_then(Value::as_str).ok_or("missing provider")?;
+            let account = params.get("account").and_then(Value::as_str).unwrap_or("default");
+            let state = app.state::<Arc<AppState>>();
+            let auth_store = Arc::clone(&state.auth_store);
+            let on_success: kxen_app::auth::oauth_login::OnSuccess = Arc::new(move |provider, account, credential| {
+                let key = kxen_app::auth::credential::account_id(provider, account);
+                let update = kxen_app::auth::credential::update_auth_file_committed(&kxen_app::core::paths::auth_file(), |disk| {
+                    disk.insert(key.clone(), credential.clone());
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
+                let (persisted, warning) = update.into_snapshot_and_warning();
+                *auth_store.lock().map_err(|error| error.to_string())? = persisted;
+                match warning {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            });
+            let info = kxen_app::auth::oauth_login::begin_login(provider, account, on_success).await?;
+            let mut payload = info.payload;
+            // 桌面端自动打开授权页（code = 授权 URL，device = 验证页）；失败由前端展示供手动复制
+            let target = payload.get("authorize_url").or_else(|| payload.get("verification_url")).and_then(Value::as_str);
+            if let Some(url) = target {
+                payload["opened"] = json!(super::ops_mcp::open_browser(url));
+            }
+            payload["session"] = json!(info.session);
+            Ok(payload)
+        }
+        "provider.oauth_wait" => {
+            let session = params.get("session").and_then(Value::as_str).ok_or("missing session")?;
+            let manual_code = params.get("manual_code").and_then(Value::as_str);
+            kxen_app::auth::oauth_login::await_login(session, manual_code)
+        }
+        "provider.oauth_cancel" => {
+            let session = params.get("session").and_then(Value::as_str).ok_or("missing session")?;
+            Ok(kxen_app::auth::oauth_login::cancel_login(session))
+        }
+        "provider.probe_models" => {
+            let base_url = params.get("base_url").and_then(Value::as_str).ok_or("missing base_url")?;
+            kxen_app::core::config::validate_custom_provider_endpoint(base_url).map_err(|error| format!("base_url {error}"))?;
+            let api_key = params.get("api_key").and_then(Value::as_str).ok_or("missing api_key")?;
+            let protocol = params.get("protocol").and_then(Value::as_str).unwrap_or("openai");
+            kxen_app::core::config::validate_custom_provider_auth(protocol, api_key)?;
+            let out = kxen_app::llm::models::probe_custom_models(base_url, api_key, protocol, 15).await;
+            Ok(json!({ "models": out.models, "source": out.source, "detail": out.detail }))
         }
         "provider.reprobe" => reprobe(app).await,
         other => Err(format!("unknown provider method: {other}")),
