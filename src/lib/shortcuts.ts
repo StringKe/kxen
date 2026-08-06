@@ -1,7 +1,8 @@
-// 全局快捷键（Cmd/Ctrl）：N 新会话 / W 关当前会话 / , 设置。Layout 挂载一次。
+// 全局快捷键（Cmd/Ctrl）：N 新会话 / W 关当前会话 / , 设置 / O 展开折叠全部工具详情。Layout 挂载一次。
 import { flash, flashErr, flashOk } from "./flash";
 import { formatError } from "./error-text";
 import { activeSessionId, deleteSession, newSession, navigate, sessions } from "./state";
+import { toggleExpandAllTools } from "./tool-ui";
 
 export function mountShortcuts(): () => void {
   const onKey = (e: KeyboardEvent) => {
@@ -15,6 +16,11 @@ export function mountShortcuts(): () => void {
     if (key === "w") {
       e.preventDefault();
       void closeCurrent();
+      return;
+    }
+    if (key === "o") {
+      e.preventDefault();
+      toggleExpandAllTools();
       return;
     }
     if (e.key === ",") {

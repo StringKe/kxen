@@ -45,8 +45,9 @@ vi.mock("../lib/client", () => ({
   },
 }));
 
-// Markdown / DockWorktree 与本测试无关（重依赖 + 自带 RPC），桩掉保持用例聚焦
-vi.mock("./Markdown", () => ({ default: () => null }));
+// ChangesTree / DiffView / DockWorktree 与本测试无关（重依赖 + 自带 RPC），桩掉保持用例聚焦
+vi.mock("./ChangesTree", () => ({ default: () => null }));
+vi.mock("./DiffView", () => ({ default: () => null }));
 vi.mock("./DockWorktree", () => ({ default: () => null }));
 
 import Dock from "./Dock";

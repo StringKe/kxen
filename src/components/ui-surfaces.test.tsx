@@ -248,6 +248,11 @@ describe("状态卡片", () => {
         document.body,
       );
       expect(document.body.textContent).toContain("shell");
+      // 默认折叠：payload 不在 DOM；展开后参数与结果可见（折叠语义细节见 ToolCard.test.tsx）
+      expect(document.body.textContent).not.toContain('{"cmd":"true"}');
+      document.body
+        .querySelector("summary")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       expect(document.body.textContent).toContain('{"cmd":"true"}');
       if (result) expect(document.body.textContent).toContain(result);
       dispose();

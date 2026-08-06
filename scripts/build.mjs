@@ -40,6 +40,11 @@ if (result.status !== 0) {
 const DEFAULT_RAW_LIMIT = 500_000;
 const MERMAID_PARSER_RAW_LIMIT = 700_000;
 const MERMAID_PARSER_GZIP_LIMIT = 150_000;
+// @pierre/diffs 的 shiki 语法包/引擎 chunk：按语言异步按需加载（diff 不含该语言则永不拉取），
+// TextMate grammar 与 Oniguruma wasm 天然体积大，对齐 mermaid 先例给独立预算。
+// 新语言包若超限会在构建期暴露，逐个评审后加名单，不放开通用上限
+const SHIKI_ON_DEMAND_RAW_LIMIT = 800_000;
+const SHIKI_ON_DEMAND_GZIP_LIMIT = 250_000;
 
 function files(directory) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -49,10 +54,17 @@ function files(directory) {
 }
 
 function budget(path) {
-  if (/^mermaid-parser-runtime[.-]/.test(basename(path))) {
+  const name = basename(path);
+  if (/^mermaid-parser-runtime[.-]/.test(name)) {
     return {
       raw: MERMAID_PARSER_RAW_LIMIT,
       gzip: MERMAID_PARSER_GZIP_LIMIT,
+    };
+  }
+  if (/^(emacs-lisp|cpp|wasm)[.-]/.test(name)) {
+    return {
+      raw: SHIKI_ON_DEMAND_RAW_LIMIT,
+      gzip: SHIKI_ON_DEMAND_GZIP_LIMIT,
     };
   }
   return { raw: DEFAULT_RAW_LIMIT };

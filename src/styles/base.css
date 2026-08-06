@@ -332,3 +332,20 @@ code {
   color: var(--text-faint);
   margin-bottom: 0.375rem;
 }
+
+/* @pierre/trees 主题对齐：树渲染在 shadow root 内，只读 --trees-theme-* 变量，映射到应用 tokens */
+.changes-tree {
+  --trees-theme-sidebar-bg: transparent;
+  --trees-theme-sidebar-fg: var(--text-dim);
+  --trees-theme-sidebar-border: var(--border);
+  --trees-theme-sidebar-header-fg: var(--text-faint);
+  --trees-theme-list-hover-bg: var(--bg-overlay);
+  --trees-theme-list-active-selection-bg: var(--bg-overlay);
+  --trees-theme-list-active-selection-fg: var(--text);
+  --trees-theme-focus-ring: var(--accent);
+  --trees-theme-git-added-fg: var(--ok);
+  --trees-theme-git-modified-fg: var(--warn);
+  --trees-theme-git-deleted-fg: var(--err);
+  --trees-theme-git-untracked-fg: var(--text-dim);
+  --trees-theme-git-renamed-fg: var(--accent-hover);
+}

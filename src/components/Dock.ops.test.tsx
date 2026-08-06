@@ -51,8 +51,23 @@ vi.mock("../lib/client", () => ({
   },
 }));
 
-// Markdown / DockWorktree 与本测试无关（重依赖 + 自带 RPC），桩掉保持用例聚焦
-vi.mock("./Markdown", () => ({ default: () => null }));
+// ChangesTree / DiffView / DockWorktree 与本测试无关（重依赖 + 自带 RPC），桩掉保持用例聚焦；
+// 树桩渲染路径与增删统计，保证「会话改动」分区的数据映射断言仍有效
+vi.mock("./ChangesTree", () => ({
+  default: (p: {
+    entries: () => { path: string; stats?: string | undefined }[];
+    onSelect: (path: string) => void;
+  }) => (
+    <div>
+      {p.entries().map((e) => (
+        <button onClick={() => p.onSelect(e.path)}>
+          {e.path} {e.stats}
+        </button>
+      ))}
+    </div>
+  ),
+}));
+vi.mock("./DiffView", () => ({ default: (p: { patch?: string }) => <pre>{p.patch}</pre> }));
 vi.mock("./DockWorktree", () => ({ default: () => null }));
 
 import Dock from "./Dock";

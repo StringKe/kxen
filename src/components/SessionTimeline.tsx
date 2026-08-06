@@ -1,9 +1,10 @@
-import { For, Show, type Accessor } from "solid-js";
+import { createMemo, For, Show, type Accessor } from "solid-js";
 import { ArrowDown } from "lucide-solid";
 import AgentRunCards from "./AgentRunCards";
 import EmptyHero from "./EmptyHero";
 import SessionItem from "./SessionItem";
 import type { Item, MsgItem } from "../lib/items";
+import { groupToolEntries, type TimelineEntry } from "../lib/tool-ui";
 
 export default function SessionTimeline(props: {
   items: Accessor<Item[]>;
@@ -25,23 +26,28 @@ export default function SessionTimeline(props: {
   onContinue: () => void;
   onRespondApproval: (id: string, allow: boolean) => Promise<void>;
 }) {
+  // 展示层聚合（探索类连续调用成团）：只影响渲染，items 原始序不变；
+  // live/编辑重发/重跑按原始 items 索引对齐，故用引用回查原始下标而非聚合后下标
+  const entries = createMemo(() => groupToolEntries(props.items()));
+  // 聚合包装不在原始 items 里（indexOf -1），但 msg 分支才会触达这些回调，不影响正确性
+  const rawIndex = (entry: TimelineEntry) => props.items().indexOf(entry as Item);
   return (
     <>
       <div ref={props.setListRef} class="flex-1 overflow-auto px-4 py-5" onScroll={props.onScroll}>
         <div class="w-full space-y-4">
-          <For each={props.items()}>
-            {(item, index) => (
+          <For each={entries()}>
+            {(entry) => (
               <SessionItem
-                item={item}
+                item={entry}
                 sessionId={props.sessionId}
                 streaming={props.streaming}
-                live={() => props.streaming() && index() === props.items().length - 1}
+                live={() => props.streaming() && props.items().at(-1) === entry}
                 onForkId={props.onForkId}
-                onEditResend={(text) => props.onEditResend(index(), text)}
+                onEditResend={(text) => props.onEditResend(rawIndex(entry), text)}
                 onRewindId={props.onRewindId}
                 onRetryItem={props.onRetryItem}
-                retrying={() => (item.kind === "msg" ? props.isRetrying(item) : false)}
-                onRerun={() => props.onRerun(index())}
+                retrying={() => (entry.kind === "msg" ? props.isRetrying(entry) : false)}
+                onRerun={() => props.onRerun(rawIndex(entry))}
                 onContinue={props.onContinue}
                 onImageLoad={() => props.scroll()}
                 onRespondApproval={props.onRespondApproval}

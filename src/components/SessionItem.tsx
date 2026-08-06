@@ -1,14 +1,16 @@
-// 时间线单条渲染分派：tool / approval / phase / compacted / user / assistant 六类 item。
+// 时间线单条渲染分派：tool / tool-group / approval / phase / compacted / user / assistant。
 // fork/rewind/retry 在分支内绑定（此处 item 已收窄为 MsgItem，messageId/role 类型才成立）。
 import type { Accessor } from "solid-js";
 import AssistantItem from "./AssistantItem";
 import ApprovalCard from "./ApprovalCard";
 import ToolCard from "./ToolCard";
+import ToolGroupCard from "./ToolGroupCard";
 import UserItem from "./UserItem";
-import type { Item, MsgItem } from "../lib/items";
+import type { MsgItem } from "../lib/items";
+import { isToolGroup, type TimelineEntry } from "../lib/tool-ui";
 
 export default function SessionItem(props: {
-  item: Item;
+  item: TimelineEntry;
   sessionId: Accessor<string>;
   streaming: Accessor<boolean>;
   live: Accessor<boolean>;
@@ -23,6 +25,9 @@ export default function SessionItem(props: {
   onRespondApproval: (id: string, allow: boolean) => Promise<void>;
 }) {
   const item = props.item;
+  if (isToolGroup(item)) {
+    return <ToolGroupCard group={item} />;
+  }
   if (item.kind === "tool") {
     return <ToolCard name={item.name} call={item.call} args={item.args} result={item.result} />;
   }

@@ -1,20 +1,14 @@
 // 仓库改动分段：git status 口径（含用户自己的未提交改动），与「会话改动」（本会话 agent 快照口径）并列。
 // 数据源 diff.status/diff.file RPC（src-tauri worktree.rs status/diff_file），本组件是唯一消费入口。
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { GitBranch } from "lucide-solid";
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { GitBranch, X } from "lucide-solid";
 import { diffFile, diffStatus, type DiffStatusEntry } from "../lib/chat-ops";
 import { activeSessionId } from "../lib/state";
 import DockSection from "./DockSection";
-import Markdown from "./Markdown";
+import ChangesTree from "./ChangesTree";
+import DiffView from "./DiffView";
 import { errText } from "./err-text";
 import { createSeqGuard } from "../lib/async-guard";
-
-const STATUS_STYLE: Record<string, { text: string; cls: string }> = {
-  M: { text: "修改", cls: "text-[var(--warn)]" },
-  A: { text: "新增", cls: "text-[var(--ok)]" },
-  D: { text: "删除", cls: "text-[var(--err)]" },
-  "??": { text: "未跟踪", cls: "text-[var(--text-dim)]" },
-};
 
 export default function DockRepoDiff() {
   const [entries, setEntries] = createSignal<DiffStatusEntry[]>([]);
@@ -92,34 +86,46 @@ export default function DockRepoDiff() {
           </Show>
         }
       >
-        <div class="space-y-0.5">
-          <For each={entries()}>
-            {(e) => {
-              const style = () =>
-                STATUS_STYLE[e.status] ?? { text: e.status, cls: "text-[var(--text-dim)]" };
-              return (
-                <div>
-                  <button
-                    class="w-full flex items-center gap-1.5 px-1 py-0.5 rounded text-xs text-left hover:bg-[var(--bg-overlay)]/60"
-                    onClick={() => void toggle(e.path)}
-                  >
-                    <span class={`font-mono text-2xs w-10 shrink-0 ${style().cls}`}>
-                      {style().text}
-                    </span>
-                    <span class="truncate font-mono text-[var(--text-dim)] flex-1" title={e.path}>
-                      {e.path}
-                    </span>
-                  </button>
-                  <Show when={open()?.path === e.path}>
-                    <div class="mt-1 mb-2 text-2xs max-h-72 overflow-auto rounded border border-[var(--border)]">
-                      <Markdown text={"```diff\n" + (open()?.text ?? "") + "\n```"} />
-                    </div>
-                  </Show>
-                </div>
-              );
-            }}
-          </For>
-        </div>
+        <ChangesTree
+          entries={() =>
+            entries().map((e) => ({
+              path: e.path,
+              status:
+                e.status === "A"
+                  ? ("added" as const)
+                  : e.status === "D"
+                    ? ("deleted" as const)
+                    : e.status === "??"
+                      ? ("untracked" as const)
+                      : ("modified" as const),
+            }))
+          }
+          onSelect={(path) => void toggle(path)}
+        />
+        <Show when={open()}>
+          {(d) => (
+            <div class="mt-1 rounded border border-[var(--border)] overflow-hidden">
+              <div class="flex items-center gap-2 px-2 py-1 border-b border-[var(--border)] bg-[var(--bg-raised)]">
+                <span
+                  class="truncate font-mono text-2xs text-[var(--text-dim)] flex-1"
+                  title={d().path}
+                >
+                  {d().path}
+                </span>
+                <button
+                  class="pressable text-[var(--text-faint)] hover:text-[var(--text)]"
+                  title="关闭 diff"
+                  onClick={() => void toggle(d().path)}
+                >
+                  <X size={11} />
+                </button>
+              </div>
+              <div class="text-2xs max-h-72 overflow-auto">
+                <DiffView patch={d().text} />
+              </div>
+            </div>
+          )}
+        </Show>
       </Show>
     </DockSection>
   );

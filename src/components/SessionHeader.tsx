@@ -1,6 +1,7 @@
 import { Show, type Accessor } from "solid-js";
-import { Download, FolderOpen } from "lucide-solid";
+import { Download, FoldVertical, FolderOpen, UnfoldVertical } from "lucide-solid";
 import { onDragStart } from "../lib/drag";
+import { expandAllTools, toggleExpandAllTools } from "../lib/tool-ui";
 import type { OrbState } from "../lib/orb";
 import ThinkingOrb from "./ThinkingOrb";
 
@@ -42,6 +43,15 @@ export default function SessionHeader(props: Props) {
         <Show when={props.exportNote()}>
           <span class="text-2xs text-[var(--ok)]">{props.exportNote()}</span>
         </Show>
+        <button
+          class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--text)]"
+          title={expandAllTools() ? "折叠全部工具详情 (Ctrl+O)" : "展开全部工具详情 (Ctrl+O)"}
+          onClick={() => toggleExpandAllTools()}
+        >
+          <Show when={expandAllTools()} fallback={<UnfoldVertical size={13} />}>
+            <FoldVertical size={13} />
+          </Show>
+        </button>
         <button
           class="pressable px-1.5 py-1 rounded text-[var(--text-faint)] hover:text-[var(--text)] disabled:opacity-40"
           disabled={!props.canExport()}

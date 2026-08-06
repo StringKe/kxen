@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Show, onCleanup, onMount } from "solid-js";
+import { createEffect, createSignal, Show, onCleanup, onMount } from "solid-js";
 import {
   goalFocus,
   goalList,
@@ -15,13 +15,14 @@ import { createAction, createSeqGuard } from "../lib/async-guard";
 import { activeSessionId } from "../lib/state";
 import { flashErr } from "../lib/flash";
 import { errText } from "./err-text";
-import Markdown from "./Markdown";
+import ChangesTree from "./ChangesTree";
+import DiffView from "./DiffView";
 import DockWorktree from "./DockWorktree";
 import DockGoal from "./DockGoal";
 import DockTasks, { type DockLoadState } from "./DockTasks";
 import DockRepoDiff from "./DockRepoDiff";
 import DockSection from "./DockSection";
-import { FileDiff, Target } from "lucide-solid";
+import { FileDiff, Target, X } from "lucide-solid";
 
 /** 右 dock：会话上下文（目标 / 改动 / 后台任务）。 */
 function DockSections(props: {
@@ -105,45 +106,45 @@ function DockSections(props: {
               when={diffEntries().length > 0}
               fallback={<div class="text-xs text-[var(--text-faint)]">本会话暂无 agent 改动</div>}
             >
-              <div class="space-y-0.5">
-                <For each={diffEntries()}>
-                  {(c) => (
-                    <div>
-                      <button
-                        class="w-full flex items-center gap-1.5 px-1 py-0.5 rounded text-xs text-left hover:bg-[var(--bg-overlay)]/60"
-                        onClick={() => void toggleDiff(c.path)}
+              <ChangesTree
+                entries={() =>
+                  diffEntries().map((c) => ({
+                    path: c.path,
+                    status:
+                      c.status === "created"
+                        ? ("added" as const)
+                        : c.status === "deleted"
+                          ? ("deleted" as const)
+                          : ("modified" as const),
+                    stats: `+${c.added} -${c.deleted}`,
+                  }))
+                }
+                onSelect={(path) => void toggleDiff(path)}
+              />
+              <Show when={openDiff()}>
+                {(d) => (
+                  <div class="mt-1 rounded border border-[var(--border)] overflow-hidden">
+                    <div class="flex items-center gap-2 px-2 py-1 border-b border-[var(--border)] bg-[var(--bg-raised)]">
+                      <span
+                        class="truncate font-mono text-2xs text-[var(--text-dim)] flex-1"
+                        title={d().path}
                       >
-                        <span
-                          class="font-mono text-2xs w-10 shrink-0"
-                          classList={{
-                            "text-[var(--ok)]": c.status === "created",
-                            "text-[var(--warn)]": c.status === "modified",
-                            "text-[var(--err)]": c.status === "deleted",
-                          }}
-                        >
-                          {c.status === "created"
-                            ? "新增"
-                            : c.status === "deleted"
-                              ? "删除"
-                              : "修改"}
-                        </span>
-                        <span class="truncate font-mono text-[var(--text-dim)] flex-1">
-                          {c.path}
-                        </span>
-                        <span class="text-2xs tabular-nums shrink-0">
-                          <span class="text-[var(--ok)]">+{c.added}</span>{" "}
-                          <span class="text-[var(--err)]">-{c.deleted}</span>
-                        </span>
+                        {d().path}
+                      </span>
+                      <button
+                        class="pressable text-[var(--text-faint)] hover:text-[var(--text)]"
+                        title="关闭 diff"
+                        onClick={() => void toggleDiff(d().path)}
+                      >
+                        <X size={11} />
                       </button>
-                      <Show when={openDiff()?.path === c.path}>
-                        <div class="mt-1 mb-2 text-2xs max-h-72 overflow-auto rounded border border-[var(--border)]">
-                          <Markdown text={"```diff\n" + (openDiff()?.text ?? "") + "\n```"} />
-                        </div>
-                      </Show>
                     </div>
-                  )}
-                </For>
-              </div>
+                    <div class="text-2xs max-h-72 overflow-auto">
+                      <DiffView patch={d().text} />
+                    </div>
+                  </div>
+                )}
+              </Show>
             </Show>
           </Show>
         </Show>
