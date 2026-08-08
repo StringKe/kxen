@@ -15,8 +15,8 @@ importers:
   .:
     dependencies:
       '@cloudflare/nimbus-docs':
-        specifier: 0.8.2
-        version: 0.8.2(astro@7.1.6(@astrojs/markdown-remark@7.2.2(supports-color@10.2.2))(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@26.1.2)(jiti@2.7.0)(yaml@2.9.0))(supports-color@10.2.2)
+        specifier: 0.9.0
+        version: 0.9.0(astro@7.1.6(@astrojs/markdown-remark@7.2.2(supports-color@10.2.2))(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@26.1.2)(jiti@2.7.0)(yaml@2.9.0))(supports-color@10.2.2)
       '@fontsource-variable/inter':
         specifier: ^5.3.0
         version: 5.3.0
@@ -288,8 +288,8 @@ packages:
     resolution: {integrity: sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg==}
     engines: {node: '>=22.0.0'}
 
-  '@cloudflare/nimbus-docs@0.8.2':
-    resolution: {integrity: sha512-SLrU2xeXIHQYxhZAivpQWqEHk+egwPAuCPffdEMI4qUANAccP9jV6MPdP4s57xwXaD3TP2URSMI28fGH9kkywg==}
+  '@cloudflare/nimbus-docs@0.9.0':
+    resolution: {integrity: sha512-QBUk8175ZiVSwX+xw1HcV7J0/bacHWCwWELBm4aVILk6rkzn2iZteIWbEw5195GapB7e1Bo5KJYrV4lCDdPH4g==}
     engines: {node: '>=22.12.0'}
     hasBin: true
     peerDependencies:
@@ -3574,7 +3574,7 @@ snapshots:
 
   '@cloudflare/kv-asset-handler@0.5.0': {}
 
-  '@cloudflare/nimbus-docs@0.8.2(astro@7.1.6(@astrojs/markdown-remark@7.2.2(supports-color@10.2.2))(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@26.1.2)(jiti@2.7.0)(yaml@2.9.0))(supports-color@10.2.2)':
+  '@cloudflare/nimbus-docs@0.9.0(astro@7.1.6(@astrojs/markdown-remark@7.2.2(supports-color@10.2.2))(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@26.1.2)(jiti@2.7.0)(yaml@2.9.0))(supports-color@10.2.2)':
     dependencies:
       '@astrojs/markdown-satteri': 0.3.5
       '@astrojs/mdx': 7.0.5(@astrojs/markdown-satteri@0.3.5)(astro@7.1.6(@astrojs/markdown-remark@7.2.2(supports-color@10.2.2))(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.3)(@types/node@26.1.2)(jiti@2.7.0)(yaml@2.9.0))(supports-color@10.2.2)
