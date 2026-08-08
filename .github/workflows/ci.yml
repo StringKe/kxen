@@ -30,7 +30,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11.15.1
           run_install: false
@@ -90,7 +90,7 @@ jobs:
           cargo install --locked cargo-llvm-cov --version 0.8.7
           cargo install --locked cargo-audit --version 0.22.2
       # rust-embed 编译期读取仓库根 dist/（gitignored）：cargo 步骤前必须先构建前端产物
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11.15.1
           run_install: false
@@ -132,7 +132,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 11.15.1
           run_install: false
