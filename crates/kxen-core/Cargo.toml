@@ -44,7 +44,7 @@ futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 dirs = "6"
-base64 = "0.22"
+base64 = "0.23"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 rquickjs = { version = "0.12", features = ["futures"] }
 cron = "0.12"
