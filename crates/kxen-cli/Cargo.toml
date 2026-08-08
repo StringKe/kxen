@@ -26,4 +26,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 futures = "0.3"
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
