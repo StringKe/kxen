@@ -29,7 +29,7 @@
     "marked-shiki": "^1.2.1",
     "mermaid": "11.16.1",
     "shiki": "^4.4.3",
-    "solid-js": "^1.9.14"
+    "solid-js": "^1.9.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
