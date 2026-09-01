@@ -36,7 +36,7 @@
     "pagefind": "^1.5.2",
     "tailwindcss": "^4.3.3",
     "typescript": "^6.0.3",
-    "wrangler": "^4.120.1"
+    "wrangler": "^4.127.1"
   },
   "engines": {
     "node": ">=22.12.0"
