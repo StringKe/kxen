@@ -24,7 +24,7 @@
     "@tauri-apps/plugin-updater": "^2.10.1",
     "class-variance-authority": "^0.7.1",
     "dompurify": "^3.4.13",
-    "lucide-solid": "^1.31.0",
+    "lucide-solid": "^1.37.0",
     "marked": "^18.0.9",
     "marked-shiki": "^1.2.1",
     "mermaid": "11.16.1",

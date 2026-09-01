@@ -241,8 +241,8 @@ importers:
         specifier: ^3.4.13
         version: 3.4.13
       lucide-solid:
-        specifier: ^1.31.0
-        version: 1.31.0(solid-js@1.9.14)
+        specifier: ^1.37.0
+        version: 1.37.0(solid-js@1.9.14)
       marked:
         specifier: ^18.0.9
         version: 18.0.9
@@ -294,7 +294,7 @@ importers:
         version: 0.2.8(@vitest/browser-playwright@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(jiti@2.7.0)(terser@5.49.0)(typescript@7.0.2)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
       vitest:
         specifier: ^4.1.10
-        version: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+        version: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
 
 packages:
 
@@ -2282,8 +2282,8 @@ packages:
   lru_map@0.4.1:
     resolution: {integrity: sha512-I+lBvqMMFfqaV8CJCISjI3wbjmwVu/VyOoU7+qtu9d7ioW5klMgsTTiUOUp+DJvfTTzKXoPbyC6YfgkNcyPSOg==}
 
-  lucide-solid@1.31.0:
-    resolution: {integrity: sha512-yRJChFmaeWF8+hmm/9s2O0NrlQVr/t/p11Hd9+MON0biY0a7LLeCYZ/yH4s2G5df6vNP8hhmZsoi2v46v4rgKQ==}
+  lucide-solid@1.37.0:
+    resolution: {integrity: sha512-RjyHbI3IqMAdQKpm6FS0zxsIKEdF8Oz1V4AtHLSE95N3n9AqFJWKvktqnaFVno8grNp7L18WqyrisZbfvlY5MA==}
     peerDependencies:
       solid-js: ^1.4.7
 
@@ -3678,7 +3678,7 @@ snapshots:
       '@vitest/mocker': 4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
       playwright: 1.62.1
       tinyrainbow: 3.1.1
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
     transitivePeerDependencies:
       - bufferutil
       - msw
@@ -3690,7 +3690,7 @@ snapshots:
       '@testing-library/dom': 10.4.1
       '@testing-library/user-event': 14.6.1(@testing-library/dom@10.4.1)
       '@vitest/browser': 4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10)
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
     transitivePeerDependencies:
       - bufferutil
       - msw
@@ -3706,7 +3706,7 @@ snapshots:
       pngjs: 7.0.0
       sirv: 3.0.2
       tinyrainbow: 3.1.1
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
       ws: 8.21.2
     transitivePeerDependencies:
       - bufferutil
@@ -3726,7 +3726,7 @@ snapshots:
       magicast: 0.5.4
       obug: 2.1.4
       tinyrainbow: 3.1.1
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
     transitivePeerDependencies:
       - supports-color
 
@@ -3742,7 +3742,7 @@ snapshots:
       obug: 2.1.4
       std-env: 4.2.0
       tinyrainbow: 3.1.1
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
     optionalDependencies:
       '@vitest/browser': 4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10)
     optional: true
@@ -4415,7 +4415,7 @@ snapshots:
 
   lru_map@0.4.1: {}
 
-  lucide-solid@1.31.0(solid-js@1.9.14):
+  lucide-solid@1.37.0(solid-js@1.9.14):
     dependencies:
       solid-js: 1.9.14
 
@@ -4883,7 +4883,7 @@ snapshots:
       oxfmt: 0.61.0(vite-plus@0.2.8(@vitest/browser-playwright@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(jiti@2.7.0)(terser@5.49.0)(typescript@7.0.2)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0)))
       oxlint: 1.76.0(oxlint-tsgolint@7.0.2001)(vite-plus@0.2.8(@vitest/browser-playwright@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(jiti@2.7.0)(terser@5.49.0)(typescript@7.0.2)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0)))
       oxlint-tsgolint: 7.0.2001
-      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
+      vitest: 4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
     optionalDependencies:
       '@vitest/browser-playwright': 4.1.10(playwright@1.62.1)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10)
       '@voidzero-dev/vite-plus-darwin-arm64': 0.2.8
@@ -4941,7 +4941,7 @@ snapshots:
     optionalDependencies:
       vite: 8.1.5(jiti@2.7.0)(terser@5.49.0)
 
-  vitest@4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))(vitest@4.1.10))(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0)):
+  vitest@4.1.10(@vitest/browser-playwright@4.1.10)(@vitest/browser-preview@4.1.10)(@vitest/coverage-istanbul@4.1.10)(@vitest/coverage-v8@4.1.10)(vite@8.1.5(jiti@2.7.0)(terser@5.49.0)):
     dependencies:
       '@vitest/expect': 4.1.10
       '@vitest/mocker': 4.1.10(vite@8.1.5(jiti@2.7.0)(terser@5.49.0))
