@@ -27,7 +27,7 @@
     "canvaskit-wasm": "^0.41.1",
     "clsx": "^2.1.1",
     "dompurify": "^3.4.13",
-    "mermaid": "11.16.1",
+    "mermaid": "11.17.2",
     "tailwind-merge": "^3.6.0"
   },
   "devDependencies": {
