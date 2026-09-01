@@ -24,7 +24,7 @@
     "astro": "^7.2.0",
     "astro-icon": "^1.1.5",
     "astro-og-canvas": "^0.13.0",
-    "canvaskit-wasm": "^0.41.1",
+    "canvaskit-wasm": "^0.42.0",
     "clsx": "^2.1.1",
     "dompurify": "^3.4.13",
     "mermaid": "11.16.1",
