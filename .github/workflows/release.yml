@@ -66,7 +66,7 @@ jobs:
           bash "$RUNNER_TEMP/release-tools/validate-release.sh" \
             "$RELEASE_TAG" origin/main "$GITHUB_REPOSITORY" "$GITHUB_SHA"
       - name: Generate release notes before platform builds
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
         with:
           version: v2.13.1
           config: ${{ runner.temp }}/release-tools/cliff.toml
@@ -600,7 +600,7 @@ jobs:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: bash "$RUNNER_TEMP/trusted-release-tools/validate-release.sh" "$RELEASE_TAG" origin/main "$GITHUB_REPOSITORY" "$GITHUB_SHA"
       - name: Generate version-specific release notes
-        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        uses: orhun/git-cliff-action@a9a95522b26fe6403f7bb24031f21fb573d0f5ff # v4.9.1
         with:
           version: v2.13.1
           config: ${{ runner.temp }}/trusted-release-tools/cliff.toml
